@@ -1,5 +1,7 @@
 //! Data for the lifecycle of the Ingester
 
+use crate::compact::compact_persisting_batch;
+use crate::persist::persist;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{format::StrftimeItems, TimeZone, Utc};
@@ -7,19 +9,24 @@ use data_types::delete_predicate::DeletePredicate;
 use dml::DmlOperation;
 use generated_types::{google::FieldViolation, influxdata::iox::ingester::v1 as proto};
 use iox_catalog::interface::{
-    Catalog, KafkaPartition, NamespaceId, PartitionId, SequenceNumber, SequencerId, TableId,
-    Timestamp, Tombstone,
+    Catalog, KafkaPartition, NamespaceId, PartitionId, PartitionInfo, SequenceNumber, SequencerId,
+    TableId, Timestamp, Tombstone,
 };
 use mutable_batch::column::ColumnData;
 use mutable_batch::MutableBatch;
 use object_store::ObjectStore;
+use observability_deps::tracing::{error, warn};
 use parking_lot::RwLock;
 use predicate::Predicate;
+use query::exec::Executor;
 use schema::selection::Selection;
 use schema::TIME_COLUMN_NAME;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::TryFrom;
+use std::ops::DerefMut;
+use std::time::Duration;
 use std::{collections::BTreeMap, sync::Arc};
+use time::SystemProvider;
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
@@ -43,6 +50,9 @@ pub enum Error {
     #[snafu(display("Namespace {} not found in catalog", namespace))]
     NamespaceNotFound { namespace: String },
 
+    #[snafu(display("Table {} not found in buffer", table_name))]
+    TableNotFound { table_name: String },
+
     #[snafu(display("Table must be specified in delete"))]
     TableNotPresent,
 
@@ -65,6 +75,9 @@ pub enum Error {
 
     #[snafu(display("Snapshot error: {}", source))]
     Snapshot { source: mutable_batch::Error },
+
+    #[snafu(display("Partition not found: {}", partition_id))]
+    PartitionNotFound { partition_id: PartitionId },
 }
 
 /// A specialized `Error` for Ingester Data errors
@@ -111,13 +124,155 @@ pub(crate) trait Persister: Send + Sync + 'static {
 
 #[async_trait]
 impl Persister for IngesterData {
-    async fn persist(&self, _partition_id: PartitionId) {
-        // lookup the TableData
-        // let persisting_batch = table_data.create_persisting_batch(partition.partition_key);
-        // do the persist with this persisting batch
-        // update the catalog
-        // table_data.clear_persisting_batch() (behind the scenes this will remove the persisting batch
-        // and if the partition is empty, remove it from the map in table_data)
+    async fn persist(&self, partition_id: PartitionId) {
+        let retry_time = Duration::from_secs(1);
+
+        // lookup the partition_info from the catalog
+        let partition_info: Option<PartitionInfo> = loop {
+            match self.catalog.start_transaction().await {
+                Ok(mut txn) => match txn.partitions().partition_info_by_id(partition_id).await {
+                    Ok(p) => break p,
+                    Err(e) => {
+                        error!(%e, "error getting partition_info_by_id");
+                        tokio::time::sleep(retry_time).await;
+                    }
+                },
+                Err(e) => {
+                    error!(%e, "error starting transaction");
+                    tokio::time::sleep(retry_time).await;
+                }
+            }
+        };
+
+        // lookup the state from the ingester data. If something isn't found, it's unexpected. Crash
+        // so someone can take a look.
+        let partition_info = partition_info
+            .unwrap_or_else(|| panic!("partition {} not found in catalog", partition_id));
+        let sequencer_data = self
+            .sequencers
+            .get(&partition_info.partition.sequencer_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "sequencer state for {} not in ingester data",
+                    partition_info.partition.sequencer_id
+                )
+            }); //{
+        let namespace = sequencer_data
+            .namespace(&partition_info.namespace_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "namespace {} not in sequencer {} state",
+                    partition_info.namespace_name, partition_info.partition.sequencer_id
+                )
+            });
+        let table_data = namespace
+            .table_data(&partition_info.table_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "table {} for namespace {} not in sequencer {} state",
+                    partition_info.table_name,
+                    partition_info.namespace_name,
+                    partition_info.partition.sequencer_id
+                )
+            });
+        let partition_data = table_data
+            .partition_data(&partition_info.partition.partition_key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "partition {} not in table {} for namespace {} in sequencer {} state",
+                    partition_info.partition.partition_key,
+                    partition_info.table_name,
+                    partition_info.namespace_name,
+                    partition_info.partition.sequencer_id
+                )
+            });
+
+        // snapshot and make arc clones of the data.
+        let persisting_batch = partition_data.snapshot_to_persisting_batch(
+            partition_info.partition.sequencer_id,
+            partition_info.partition.table_id,
+            partition_info.partition.id,
+            &partition_info.table_name,
+        );
+
+        // do the CPU intensive work of compaction, de-duplication and sorting
+        let exec = Executor::new(1);
+        let (record_batches, iox_meta) = match compact_persisting_batch(
+            Arc::new(SystemProvider::new()),
+            &exec,
+            namespace.namespace_id.get(),
+            &partition_info.namespace_name,
+            &partition_info.table_name,
+            &partition_info.partition.partition_key,
+            Arc::clone(&persisting_batch),
+        )
+        .await
+        {
+            Err(e) => {
+                // this should never error out. if it does, we need to crash hard so
+                // someone can take a look.
+                panic!("unable to compact persisting batch with error: {:?}", e);
+            }
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                warn!("persist called with no data");
+                return;
+            }
+        };
+
+        // save the compacted data to a parquet file in object storage
+        loop {
+            match persist(&iox_meta, record_batches.to_vec(), &self.object_store).await {
+                Ok(_) => break,
+                Err(e) => {
+                    error!(%e, "error persisting parquet file to object store");
+                    tokio::time::sleep(retry_time).await;
+                }
+            }
+        }
+
+        // Commit the parquet file and tombstones to the catalog. This is pretty ugly because of all
+        // the failures that might happen where we just want to keep retrying it.
+        // TODO: clean this up when updating the min_sequence_number is added in.
+        let parquet_file = iox_meta.to_parquet_file();
+        loop {
+            match self.catalog.start_transaction().await {
+                Ok(mut txn) => {
+                    match iox_catalog::add_parquet_file_with_tombstones(
+                        &parquet_file,
+                        &persisting_batch.data.deletes,
+                        txn.deref_mut(),
+                    )
+                    .await
+                    {
+                        Ok(_) => match txn.commit().await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                error!(%e, "error commiting transaction to catalog");
+                                tokio::time::sleep(retry_time).await;
+                            }
+                        },
+                        Err(e) => {
+                            error!(%e, "error from catalog adding parquet file and processed tombstones");
+                            if let Err(e) = txn.abort().await {
+                                error!(%e, "error aborting failed transaction to add parquet file and tombstones");
+                            }
+                            tokio::time::sleep(retry_time).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(%e, "error starting catalog transaction");
+                    tokio::time::sleep(retry_time).await;
+                }
+            }
+        }
+
+        // and remove the persisted data from memory
+        namespace.mark_persisted_and_remove_if_empty(
+            &partition_info.table_name,
+            &partition_info.partition.partition_key,
+        );
     }
 }
 
@@ -270,6 +425,31 @@ impl NamespaceData {
 
         Ok(data)
     }
+
+    /// Walks down the table and partition and clears the persisting batch. If there is no
+    /// data buffered in the partition, it is removed. If there are no other partitions in
+    /// the table, it is removed.
+    fn mark_persisted_and_remove_if_empty(&self, table_name: &str, partition_key: &str) {
+        let mut tables = self.tables.write();
+        let table = tables.get(table_name).cloned();
+
+        if let Some(t) = table {
+            let mut partitions = t.partition_data.write();
+            let partition = partitions.get(partition_key).cloned();
+
+            if let Some(p) = partition {
+                let mut data = p.inner.write();
+                data.persisting = None;
+                if data.is_empty() {
+                    partitions.remove(partition_key);
+                }
+            }
+
+            if partitions.is_empty() {
+                tables.remove(table_name);
+            }
+        }
+    }
 }
 
 /// Data of a Table in a given Namesapce that belongs to a given Shard
@@ -398,6 +578,26 @@ impl PartitionData {
         }
     }
 
+    /// Snapshot anything in the buffer and move all snapshot data into a persisting batch
+    pub fn snapshot_to_persisting_batch(
+        &self,
+        sequencer_id: SequencerId,
+        table_id: TableId,
+        partition_id: PartitionId,
+        table_name: &str,
+    ) -> Arc<PersistingBatch> {
+        let mut data = self.inner.write();
+        data.snapshot_to_persisting(sequencer_id, table_id, partition_id, table_name)
+    }
+
+    /// Clears the persisting batch and returns true if there is no other data in the partition.
+    fn clear_persisting(&self) -> bool {
+        let mut d = self.inner.write();
+        d.persisting = None;
+
+        d.snapshots.is_empty() && d.buffer.is_empty()
+    }
+
     /// Snapshot whatever is in the buffer and return a new vec of the
     /// arc cloned snapshots
     pub fn snapshot(&self) -> Result<Vec<Arc<SnapshotBatch>>> {
@@ -512,6 +712,47 @@ impl DataBuffer {
         Ok(())
     }
 
+    /// Returns true if there are no batches in the buffer or snapshots or persisting data
+    fn is_empty(&self) -> bool {
+        self.snapshots.is_empty() && self.buffer.is_empty() && self.persisting.is_none()
+    }
+
+    /// Snapshots the buffer and moves snapshots over to the `PersistingBatch`. Returns error
+    /// if there is already a persisting batch.
+    pub fn snapshot_to_persisting(
+        &mut self,
+        sequencer_id: SequencerId,
+        table_id: TableId,
+        partition_id: PartitionId,
+        table_name: &str,
+    ) -> Arc<PersistingBatch> {
+        if self.persisting.is_some() {
+            panic!("Unable to snapshot while persisting. This is an unexpected state.")
+        }
+
+        self.snapshot()
+            .expect("This mutable batch snapshot error should be impossible.");
+
+        let mut data = vec![];
+        std::mem::swap(&mut data, &mut self.snapshots);
+        let mut deletes = vec![];
+        std::mem::swap(&mut deletes, &mut self.deletes);
+
+        let queryable_batch = QueryableBatch::new(table_name, data, deletes);
+
+        let persisting_batch = Arc::new(PersistingBatch {
+            sequencer_id,
+            table_id,
+            partition_id,
+            object_store_id: Uuid::new_v4(),
+            data: Arc::new(queryable_batch),
+        });
+
+        self.persisting = Some(Arc::clone(&persisting_batch));
+
+        persisting_batch
+    }
+
     /// Add a persiting batch into the buffer persisting list
     /// Note: For now, there is at most one persisting batch at a time but
     /// the plan is to process several of them a time as needed
@@ -586,7 +827,7 @@ pub struct PersistingBatch {
 #[derive(Debug, PartialEq)]
 pub struct QueryableBatch {
     /// data
-    pub data: Vec<SnapshotBatch>,
+    pub data: Vec<Arc<SnapshotBatch>>,
 
     /// Tomstones to be applied on data
     pub deletes: Vec<Tombstone>,
@@ -650,8 +891,18 @@ pub struct QueryData {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_types::sequence::Sequence;
+    use dml::{DmlMeta, DmlWrite};
+    use futures::TryStreamExt;
+    use iox_catalog::interface::NamespaceSchema;
+    use iox_catalog::mem::MemCatalog;
+    use iox_catalog::validate_or_insert_schema;
+    use mutable_batch_lp::lines_to_batches;
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
+    use object_store::ObjectStoreApi;
+    use std::ops::DerefMut;
     use test_helpers::assert_error;
+    use time::Time;
 
     #[test]
     fn convert_query_proto_to_rust() {
@@ -806,5 +1057,122 @@ mod tests {
 
         assert_eq!(data_buffer.buffer.len(), 2);
         assert!(data_buffer.snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist() {
+        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new());
+        let mut txn = catalog.start_transaction().await.unwrap();
+        let kafka_topic = txn.kafka_topics().create_or_get("whatevs").await.unwrap();
+        let query_pool = txn.query_pools().create_or_get("whatevs").await.unwrap();
+        let kafka_partition = KafkaPartition::new(0);
+        let namespace = txn
+            .namespaces()
+            .create("foo", "inf", kafka_topic.id, query_pool.id)
+            .await
+            .unwrap();
+        let sequencer1 = txn
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let sequencer2 = txn
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let mut sequencers = BTreeMap::new();
+        sequencers.insert(sequencer1.id, SequencerData::default());
+        sequencers.insert(sequencer2.id, SequencerData::default());
+
+        let object_store = Arc::new(ObjectStore::new_in_memory());
+
+        let data = Arc::new(IngesterData {
+            object_store: Arc::clone(&object_store),
+            catalog: Arc::clone(&catalog),
+            sequencers,
+        });
+
+        let schema = NamespaceSchema::new(namespace.id, kafka_topic.id, query_pool.id);
+
+        let ignored_ts = Time::from_timestamp_millis(42);
+
+        let w1 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 10", 0).unwrap(),
+            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+        );
+        let schema = validate_or_insert_schema(w1.tables(), &schema, txn.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let w2 = DmlWrite::new(
+            "foo",
+            lines_to_batches("cpu foo=1 10", 1).unwrap(),
+            DmlMeta::sequenced(Sequence::new(2, 1), ignored_ts, None, 50),
+        );
+        let _ = validate_or_insert_schema(w2.tables(), &schema, txn.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let w3 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 30", 2).unwrap(),
+            DmlMeta::sequenced(Sequence::new(1, 2), ignored_ts, None, 50),
+        );
+
+        // close out the transaction to the mem catalog won't deadlock.
+        txn.commit().await.unwrap();
+
+        data.buffer_operation(sequencer1.id, DmlOperation::Write(w1))
+            .await
+            .unwrap();
+        data.buffer_operation(sequencer2.id, DmlOperation::Write(w2))
+            .await
+            .unwrap();
+        data.buffer_operation(sequencer1.id, DmlOperation::Write(w3))
+            .await
+            .unwrap();
+
+        let sd = data.sequencers.get(&sequencer1.id).unwrap();
+        let n = sd.namespace("foo").unwrap();
+        let mem_table = n.table_data("mem").unwrap();
+        assert!(n.table_data("cpu").is_some());
+
+        let p = mem_table.partition_data("1970-01-01").unwrap();
+        data.persist(p.id).await;
+
+        // verify that a file got put into object store
+        let file_paths: Vec<_> = object_store
+            .list(None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(file_paths.len(), 1);
+
+        let mut txn = catalog.start_transaction().await.unwrap();
+        // verify it put the record in the catalog
+        let parquet_files = txn
+            .parquet_files()
+            .list_by_sequencer_greater_than(sequencer1.id, SequenceNumber::new(0))
+            .await
+            .unwrap();
+        assert_eq!(parquet_files.len(), 1);
+        let pf = parquet_files.first().unwrap();
+        assert_eq!(pf.partition_id, p.id);
+        assert_eq!(pf.table_id, mem_table.table_id);
+        assert_eq!(pf.min_time, Timestamp::new(10));
+        assert_eq!(pf.max_time, Timestamp::new(30));
+        assert_eq!(pf.min_sequence_number, SequenceNumber::new(1));
+        assert_eq!(pf.max_sequence_number, SequenceNumber::new(2));
+        assert_eq!(pf.sequencer_id, sequencer1.id);
+        assert!(!pf.to_delete);
+
+        // verify that the partition got removed from the table because it is now empty
+        assert!(mem_table.partition_data("1970-01-01").is_none());
     }
 }
