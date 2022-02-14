@@ -15,6 +15,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use iox_catalog::interface::{SequenceNumber, Tombstone};
+use observability_deps::tracing::{debug, trace};
 use predicate::{delete_predicate::parse_delete_predicate, Predicate, PredicateMatch};
 use query::{exec::stringset::StringSet, QueryChunk, QueryChunkMeta};
 use schema::{merge::merge_record_batch_schemas, selection::Selection, sort::SortKey, Schema};
@@ -185,6 +186,8 @@ impl QueryChunk for QueryableBatch {
         // todo: will need for the case we read data to send to Querier
         selection: Selection<'_>,
     ) -> Result<SendableRecordBatchStream, Self::Error> {
+        trace!(?selection, "selection");
+
         // Get all record batches from their snapshots
         let mut batches = vec![];
         for snapshot in &self.data {
@@ -208,8 +211,7 @@ impl QueryChunk for QueryableBatch {
         // Return stream of data
         let dummy_metrics = ExecutionPlanMetricsSet::new();
         let mem_metrics = MemTrackingMetrics::new(&dummy_metrics, 0);
-        let stream =
-            SizedRecordBatchStream::new(self.schema().as_arrow(), stream_batches, mem_metrics);
+        let stream = SizedRecordBatchStream::new(schema.as_arrow(), stream_batches, mem_metrics);
         Ok(Box::pin(stream))
     }
 

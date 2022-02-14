@@ -41,7 +41,7 @@ pub enum Error {
 /// A specialized `Error` for Ingester's Query errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Compact a given Queryable Batch
+/// Query a given Queryable Batch
 pub async fn query(
     executor: &Executor,
     data: Arc<QueryableBatch>,
@@ -89,7 +89,8 @@ pub async fn query(
 mod tests {
     use super::*;
     use crate::test_util::{
-        create_one_record_batch_with_influxtype_no_duplicates, make_queryable_batch_with_deletes, make_queryable_batch,
+        create_one_record_batch_with_influxtype_no_duplicates, make_queryable_batch,
+        make_queryable_batch_with_deletes,
     };
     use arrow_util::assert_batches_eq;
     use datafusion::logical_plan::{col, lit};
@@ -103,24 +104,18 @@ mod tests {
         let batches = create_one_record_batch_with_influxtype_no_duplicates().await;
 
         // build queryable batch from the input batches
-        let compact_batch = make_queryable_batch("test_table", 1, batches);
+        let batch = make_queryable_batch("test_table", 1, batches);
 
-        // verify PK
-        let schema = compact_batch.schema();
-        let pk = schema.primary_key();
-        let expected_pk = vec!["tag1", "time"];
-        assert_eq!(expected_pk, pk);
-
-        // query that filters nothing
+        // query without filters
         let exc = Executor::new(1);
-        let stream = query(&exc, compact_batch, Predicate::default(), Selection::All)
+        let stream = query(&exc, batch, Predicate::default(), Selection::All)
             .await
             .unwrap();
         let output_batches = datafusion::physical_plan::common::collect(stream)
             .await
             .unwrap();
 
-        // verify data: all rows and columns shoudl return
+        // verify data: all rows and columns should be returned
         let expected = vec![
             "+-----------+------+-----------------------------+",
             "| field_int | tag1 | time                        |",
@@ -142,15 +137,9 @@ mod tests {
         //let tombstones = vec![create_tombstone(1, 1, 1, 1, 0, 200000, "tag1=UT")];
 
         // build queryable batch from the input batches
-        let compact_batch = make_queryable_batch("test_table", 1, batches);
+        let batch = make_queryable_batch("test_table", 1, batches);
 
-        // verify PK
-        let schema = compact_batch.schema();
-        let pk = schema.primary_key();
-        let expected_pk = vec!["tag1", "time"];
-        assert_eq!(expected_pk, pk);
-
-        // Define what to filter
+        // make filters
         // Only read 2 columns: "tag1" and "time"
         let selection = Selection::Some(&["tag1", "time"]);
 
@@ -160,22 +149,20 @@ mod tests {
         let pred = Predicate::default();
 
         let exc = Executor::new(1);
-        let stream = query(&exc, compact_batch, pred, selection)
-            .await
-            .unwrap();
+        let stream = query(&exc, batch, pred, selection).await.unwrap();
         let output_batches = datafusion::physical_plan::common::collect(stream)
             .await
             .unwrap();
 
-        // verify data: all rows and columns shoudl return
+        // verify data: 2  columns should be returned
         let expected = vec![
-            "+-----------+------+-----------------------------+",
-            "| field_int | tag1 | time                        |",
-            "+-----------+------+-----------------------------+",
-            "| 70        | UT   | 1970-01-01T00:00:00.000020Z |",
-            "| 10        | VT   | 1970-01-01T00:00:00.000010Z |",
-            "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
-            "+-----------+------+-----------------------------+",
+            "+------+-----------------------------+",
+            "| tag1 | time                        |",
+            "+------+-----------------------------+",
+            "| UT   | 1970-01-01T00:00:00.000020Z |",
+            "| VT   | 1970-01-01T00:00:00.000010Z |",
+            "| WA   | 1970-01-01T00:00:00.000008Z |",
+            "+------+-----------------------------+",
         ];
         assert_batches_eq!(&expected, &output_batches);
     }
