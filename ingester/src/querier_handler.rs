@@ -89,8 +89,8 @@ pub async fn query(
 mod tests {
     use super::*;
     use crate::test_util::{
-        create_one_record_batch_with_influxtype_no_duplicates, make_queryable_batch,
-        make_queryable_batch_with_deletes,
+        create_one_record_batch_with_influxtype_no_duplicates, create_tombstone,
+        make_queryable_batch, make_queryable_batch_with_deletes,
     };
     use arrow_util::assert_batches_eq;
     use datafusion::logical_plan::{col, lit};
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_filter() {
+    async fn test_query_with_filter() {
         test_helpers::maybe_start_logging();
 
         // create input data
@@ -144,9 +144,8 @@ mod tests {
         let selection = Selection::Some(&["tag1", "time"]);
 
         // tag1=VT
-        //let expr = col("tag1").eq(lit("VT"));
-        //let pred = PredicateBuilder::default().add_expr(expr).build();
-        let pred = Predicate::default();
+        let expr = col("tag1").eq(lit("VT"));
+        let pred = PredicateBuilder::default().add_expr(expr).build();
 
         let exc = Executor::new(1);
         let stream = query(&exc, batch, pred, selection).await.unwrap();
@@ -154,16 +153,44 @@ mod tests {
             .await
             .unwrap();
 
-        // verify data: 2  columns should be returned
+        // verify data: 2  columns and one row of "tag1=VT" should be returned
         let expected = vec![
             "+------+-----------------------------+",
             "| tag1 | time                        |",
             "+------+-----------------------------+",
-            "| UT   | 1970-01-01T00:00:00.000020Z |",
             "| VT   | 1970-01-01T00:00:00.000010Z |",
-            "| WA   | 1970-01-01T00:00:00.000008Z |",
             "+------+-----------------------------+",
         ];
+        assert_batches_eq!(&expected, &output_batches);
+    }
+
+    #[tokio::test]
+    async fn test_query_with_filter_with_delete() {
+        test_helpers::maybe_start_logging();
+
+        // create input data
+        let batches = create_one_record_batch_with_influxtype_no_duplicates().await;
+        let tombstones = vec![create_tombstone(1, 1, 1, 1, 0, 200000, "tag1=UT")];
+
+        // build queryable batch from the input batches
+        let batch = make_queryable_batch_with_deletes("test_table", 1, batches, tombstones);
+
+        // make filters
+        // Only read 2 columns: "tag1" and "time"
+        let selection = Selection::Some(&["tag1", "time"]);
+
+        // tag1=VT
+        let expr = col("tag1").eq(lit("UT"));
+        let pred = PredicateBuilder::default().add_expr(expr).build();
+
+        let exc = Executor::new(1);
+        let stream = query(&exc, batch, pred, selection).await.unwrap();
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+
+        // verify data: return nothing because the selected row already deleted
+        let expected = vec!["++", "++"];
         assert_batches_eq!(&expected, &output_batches);
     }
 }
