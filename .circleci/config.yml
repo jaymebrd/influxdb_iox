@@ -440,7 +440,7 @@ jobs:
               }
 
               # retry installing skopeo up to 5 times to avoid temporary networking issues
-              for attempt in $(seq 1 ${attempts}) ; do
+              for attempt in $(seq 1 "${attempts}") ; do
                 # run installation, if successful, exit and return 0
                 if install ; then
                   exit 0
