@@ -2,11 +2,17 @@
 
 use std::sync::Arc;
 
-use datafusion::logical_plan::{col, lit_timestamp_nano, LogicalPlan};
+use datafusion::{
+    logical_expr::LogicalPlan,
+    prelude::{col, lit_timestamp_nano},
+};
 use observability_deps::tracing::debug;
 use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
 
-use crate::{exec::make_stream_split, QueryChunk};
+use crate::{
+    exec::{make_stream_split, IOxSessionContext},
+    QueryChunk,
+};
 use snafu::{ResultExt, Snafu};
 
 use super::common::ScanPlanBuilder;
@@ -46,38 +52,42 @@ impl From<datafusion::error::DataFusionError> for Error {
 
 /// Planner for physically rearranging chunk data. This planner
 /// creates COMPACT and SPLIT plans for use in the database lifecycle manager
-#[derive(Debug, Default)]
-pub struct ReorgPlanner {}
+#[derive(Debug)]
+pub struct ReorgPlanner {
+    ctx: IOxSessionContext,
+}
 
 impl ReorgPlanner {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ctx: IOxSessionContext) -> Self {
+        Self { ctx }
     }
 
     /// Creates an execution plan for the COMPACT operations which does the following:
     ///
     /// 1. Merges chunks together into a single stream
     /// 2. Deduplicates via PK as necessary
-    /// 3. Sorts the result according to the requested key
+    /// 3. Sorts the result according to the requested `output_sort_key`
     ///
     /// The plan looks like:
     ///
-    /// (Sort on output_sort)
+    /// (Sort on output_sort_key)
     ///   (Scan chunks) <-- any needed deduplication happens here
     pub fn compact_plan<I>(
         &self,
+        table_name: Arc<str>,
         schema: Arc<Schema>,
         chunks: I,
-        sort_key: SortKey,
+        output_sort_key: SortKey,
     ) -> Result<LogicalPlan>
     where
         I: IntoIterator<Item = Arc<dyn QueryChunk>>,
     {
-        let scan_plan = ScanPlanBuilder::new(schema)
-            .with_chunks(chunks)
-            .with_sort_key(sort_key)
-            .build()
-            .context(BuildingScanSnafu)?;
+        let scan_plan =
+            ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("compact_plan"))
+                .with_chunks(chunks)
+                .with_output_sort_key(output_sort_key)
+                .build()
+                .context(BuildingScanSnafu)?;
 
         let plan = scan_plan.plan_builder.build()?;
 
@@ -91,7 +101,7 @@ impl ReorgPlanner {
     ///
     /// 1. Merges chunks together into a single stream
     /// 2. Deduplicates via PK as necessary
-    /// 3. Sorts the result according to the requested key
+    /// 3. Sorts the result according to the requested output_sort_key
     /// 4. Splits the stream on value of the `time` column: Those
     ///    rows that are on or before the time and those that are after
     ///
@@ -139,9 +149,10 @@ impl ReorgPlanner {
     /// ```
     pub fn split_plan<I>(
         &self,
+        table_name: Arc<str>,
         schema: Arc<Schema>,
         chunks: I,
-        sort_key: SortKey,
+        output_sort_key: SortKey,
         split_times: Vec<i64>,
     ) -> Result<LogicalPlan>
     where
@@ -152,9 +163,9 @@ impl ReorgPlanner {
             panic!("Split plan does not accept empty split_times");
         }
 
-        let scan_plan = ScanPlanBuilder::new(schema)
+        let scan_plan = ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("split_plan"))
             .with_chunks(chunks)
-            .with_sort_key(sort_key)
+            .with_output_sort_key(output_sort_key)
             .build()
             .context(BuildingScanSnafu)?;
 
@@ -256,7 +267,97 @@ mod test {
             .unwrap()
             .build();
 
-        (Arc::new(schema), vec![chunk1, chunk2])
+        (schema, vec![chunk1, chunk2])
+    }
+
+    async fn get_sorted_test_chunks() -> (Arc<Schema>, Vec<Arc<dyn QueryChunk>>) {
+        // Chunk 1
+        let chunk1 = Arc::new(
+            TestChunk::new("t")
+                .with_time_column_with_stats(Some(1000), Some(1000))
+                .with_tag_column_with_stats("tag1", Some("A"), Some("A"))
+                .with_i64_field_column("field_int")
+                .with_one_row_of_specific_data("A", 1, 1000),
+        ) as Arc<dyn QueryChunk>;
+
+        let expected = vec![
+            "+-----------+------+-----------------------------+",
+            "| field_int | tag1 | time                        |",
+            "+-----------+------+-----------------------------+",
+            "| 1         | A    | 1970-01-01T00:00:00.000001Z |",
+            "+-----------+------+-----------------------------+",
+        ];
+        assert_batches_eq!(&expected, &raw_data(&[Arc::clone(&chunk1)]).await);
+
+        // Chunk 2
+        let chunk2 = Arc::new(
+            TestChunk::new("t")
+                .with_time_column_with_stats(Some(2000), Some(2000))
+                .with_tag_column_with_stats("tag1", Some("B"), Some("B"))
+                .with_i64_field_column("field_int")
+                .with_one_row_of_specific_data("B", 2, 2000),
+        ) as Arc<dyn QueryChunk>;
+
+        let expected = vec![
+            "+-----------+------+-----------------------------+",
+            "| field_int | tag1 | time                        |",
+            "+-----------+------+-----------------------------+",
+            "| 2         | B    | 1970-01-01T00:00:00.000002Z |",
+            "+-----------+------+-----------------------------+",
+        ];
+        assert_batches_eq!(&expected, &raw_data(&[Arc::clone(&chunk2)]).await);
+
+        (chunk1.schema(), vec![chunk1, chunk2])
+    }
+
+    #[tokio::test]
+    async fn test_compact_plan_sorted() {
+        test_helpers::maybe_start_logging();
+
+        // ensures that the output is actually sorted
+        // https://github.com/influxdata/influxdb_iox/issues/6125
+        let (schema, chunks) = get_sorted_test_chunks().await;
+
+        let chunk_orders = vec![
+            // reverse order
+            vec![Arc::clone(&chunks[1]), Arc::clone(&chunks[0])],
+            chunks,
+        ];
+
+        // executor has only 1 thread
+        let executor = Executor::new(1);
+        for chunks in chunk_orders {
+            let sort_key = SortKeyBuilder::with_capacity(2)
+                .with_col_opts("tag1", false, true)
+                .with_col_opts(TIME_COLUMN_NAME, false, true)
+                .build();
+
+            let compact_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+                .compact_plan(Arc::from("t"), Arc::clone(&schema), chunks, sort_key)
+                .expect("created compact plan");
+
+            let physical_plan = executor
+                .new_context(ExecutorType::Reorg)
+                .create_physical_plan(&compact_plan)
+                .await
+                .unwrap();
+
+            let batches = test_collect(physical_plan).await;
+
+            // should be sorted on tag1 then timestamp
+            let expected = vec![
+                "+-----------+------+-----------------------------+",
+                "| field_int | tag1 | time                        |",
+                "+-----------+------+-----------------------------+",
+                "| 1         | A    | 1970-01-01T00:00:00.000001Z |",
+                "| 2         | B    | 1970-01-01T00:00:00.000002Z |",
+                "+-----------+------+-----------------------------+",
+            ];
+
+            assert_batches_eq!(&expected, &batches);
+        }
+
+        executor.join().await;
     }
 
     #[tokio::test]
@@ -270,8 +371,8 @@ mod test {
             .with_col_opts(TIME_COLUMN_NAME, false, false)
             .build();
 
-        let compact_plan = ReorgPlanner::new()
-            .compact_plan(schema, chunks, sort_key)
+        let compact_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            .compact_plan(Arc::from("t"), schema, chunks, sort_key)
             .expect("created compact plan");
 
         let executor = Executor::new(1);
@@ -323,8 +424,8 @@ mod test {
             .build();
 
         // split on 1000 should have timestamps 1000, 5000, and 7000
-        let split_plan = ReorgPlanner::new()
-            .split_plan(schema, chunks, sort_key, vec![1000])
+        let split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000])
             .expect("created compact plan");
 
         let executor = Executor::new(1);
@@ -389,8 +490,8 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let split_plan = ReorgPlanner::new()
-            .split_plan(schema, chunks, sort_key, vec![1000, 7000])
+        let split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000, 7000])
             .expect("created compact plan");
 
         let executor = Executor::new(1);
@@ -467,8 +568,8 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let _split_plan = ReorgPlanner::new()
-            .split_plan(schema, chunks, sort_key, vec![]) // reason of panic: empty split_times
+        let _split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![]) // reason of panic: empty split_times
             .expect("created compact plan");
     }
 
@@ -486,8 +587,8 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let _split_plan = ReorgPlanner::new()
-            .split_plan(schema, chunks, sort_key, vec![1000, 500]) // reason of panic: split_times not in ascending order
+        let _split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000, 500]) // reason of panic: split_times not in ascending order
             .expect("created compact plan");
     }
 }

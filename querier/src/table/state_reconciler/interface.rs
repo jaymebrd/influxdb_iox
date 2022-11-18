@@ -1,7 +1,9 @@
 //! Interface for reconciling Ingester and catalog state
 
 use crate::{chunk::QuerierChunk, ingester::IngesterPartition};
-use data_types::{ParquetFile, PartitionId, SequenceNumber, SequencerId, Tombstone, TombstoneId};
+use data_types::{
+    CompactionLevel, ParquetFile, PartitionId, SequenceNumber, ShardId, Tombstone, TombstoneId,
+};
 use std::{ops::Deref, sync::Arc};
 
 /// Information about an ingester partition.
@@ -9,7 +11,7 @@ use std::{ops::Deref, sync::Arc};
 /// This is mostly the same as [`IngesterPartition`] but allows easier mocking.
 pub trait IngesterPartitionInfo {
     fn partition_id(&self) -> PartitionId;
-    fn sequencer_id(&self) -> SequencerId;
+    fn shard_id(&self) -> ShardId;
     fn parquet_max_sequence_number(&self) -> Option<SequenceNumber>;
     fn tombstone_max_sequence_number(&self) -> Option<SequenceNumber>;
 }
@@ -19,8 +21,8 @@ impl IngesterPartitionInfo for IngesterPartition {
         self.deref().partition_id()
     }
 
-    fn sequencer_id(&self) -> SequencerId {
-        self.deref().sequencer_id()
+    fn shard_id(&self) -> ShardId {
+        self.deref().shard_id()
     }
 
     fn parquet_max_sequence_number(&self) -> Option<SequenceNumber> {
@@ -40,8 +42,8 @@ where
         self.deref().partition_id()
     }
 
-    fn sequencer_id(&self) -> SequencerId {
-        self.deref().sequencer_id()
+    fn shard_id(&self) -> ShardId {
+        self.deref().shard_id()
     }
 
     fn parquet_max_sequence_number(&self) -> Option<SequenceNumber> {
@@ -58,8 +60,8 @@ where
 /// This is mostly the same as [`ParquetFile`] but allows easier mocking.
 pub trait ParquetFileInfo {
     fn partition_id(&self) -> PartitionId;
-    fn min_sequence_number(&self) -> SequenceNumber;
     fn max_sequence_number(&self) -> SequenceNumber;
+    fn compaction_level(&self) -> CompactionLevel;
 }
 
 impl ParquetFileInfo for Arc<ParquetFile> {
@@ -67,12 +69,12 @@ impl ParquetFileInfo for Arc<ParquetFile> {
         self.partition_id
     }
 
-    fn min_sequence_number(&self) -> SequenceNumber {
-        self.min_sequence_number
-    }
-
     fn max_sequence_number(&self) -> SequenceNumber {
         self.max_sequence_number
+    }
+
+    fn compaction_level(&self) -> CompactionLevel {
+        self.compaction_level
     }
 }
 
@@ -81,12 +83,12 @@ impl ParquetFileInfo for QuerierChunk {
         self.meta().partition_id()
     }
 
-    fn min_sequence_number(&self) -> SequenceNumber {
-        self.meta().min_sequence_number()
-    }
-
     fn max_sequence_number(&self) -> SequenceNumber {
         self.meta().max_sequence_number()
+    }
+
+    fn compaction_level(&self) -> CompactionLevel {
+        self.meta().compaction_level()
     }
 }
 
@@ -95,7 +97,7 @@ impl ParquetFileInfo for QuerierChunk {
 /// This is mostly the same as [`Tombstone`] but allows easier mocking.
 pub trait TombstoneInfo {
     fn id(&self) -> TombstoneId;
-    fn sequencer_id(&self) -> SequencerId;
+    fn shard_id(&self) -> ShardId;
     fn sequence_number(&self) -> SequenceNumber;
 }
 
@@ -104,8 +106,8 @@ impl TombstoneInfo for Tombstone {
         self.id
     }
 
-    fn sequencer_id(&self) -> SequencerId {
-        self.sequencer_id
+    fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     fn sequence_number(&self) -> SequenceNumber {
@@ -118,8 +120,8 @@ impl TombstoneInfo for Arc<Tombstone> {
         self.id
     }
 
-    fn sequencer_id(&self) -> SequencerId {
-        self.sequencer_id
+    fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     fn sequence_number(&self) -> SequenceNumber {

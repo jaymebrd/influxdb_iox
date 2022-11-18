@@ -1,19 +1,20 @@
 [package]
 name = "sharder"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 data_types = { path = "../data_types" }
 mutable_batch = { path = "../mutable_batch" }
 parking_lot = "0.12"
 siphasher = "0.3"
-snafu = "0.7"
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]
-criterion = { version = "0.3.6", features = ["async_tokio", "html_reports"] }
-hashbrown = "0.12"
+criterion = { version = "0.4", default-features = false, features = ["async_tokio", "rayon"]}
+hashbrown = { workspace = true }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 rand = "0.8.3"
 test_helpers = { path = "../test_helpers" }
@@ -21,3 +22,8 @@ test_helpers = { path = "../test_helpers" }
 [[bench]]
 name = "sharder"
 harness = false
+
+[lib]
+# Allow --save-baseline to work
+# https://github.com/bheisler/criterion.rs/issues/275
+bench = false

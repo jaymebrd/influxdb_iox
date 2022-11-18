@@ -2,7 +2,7 @@
 //! and Aggregate functions in IOx, designed to be compatible with
 //! InfluxDB classic
 
-use datafusion::logical_plan::Expr;
+use datafusion::prelude::Expr;
 use snafu::Snafu;
 
 use crate::window;
@@ -20,7 +20,7 @@ pub enum Error {
 #[allow(missing_docs)]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, PartialEq, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 
 /// TimeSeries specific aggregates or selector functions
 ///
@@ -69,7 +69,7 @@ pub enum Aggregate {
 
 /// Represents some duration in time
 #[allow(missing_docs)]
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WindowDuration {
     /// Variable sized window,
     Variable { months: i64, negative: bool },
@@ -81,7 +81,7 @@ pub enum WindowDuration {
 impl Aggregate {
     /// Create the appropriate DataFusion expression for this aggregate
     pub fn to_datafusion_expr(self, input: Expr) -> Result<Expr> {
-        use datafusion::logical_plan::{avg, count, max, min, sum};
+        use datafusion::prelude::{avg, count, max, min, sum};
         match self {
             Self::Sum => Ok(sum(input)),
             Self::Count => Ok(count(input)),

@@ -13,7 +13,7 @@ use crate::commands::{
     run::all_in_one,
     tracing::{init_logs_and_tracing, init_simple_logs, TroggingGuard},
 };
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use influxdb_iox_client::connection::Builder;
 use iox_time::{SystemProvider, TimeProvider};
 use observability_deps::tracing::warn;
@@ -28,8 +28,10 @@ use tokio::runtime::Runtime;
 
 mod commands {
     pub mod catalog;
+    pub mod compactor;
     pub mod debug;
-    pub mod objectstore_garbage_collect;
+    pub mod import;
+    pub mod namespace;
     pub mod query;
     pub mod query_ingester;
     pub mod remote;
@@ -44,15 +46,28 @@ enum ReturnCode {
     Failure = 1,
 }
 
-static VERSION_STRING: Lazy<String> = Lazy::new(|| {
-    format!(
-        "{}, revision {}",
-        option_env!("CARGO_PKG_VERSION").unwrap_or("UNKNOWN"),
-        env!(
-            "GIT_HASH",
-            "Can not find find GIT HASH in build environment"
-        )
-    )
+/// Package version.
+pub static IOX_VERSION: Lazy<&'static str> =
+    Lazy::new(|| option_env!("CARGO_PKG_VERSION").unwrap_or("UNKNOWN"));
+
+/// Build-time GIT revision hash.
+pub static IOX_GIT_HASH: &str = env!(
+    "GIT_HASH",
+    "Can not find find GIT HASH in build environment"
+);
+
+/// Version string that is combined from [`IOX_VERSION`] and [`IOX_GIT_HASH`].
+pub static VERSION_STRING: Lazy<&'static str> = Lazy::new(|| {
+    let s = format!("{}, revision {}", &IOX_VERSION[..], IOX_GIT_HASH);
+    let s: Box<str> = Box::from(s);
+    Box::leak(s)
+});
+
+/// A UUID that is unique for the process lifetime.
+pub static PROCESS_UUID: Lazy<&'static str> = Lazy::new(|| {
+    let s = uuid::Uuid::new_v4().to_string();
+    let s: Box<str> = Box::from(s);
+    Box::leak(s)
 });
 
 #[cfg(all(
@@ -66,6 +81,14 @@ compile_error!("heappy and jemalloc_replacing_malloc features are mutually exclu
 #[clap(
     name = "influxdb_iox",
     version = &VERSION_STRING[..],
+    disable_help_flag = true,
+    arg(
+        clap::Arg::new("help")
+            .long("help")
+            .help("Print help information")
+            .action(clap::ArgAction::Help)
+            .global(true)
+    ),
     about = "InfluxDB IOx server and command line tools",
     long_about = r#"InfluxDB IOx server and command line tools
 
@@ -92,9 +115,9 @@ Command are generally structured in the form:
     <type of object> <action> <arguments>
 
 For example, a command such as the following shows all actions
-    available for database chunks, including get and list.
+    available for namespaces, including `list` and `retention`.
 
-    influxdb_iox database chunk --help
+    influxdb_iox namespace --help
 "#
 )]
 struct Config {
@@ -158,13 +181,16 @@ enum Command {
     /// Various commands for catalog manipulation
     Catalog(commands::catalog::Config),
 
-    /// Interrogate internal database data
+    /// Various commands for compactor manipulation
+    Compactor(Box<commands::compactor::Config>),
+
+    /// Interrogate internal data
     Debug(commands::debug::Config),
 
     /// Initiate a read request to the gRPC storage service.
     Storage(commands::storage::Config),
 
-    /// Write data into the specified database
+    /// Write data into the specified namespace
     Write(commands::write::Config),
 
     /// Query the data with SQL
@@ -173,9 +199,11 @@ enum Command {
     /// Query the ingester only
     QueryIngester(commands::query_ingester::Config),
 
-    /// Clean up old object store files that don't appear in the catalog.
-    #[clap(name = "objectstore_garbage_collect")]
-    ObjectStoreGarbageCollect(Box<commands::objectstore_garbage_collect::Config>),
+    /// Commands related to the bulk ingest of data
+    Import(commands::import::Config),
+
+    /// Various commands for namespace manipulation
+    Namespace(commands::namespace::Config),
 }
 
 fn main() -> Result<(), std::io::Error> {
@@ -279,6 +307,13 @@ fn main() -> Result<(), std::io::Error> {
                     std::process::exit(ReturnCode::Failure as _)
                 }
             }
+            Some(Command::Compactor(config)) => {
+                let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
+                if let Err(e) = commands::compactor::command(*config).await {
+                    eprintln!("{}", e);
+                    std::process::exit(ReturnCode::Failure as _)
+                }
+            }
             Some(Command::Debug(config)) => {
                 let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
                 if let Err(e) = commands::debug::command(connection, config).await {
@@ -310,14 +345,19 @@ fn main() -> Result<(), std::io::Error> {
                     std::process::exit(ReturnCode::Failure as _)
                 }
             }
-            Some(Command::ObjectStoreGarbageCollect(config)) => {
+            Some(Command::Import(config)) => {
                 let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
-                if let Err(e) = commands::objectstore_garbage_collect::command(*config).await {
-                    use snafu::ErrorCompat;
+                let connection = connection().await;
+                if let Err(e) = commands::import::command(connection, config).await {
                     eprintln!("{}", e);
-                    for cause in ErrorCompat::iter_chain(&e).skip(1) {
-                        eprintln!("Caused by: {cause}");
-                    }
+                    std::process::exit(ReturnCode::Failure as _)
+                }
+            }
+            Some(Command::Namespace(config)) => {
+                let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
+                let connection = connection().await;
+                if let Err(e) = commands::namespace::command(connection, config).await {
+                    eprintln!("{}", e);
                     std::process::exit(ReturnCode::Failure as _)
                 }
             }
@@ -381,7 +421,7 @@ fn get_runtime(num_threads: Option<usize>) -> Result<Runtime, std::io::Error> {
 fn load_dotenv() {
     match dotenv() {
         Ok(_) => {}
-        Err(dotenv::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             // Ignore this - a missing env file is not an error, defaults will
             // be applied when initialising the Config struct.
         }
@@ -469,5 +509,18 @@ where
                 s
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    #[test]
+    // ensures that dependabot doesn't update dotenvy until https://github.com/allan2/dotenvy/issues/12 is fixed
+    fn dotenvy_regression() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "# '").unwrap();
+        dotenvy::from_path(tmp.path()).unwrap();
     }
 }

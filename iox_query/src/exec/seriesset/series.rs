@@ -248,39 +248,32 @@ impl SeriesSet {
     /// Create the tag=value pairs for this series set, adding
     /// adding the _f and _m tags for the field name and measurement
     fn create_frame_tags(&self, field_name: &str) -> Vec<Tag> {
-        // Special case "measurement" name which is modeled as a tag of
-        // "_measurement" and "field" which is modeled as a tag of "_field"
-        //
-        // N.B., in order to emit series sets in the same "tag order" as they
-        // would be in a TSM model we need to emit "_measurement" at the front
-        // and "_field" at the end. Whilst this does not appear to be the
-        // correct lexicographical order, in a TSM data-model these tags are
-        // actually stored as `\x00` and `\xff` respectively. Therefore the
-        // expectation is that "_measurement" is emitted first and "_field"
-        // last.
-        //
-        // This also ensures that the output will be sorted first by
-        // "_measurement" and then "_field" even when there are no groups
-        // requested.
+        // Add special _field and _measurement tags and return them in
+        // lexicographical (sorted) order
 
-        // Prepend key with "_measurement"
-        let mut converted_tags = vec![Tag {
-            key: MEASUREMENT_COLUMN_NAME.into(),
-            value: Arc::clone(&self.table_name),
-        }];
+        let mut all_tags = self
+            .tags
+            .iter()
+            .cloned()
+            .chain(
+                [
+                    (Arc::from(FIELD_COLUMN_NAME), Arc::from(field_name)),
+                    (
+                        Arc::from(MEASUREMENT_COLUMN_NAME),
+                        Arc::clone(&self.table_name),
+                    ),
+                ]
+                .into_iter(),
+            )
+            .collect::<Vec<_>>();
 
-        // convert the rest of the tags
-        converted_tags.extend(self.tags.iter().map(|(k, v)| Tag {
-            key: Arc::clone(k),
-            value: Arc::clone(v),
-        }));
+        // sort by name
+        all_tags.sort_by(|(key1, _value), (key2, _value2)| key1.cmp(key2));
 
-        // Add "_field" to end of key.
-        converted_tags.push(Tag {
-            key: FIELD_COLUMN_NAME.into(),
-            value: field_name.into(),
-        });
-        converted_tags
+        all_tags
+            .into_iter()
+            .map(|(key, value)| Tag { key, value })
+            .collect()
     }
 }
 
@@ -451,15 +444,15 @@ mod tests {
         let series_strings = series_set_to_series_strings(series_set);
 
         let expected = vec![
-            "Series tags={_measurement=the_table, tag1=val1, _field=string_field}",
+            "Series tags={_field=string_field, _measurement=the_table, tag1=val1}",
             "  StringPoints timestamps: [2000, 3000], values: [\"bar\", \"baz\"]",
-            "Series tags={_measurement=the_table, tag1=val1, _field=int_field}",
+            "Series tags={_field=int_field, _measurement=the_table, tag1=val1}",
             "  IntegerPoints timestamps: [2000, 3000], values: [2, 3]",
-            "Series tags={_measurement=the_table, tag1=val1, _field=uint_field}",
+            "Series tags={_field=uint_field, _measurement=the_table, tag1=val1}",
             "  UnsignedPoints timestamps: [2000, 3000], values: [22, 33]",
-            "Series tags={_measurement=the_table, tag1=val1, _field=float_field}",
+            "Series tags={_field=float_field, _measurement=the_table, tag1=val1}",
             "  FloatPoints timestamps: [2000, 3000], values: [20.1, 30.1]",
-            "Series tags={_measurement=the_table, tag1=val1, _field=boolean_field}",
+            "Series tags={_field=boolean_field, _measurement=the_table, tag1=val1}",
             "  BooleanPoints timestamps: [2000, 3000], values: [false, true]",
         ];
 
@@ -471,12 +464,50 @@ mod tests {
     }
 
     #[test]
-    fn test_series_set_conversion_different_time_columns() {
-        let time1_array: ArrayRef =
-            Arc::new(TimestampNanosecondArray::from_vec(vec![1, 2, 3], None));
+    fn test_series_set_conversion_mixed_case_tags() {
+        let time1_array: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![1, 2, 3]));
         let string1_array: ArrayRef = Arc::new(StringArray::from(vec!["foo", "bar", "baz"]));
-        let time2_array: ArrayRef =
-            Arc::new(TimestampNanosecondArray::from_vec(vec![3, 4, 5], None));
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("time1", time1_array as ArrayRef),
+            ("string_field1", string1_array),
+        ])
+        .expect("created new record batch");
+
+        let series_set = SeriesSet {
+            table_name: Arc::from("the_table"),
+            tags: vec![
+                (Arc::from("CAPITAL_TAG"), Arc::from("the_value")),
+                (Arc::from("tag1"), Arc::from("val1")),
+            ],
+            // field indexes are (value, time)
+            field_indexes: FieldIndexes::from_slice(&[(1, 0)]),
+            start_row: 1,
+            num_rows: 2,
+            batch,
+        };
+
+        let series_strings = series_set_to_series_strings(series_set);
+
+        // expect  CAPITAL_TAG is before `_field` and `_measurement` tags
+        // (as that is the correct lexicographical ordering)
+        let expected = vec![
+            "Series tags={CAPITAL_TAG=the_value, _field=string_field1, _measurement=the_table, tag1=val1}",
+            "  StringPoints timestamps: [2, 3], values: [\"bar\", \"baz\"]",
+        ];
+
+        assert_eq!(
+            series_strings, expected,
+            "Expected:\n{:#?}\nActual:\n{:#?}",
+            expected, series_strings
+        );
+    }
+
+    #[test]
+    fn test_series_set_conversion_different_time_columns() {
+        let time1_array: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![1, 2, 3]));
+        let string1_array: ArrayRef = Arc::new(StringArray::from(vec!["foo", "bar", "baz"]));
+        let time2_array: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![3, 4, 5]));
         let string2_array: ArrayRef = Arc::new(StringArray::from(vec!["boo", "far", "faz"]));
 
         let batch = RecordBatch::try_from_iter(vec![
@@ -500,9 +531,9 @@ mod tests {
         let series_strings = series_set_to_series_strings(series_set);
 
         let expected = vec![
-            "Series tags={_measurement=the_table, tag1=val1, _field=string_field2}",
+            "Series tags={_field=string_field2, _measurement=the_table, tag1=val1}",
             "  StringPoints timestamps: [4, 5], values: [\"far\", \"faz\"]",
-            "Series tags={_measurement=the_table, tag1=val1, _field=string_field1}",
+            "Series tags={_field=string_field1, _measurement=the_table, tag1=val1}",
             "  StringPoints timestamps: [2, 3], values: [\"bar\", \"baz\"]",
         ];
 
@@ -525,10 +556,8 @@ mod tests {
             Some(40.1),
         ]));
 
-        let timestamp_array: ArrayRef = Arc::new(TimestampNanosecondArray::from_vec(
-            vec![1000, 2000, 3000, 4000],
-            None,
-        ));
+        let timestamp_array: ArrayRef =
+            Arc::new(TimestampNanosecondArray::from(vec![1000, 2000, 3000, 4000]));
 
         let batch = RecordBatch::try_from_iter_with_nullable(vec![
             ("state", tag_array, true),
@@ -552,7 +581,7 @@ mod tests {
         let series_strings = series_set_to_series_strings(series_set);
 
         let expected = vec![
-            "Series tags={_measurement=the_table, state=MA, _field=float_field}",
+            "Series tags={_field=float_field, _measurement=the_table, state=MA}",
             "  FloatPoints timestamps: [1000, 2000, 4000], values: [10.1, 20.1, 40.1]",
         ];
 
@@ -573,7 +602,7 @@ mod tests {
         let uint_array = UInt64Array::from(vec![None, Some(100)]);
         let bool_array = BooleanArray::from(vec![None, Some(true)]);
 
-        let timestamp_array = TimestampNanosecondArray::from_vec(vec![1000, 2000], None);
+        let timestamp_array = TimestampNanosecondArray::from(vec![1000, 2000]);
 
         let batch = RecordBatch::try_from_iter_with_nullable(vec![
             ("state", Arc::new(tag_array) as ArrayRef, true),
@@ -600,15 +629,15 @@ mod tests {
         let series_strings = series_set_to_series_strings(series_set);
 
         let expected = vec![
-            "Series tags={_measurement=the_table, state=MA, _field=string_field}",
+            "Series tags={_field=string_field, _measurement=the_table, state=MA}",
             "  StringPoints timestamps: [2000], values: [\"foo\"]",
-            "Series tags={_measurement=the_table, state=MA, _field=float_field}",
+            "Series tags={_field=float_field, _measurement=the_table, state=MA}",
             "  FloatPoints timestamps: [2000], values: [1.0]",
-            "Series tags={_measurement=the_table, state=MA, _field=int_field}",
+            "Series tags={_field=int_field, _measurement=the_table, state=MA}",
             "  IntegerPoints timestamps: [2000], values: [-10]",
-            "Series tags={_measurement=the_table, state=MA, _field=uint_field}",
+            "Series tags={_field=uint_field, _measurement=the_table, state=MA}",
             "  UnsignedPoints timestamps: [2000], values: [100]",
-            "Series tags={_measurement=the_table, state=MA, _field=bool_field}",
+            "Series tags={_field=bool_field, _measurement=the_table, state=MA}",
             "  BooleanPoints timestamps: [2000], values: [true]",
         ];
 
@@ -626,10 +655,8 @@ mod tests {
         let float_array: ArrayRef = Arc::new(Float64Array::from(vec![10.1, 20.1, 30.1, 40.1]));
         let bool_array: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true, false]));
 
-        let timestamp_array: ArrayRef = Arc::new(TimestampNanosecondArray::from_vec(
-            vec![1000, 2000, 3000, 4000],
-            None,
-        ));
+        let timestamp_array: ArrayRef =
+            Arc::new(TimestampNanosecondArray::from(vec![1000, 2000, 3000, 4000]));
 
         RecordBatch::try_from_iter_with_nullable(vec![
             ("string_field", string_array, true),

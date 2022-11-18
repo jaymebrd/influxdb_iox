@@ -1,213 +1,28 @@
 //! Test setups and data for ingester crate
 
 #![allow(missing_docs)]
+#![cfg(test)]
 
-use crate::data::{
-    IngesterData, NamespaceData, PartitionData, PersistingBatch, QueryableBatch, SequencerData,
-    SnapshotBatch, TableData,
-};
+use std::{sync::Arc, time::Duration};
+
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_eq;
-use bitflags::bitflags;
 use data_types::{
-    CompactionLevel, KafkaPartition, NamespaceId, PartitionId, PartitionKey, SequenceNumber,
-    SequencerId, TableId, Timestamp, Tombstone, TombstoneId,
+    NamespaceId, PartitionKey, Sequence, SequenceNumber, ShardId, ShardIndex, TableId,
 };
+use dml::{DmlMeta, DmlOperation, DmlWrite};
 use iox_catalog::{interface::Catalog, mem::MemCatalog};
 use iox_query::test::{raw_data, TestChunk};
-use iox_time::{SystemProvider, Time, TimeProvider};
+use iox_time::{SystemProvider, Time};
+use mutable_batch_lp::lines_to_batches;
 use object_store::memory::InMemory;
-use parquet_file::metadata::IoxMetadata;
-use schema::sort::SortKey;
-use std::{collections::BTreeMap, sync::Arc};
-use uuid::Uuid;
 
-/// Create a persisting batch, some tombstones and corresponding metadata for them after compaction
-pub async fn make_persisting_batch_with_meta() -> (Arc<PersistingBatch>, Vec<Tombstone>, IoxMetadata)
-{
-    // record batches of input data
-    let batches = create_batches_with_influxtype_different_columns_different_order().await;
+use crate::{
+    data::IngesterData,
+    lifecycle::{LifecycleConfig, LifecycleManager},
+};
 
-    // tombstones
-    let tombstones = vec![
-        create_tombstone(
-            1,
-            1,
-            1,
-            100,                          // delete's seq_number
-            0,                            // min time of data to get deleted
-            200000,                       // max time of data to get deleted
-            "tag2=CT and field_int=1000", // delete predicate
-        ),
-        create_tombstone(
-            1, 1, 1, 101,        // delete's seq_number
-            0,          // min time of data to get deleted
-            200000,     // max time of data to get deleted
-            "tag1!=MT", // delete predicate
-        ),
-    ];
-
-    // IDs set to the persisting batch and its compacted metadata
-    let uuid = Uuid::new_v4();
-    let namespace_name = "test_namespace";
-    let partition_key = "test_partition_key";
-    let table_name = "test_table";
-    let seq_id = 1;
-    let seq_num_start: i64 = 1;
-    let seq_num_end: i64 = seq_num_start + 1; // 2 batches
-    let namespace_id = 1;
-    let table_id = 1;
-    let partition_id = 1;
-
-    // make the persisting batch
-    let persisting_batch = make_persisting_batch(
-        seq_id,
-        seq_num_start,
-        table_id,
-        table_name,
-        partition_id,
-        uuid,
-        batches,
-        tombstones.clone(),
-    );
-
-    // make metadata
-    let time_provider = Arc::new(SystemProvider::new());
-    let meta = make_meta(
-        uuid,
-        time_provider.now(),
-        seq_id,
-        namespace_id,
-        namespace_name,
-        table_id,
-        table_name,
-        partition_id,
-        partition_key,
-        seq_num_start,
-        seq_num_end,
-        CompactionLevel::Initial,
-        Some(SortKey::from_columns(vec!["tag1", "tag2", "time"])),
-    );
-
-    (persisting_batch, tombstones, meta)
-}
-
-/// Create tombstone for testing
-pub fn create_tombstone(
-    id: i64,
-    table_id: i64,
-    seq_id: i64,
-    seq_num: i64,
-    min_time: i64,
-    max_time: i64,
-    predicate: &str,
-) -> Tombstone {
-    Tombstone {
-        id: TombstoneId::new(id),
-        table_id: TableId::new(table_id),
-        sequencer_id: SequencerId::new(seq_id),
-        sequence_number: SequenceNumber::new(seq_num),
-        min_time: Timestamp::new(min_time),
-        max_time: Timestamp::new(max_time),
-        serialized_predicate: predicate.to_string(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn make_meta(
-    object_store_id: Uuid,
-    creation_timestamp: Time,
-    sequencer_id: i64,
-    namespace_id: i64,
-    namespace_name: &str,
-    table_id: i64,
-    table_name: &str,
-    partition_id: i64,
-    partition_key: &str,
-    min_sequence_number: i64,
-    max_sequence_number: i64,
-    compaction_level: CompactionLevel,
-    sort_key: Option<SortKey>,
-) -> IoxMetadata {
-    IoxMetadata {
-        object_store_id,
-        creation_timestamp,
-        sequencer_id: SequencerId::new(sequencer_id),
-        namespace_id: NamespaceId::new(namespace_id),
-        namespace_name: Arc::from(namespace_name),
-        table_id: TableId::new(table_id),
-        table_name: Arc::from(table_name),
-        partition_id: PartitionId::new(partition_id),
-        partition_key: PartitionKey::from(partition_key),
-        min_sequence_number: SequenceNumber::new(min_sequence_number),
-        max_sequence_number: SequenceNumber::new(max_sequence_number),
-        compaction_level,
-        sort_key,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn make_persisting_batch(
-    seq_id: i64,
-    seq_num_start: i64,
-    table_id: i64,
-    table_name: &str,
-    partition_id: i64,
-    object_store_id: Uuid,
-    batches: Vec<Arc<RecordBatch>>,
-    tombstones: Vec<Tombstone>,
-) -> Arc<PersistingBatch> {
-    let queryable_batch =
-        make_queryable_batch_with_deletes(table_name, seq_num_start, batches, tombstones);
-
-    Arc::new(PersistingBatch {
-        sequencer_id: SequencerId::new(seq_id),
-        table_id: TableId::new(table_id),
-        partition_id: PartitionId::new(partition_id),
-        object_store_id,
-        data: queryable_batch,
-    })
-}
-
-pub fn make_queryable_batch(
-    table_name: &str,
-    seq_num_start: i64,
-    batches: Vec<Arc<RecordBatch>>,
-) -> Arc<QueryableBatch> {
-    make_queryable_batch_with_deletes(table_name, seq_num_start, batches, vec![])
-}
-
-pub fn make_queryable_batch_with_deletes(
-    table_name: &str,
-    seq_num_start: i64,
-    batches: Vec<Arc<RecordBatch>>,
-    tombstones: Vec<Tombstone>,
-) -> Arc<QueryableBatch> {
-    // make snapshots for the batches
-    let mut snapshots = vec![];
-    let mut seq_num = seq_num_start;
-    for batch in batches {
-        let seq = SequenceNumber::new(seq_num);
-        snapshots.push(Arc::new(make_snapshot_batch(batch, seq, seq)));
-        seq_num += 1;
-    }
-
-    Arc::new(QueryableBatch::new(table_name, snapshots, tombstones))
-}
-
-pub fn make_snapshot_batch(
-    batch: Arc<RecordBatch>,
-    min: SequenceNumber,
-    max: SequenceNumber,
-) -> SnapshotBatch {
-    SnapshotBatch {
-        min_sequencer_number: min,
-        max_sequencer_number: max,
-        data: batch,
-    }
-}
-
-pub async fn create_one_row_record_batch_with_influxtype() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_one_row_record_batch_with_influxtype() -> Vec<Arc<RecordBatch>> {
     let chunk1 = Arc::new(
         TestChunk::new("t")
             .with_id(1)
@@ -235,7 +50,8 @@ pub async fn create_one_row_record_batch_with_influxtype() -> Vec<Arc<RecordBatc
     batches
 }
 
-pub async fn create_one_record_batch_with_influxtype_no_duplicates() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_one_record_batch_with_influxtype_no_duplicates() -> Vec<Arc<RecordBatch>>
+{
     let chunk1 = Arc::new(
         TestChunk::new("t")
             .with_id(1)
@@ -265,7 +81,7 @@ pub async fn create_one_record_batch_with_influxtype_no_duplicates() -> Vec<Arc<
     batches
 }
 
-pub async fn create_one_record_batch_with_influxtype_duplicates() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_one_record_batch_with_influxtype_duplicates() -> Vec<Arc<RecordBatch>> {
     let chunk1 = Arc::new(
         TestChunk::new("t")
             .with_id(1)
@@ -303,7 +119,7 @@ pub async fn create_one_record_batch_with_influxtype_duplicates() -> Vec<Arc<Rec
 }
 
 /// RecordBatches with knowledge of influx metadata
-pub async fn create_batches_with_influxtype() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_batches_with_influxtype() -> Vec<Arc<RecordBatch>> {
     // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
     let mut batches = vec![];
 
@@ -389,7 +205,7 @@ pub async fn create_batches_with_influxtype() -> Vec<Arc<RecordBatch>> {
 }
 
 /// RecordBatches with knowledge of influx metadata
-pub async fn create_batches_with_influxtype_different_columns() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_batches_with_influxtype_different_columns() -> Vec<Arc<RecordBatch>> {
     // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
     let mut batches = vec![];
 
@@ -453,7 +269,7 @@ pub async fn create_batches_with_influxtype_different_columns() -> Vec<Arc<Recor
 }
 
 /// RecordBatches with knowledge of influx metadata
-pub async fn create_batches_with_influxtype_different_columns_different_order(
+pub(crate) async fn create_batches_with_influxtype_different_columns_different_order(
 ) -> Vec<Arc<RecordBatch>> {
     // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
     let mut batches = vec![];
@@ -517,7 +333,8 @@ pub async fn create_batches_with_influxtype_different_columns_different_order(
 }
 
 /// Has 2 tag columns; tag1 has a lower cardinality (3) than tag3 (4)
-pub async fn create_batches_with_influxtype_different_cardinality() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_batches_with_influxtype_different_cardinality() -> Vec<Arc<RecordBatch>>
+{
     // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
     let mut batches = vec![];
 
@@ -571,7 +388,8 @@ pub async fn create_batches_with_influxtype_different_cardinality() -> Vec<Arc<R
 }
 
 /// RecordBatches with knowledge of influx metadata
-pub async fn create_batches_with_influxtype_same_columns_different_type() -> Vec<Arc<RecordBatch>> {
+pub(crate) async fn create_batches_with_influxtype_same_columns_different_type(
+) -> Vec<Arc<RecordBatch>> {
     // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
     let mut batches = vec![];
 
@@ -623,142 +441,71 @@ pub async fn create_batches_with_influxtype_same_columns_different_type() -> Vec
     batches
 }
 
-pub const TEST_NAMESPACE: &str = "test_namespace";
-pub const TEST_NAMESPACE_EMPTY: &str = "test_namespace_empty";
-pub const TEST_TABLE: &str = "test_table";
-pub const TEST_TABLE_EMPTY: &str = "test_table_empty";
-pub const TEST_PARTITION_1: &str = "test+partition_1";
-pub const TEST_PARTITION_2: &str = "test+partition_2";
-
-bitflags! {
-    /// Make the same in-memory data but data are split between:
-    ///    . one or two partition
-    ///    . The first partition will have a choice to have data in either
-    ///       . buffer only
-    ///       . snapshot only
-    ///       . persisting only
-    ///       . buffer + snapshot
-    ///       . buffer + persisting
-    ///       . snapshot + persisting
-    ///       . buffer + snapshot + persisting
-    ///    . If the second partittion exists, it only has data in its buffer
-    pub struct DataLocation: u8 {
-        const BUFFER = 0b001;
-        const SNAPSHOT = 0b010;
-        const PERSISTING = 0b100;
-        const BUFFER_SNAPSHOT = Self::BUFFER.bits | Self::SNAPSHOT.bits;
-        const BUFFER_PERSISTING = Self::BUFFER.bits | Self::PERSISTING.bits;
-        const SNAPSHOT_PERSISTING = Self::SNAPSHOT.bits | Self::PERSISTING.bits;
-        const BUFFER_SNAPSHOT_PERSISTING = Self::BUFFER.bits | Self::SNAPSHOT.bits | Self::PERSISTING.bits;
-    }
-}
+pub(crate) const TEST_NAMESPACE: &str = "test_namespace";
+pub(crate) const TEST_TABLE: &str = "test_table";
+pub(crate) const TEST_PARTITION_1: &str = "test+partition_1";
+pub(crate) const TEST_PARTITION_2: &str = "test+partition_2";
 
 /// This function produces one scenario but with the parameter combination (2*7),
 /// you will be able to produce 14 scenarios by calling it in 2 loops
-pub fn make_ingester_data(two_partitions: bool, loc: DataLocation) -> IngesterData {
+pub(crate) async fn make_ingester_data(
+    two_partitions: bool,
+) -> (IngesterData, NamespaceId, TableId) {
     // Whatever data because they won't be used in the tests
     let metrics: Arc<metric::Registry> = Default::default();
     let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
     let object_store = Arc::new(InMemory::new());
     let exec = Arc::new(iox_query::exec::Executor::new(1));
-
-    // Make data for one sequencer/shard and two tables
-    let seq_id = SequencerId::new(1);
-    let empty_table_id = TableId::new(1);
-    let data_table_id = TableId::new(2);
-
-    // Make partitions per requested
-    let partitions = make_partitions(two_partitions, loc, seq_id, data_table_id, TEST_TABLE);
-
-    // Two tables: one empty and one with data of one or two partitions
-    let mut tables = BTreeMap::new();
-    let empty_tbl = Arc::new(tokio::sync::RwLock::new(TableData::new(
-        empty_table_id,
-        None,
-    )));
-    let data_tbl = Arc::new(tokio::sync::RwLock::new(TableData::new_for_test(
-        data_table_id,
-        None,
-        partitions,
-    )));
-    tables.insert(TEST_TABLE_EMPTY.to_string(), empty_tbl);
-    tables.insert(TEST_TABLE.to_string(), data_tbl);
-
-    // Two namespaces: one empty and one with data of 2 tables
-    let mut namespaces = BTreeMap::new();
-    let empty_ns = Arc::new(NamespaceData::new(NamespaceId::new(1), &*metrics));
-    let data_ns = Arc::new(NamespaceData::new_for_test(NamespaceId::new(2), tables));
-    namespaces.insert(TEST_NAMESPACE_EMPTY.to_string(), empty_ns);
-    namespaces.insert(TEST_NAMESPACE.to_string(), data_ns);
-
-    // One sequencer/shard that contains 2 namespaces
-    let kafka_partition = KafkaPartition::new(0);
-    let seq_data = SequencerData::new_for_test(kafka_partition, namespaces);
-    let mut sequencers = BTreeMap::new();
-    sequencers.insert(seq_id, seq_data);
-
-    // Ingester data that includes one sequencer/shard
-    IngesterData::new(
-        object_store,
-        catalog,
-        sequencers,
-        exec,
-        backoff::BackoffConfig::default(),
-    )
-}
-
-pub async fn make_ingester_data_with_tombstones(loc: DataLocation) -> IngesterData {
-    // Whatever data because they won't be used in the tests
-    let metrics: Arc<metric::Registry> = Default::default();
-    let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(metrics));
-    let object_store = Arc::new(InMemory::new());
-    let exec = Arc::new(iox_query::exec::Executor::new(1));
-
-    // Make data for one sequencer/shard and two tables
-    let seq_id = SequencerId::new(1);
-    let data_table_id = TableId::new(2);
-
-    // Make partitions per requested
-    let partitions =
-        make_one_partition_with_tombstones(&exec, loc, seq_id, data_table_id, TEST_TABLE).await;
-
-    // Two tables: one empty and one with data of one or two partitions
-    let mut tables = BTreeMap::new();
-    let data_tbl = TableData::new_for_test(data_table_id, None, partitions);
-    tables.insert(
-        TEST_TABLE.to_string(),
-        Arc::new(tokio::sync::RwLock::new(data_tbl)),
+    let lifecycle = LifecycleManager::new(
+        LifecycleConfig::new(
+            200_000_000,
+            100_000_000,
+            100_000_000,
+            Duration::from_secs(100_000_000),
+            Duration::from_secs(100_000_000),
+            100_000_000,
+        ),
+        Arc::clone(&metrics),
+        Arc::new(SystemProvider::default()),
     );
 
-    // Two namespaces: one empty and one with data of 2 tables
-    let mut namespaces = BTreeMap::new();
-    let data_ns = Arc::new(NamespaceData::new_for_test(NamespaceId::new(2), tables));
-    namespaces.insert(TEST_NAMESPACE.to_string(), data_ns);
+    // Make data for one shard and two tables
+    let shard_index = ShardIndex::new(1);
+    let (shard_id, ns_id, table_id) =
+        populate_catalog(&*catalog, shard_index, TEST_NAMESPACE, TEST_TABLE).await;
 
-    // One sequencer/shard that contains 1 namespace
-    let kafka_partition = KafkaPartition::new(0);
-    let seq_data = SequencerData::new_for_test(kafka_partition, namespaces);
-    let mut sequencers = BTreeMap::new();
-    sequencers.insert(seq_id, seq_data);
-
-    // Ingester data that includes one sequencer/shard
-    IngesterData::new(
+    let ingester = IngesterData::new(
         object_store,
-        catalog,
-        sequencers,
+        Arc::clone(&catalog),
+        [(shard_id, shard_index)],
         exec,
         backoff::BackoffConfig::default(),
+        metrics,
     )
+    .await
+    .expect("failed to initialise ingester");
+
+    // Make partitions per requested
+    let ops = make_partitions(two_partitions, shard_index, table_id, ns_id);
+
+    // Apply all ops
+    for op in ops {
+        ingester
+            .buffer_operation(shard_id, op, &lifecycle.handle())
+            .await
+            .unwrap();
+    }
+
+    (ingester, ns_id, table_id)
 }
 
 /// Make data for one or two partitions per requested
 pub(crate) fn make_partitions(
     two_partitions: bool,
-    loc: DataLocation,
-    sequencer_id: SequencerId,
+    shard_index: ShardIndex,
     table_id: TableId,
-    table_name: &str,
-) -> BTreeMap<PartitionKey, PartitionData> {
+    ns_id: NamespaceId,
+) -> Vec<DmlOperation> {
     // In-memory data includes these rows but split between 4 groups go into
     // different batches of parittion 1 or partittion 2  as requeted
     // let expected = vec![
@@ -776,127 +523,105 @@ pub(crate) fn make_partitions(
     //         "+------------+-----+------+--------------------------------+",
     //     ];
 
-    let mut partitions = BTreeMap::new();
-
     // ------------------------------------------
     // Build the first partition
-    let partition_id = PartitionId::new(1);
-    let (mut p1, seq_num) =
-        make_first_partition_data(partition_id, loc, sequencer_id, table_id, table_name);
+    let (mut ops, seq_num) = make_first_partition_data(
+        &PartitionKey::from(TEST_PARTITION_1),
+        shard_index,
+        table_id,
+        ns_id,
+    );
 
     // ------------------------------------------
     // Build the second partition if asked
 
     let mut seq_num = seq_num.get();
     if two_partitions {
-        let partition_id = PartitionId::new(2);
-        let mut p2 = PartitionData::new(partition_id);
         // Group 4: in buffer of p2
-        // Fill `buffer`
-        seq_num += 1;
-        let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+        ops.push(DmlOperation::Write(make_write_op(
+            &PartitionKey::from(TEST_PARTITION_2),
+            shard_index,
+            ns_id,
+            TEST_TABLE,
+            table_id,
+            seq_num,
             r#"test_table,city=Medford day="sun",temp=55 22"#,
-        );
-        p2.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
+        )));
         seq_num += 1;
-        let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-            r#"test_table,city=Reading day="mon",temp=58 40"#,
-        );
-        p2.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
-        partitions.insert(PartitionKey::from(TEST_PARTITION_2), p2);
+        ops.push(DmlOperation::Write(make_write_op(
+            &PartitionKey::from(TEST_PARTITION_2),
+            shard_index,
+            ns_id,
+            TEST_TABLE,
+            table_id,
+            seq_num,
+            r#"test_table,city=Reading day="mon",temp=58 40"#,
+        )));
     } else {
         // Group 4: in buffer of p1
-        // Fill `buffer`
-        seq_num += 1;
-        let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+        ops.push(DmlOperation::Write(make_write_op(
+            &PartitionKey::from(TEST_PARTITION_1),
+            shard_index,
+            ns_id,
+            TEST_TABLE,
+            table_id,
+            seq_num,
             r#"test_table,city=Medford day="sun",temp=55 22"#,
-        );
-        p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
+        )));
         seq_num += 1;
-        let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+
+        ops.push(DmlOperation::Write(make_write_op(
+            &PartitionKey::from(TEST_PARTITION_1),
+            shard_index,
+            ns_id,
+            TEST_TABLE,
+            table_id,
+            seq_num,
             r#"test_table,city=Reading day="mon",temp=58 40"#,
-        );
-        p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
+        )));
     }
 
-    partitions.insert(PartitionKey::from(TEST_PARTITION_1), p1);
-    partitions
+    ops
 }
 
-/// Make data for one partition with tombstones
-pub(crate) async fn make_one_partition_with_tombstones(
-    exec: &iox_query::exec::Executor,
-    loc: DataLocation,
-    sequencer_id: SequencerId,
-    table_id: TableId,
+pub(crate) fn make_write_op(
+    partition_key: &PartitionKey,
+    shard_index: ShardIndex,
+    namespace_id: NamespaceId,
     table_name: &str,
-) -> BTreeMap<PartitionKey, PartitionData> {
-    // In-memory data includes these rows but split between 4 groups go into
-    // different batches of parittion 1 or partittion 2  as requeted
-    // let expected = vec![
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| city       | day | temp | time                           |",
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| Andover    | tue | 56   | 1970-01-01T00:00:00.000000030Z |", // in group 1 - seq_num: 2
-    //         "| Andover    | mon |      | 1970-01-01T00:00:00.000000046Z |", // in group 2 - seq_num: 3
-    //         "| Boston     | sun | 60   | 1970-01-01T00:00:00.000000036Z |", // in group 1 - seq_num: 1  --> will get deleted
-    //         "| Boston     | mon |      | 1970-01-01T00:00:00.000000038Z |", // in group 3 - seq_num: 5  --> will get deleted
-    //         "| Medford    | sun | 55   | 1970-01-01T00:00:00.000000022Z |", // in group 4 - seq_num: 8  (after the tombstone's seq num)
-    //         "| Medford    | wed |      | 1970-01-01T00:00:00.000000026Z |", // in group 2 - seq_num: 4
-    //         "| Reading    | mon | 58   | 1970-01-01T00:00:00.000000040Z |", // in group 4 - seq_num: 9
-    //         "| Wilmington | mon |      | 1970-01-01T00:00:00.000000035Z |", // in group 3 - seq_num: 6
-    //         "+------------+-----+------+--------------------------------+",
-    //     ];
+    table_id: TableId,
+    sequence_number: i64,
+    lines: &str,
+) -> DmlWrite {
+    let mut tables_by_name = lines_to_batches(lines, 0).unwrap();
+    assert_eq!(tables_by_name.len(), 1);
 
-    let partition_id = PartitionId::new(1);
-    let (mut p1, seq_num) =
-        make_first_partition_data(partition_id, loc, sequencer_id, table_id, table_name);
-
-    // Add tombtones
-    // Depending on where the existing data is, they (buffer & snapshot) will be either moved to a new sanpshot after
-    // appying the tombstone or (persisting) stay where they are and the tomstobes is kept to get applied later
-    // ------------------------------------------
-    // Delete
-    let mut seq_num = seq_num.get();
-    seq_num += 1;
-    let ts = create_tombstone(
-        2,                  // tombstone id
-        table_id.get(),     // table id
-        sequencer_id.get(), // sequencer id
-        seq_num,            // delete's seq_number
-        10,                 // min time of data to get deleted
-        50,                 // max time of data to get deleted
-        "city=Boston",      // delete predicate
-    );
-    p1.buffer_tombstone(exec, table_name, ts).await;
-
-    // Group 4: in buffer of p1 after the tombstone
-    // Fill `buffer`
-    seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-        r#"test_table,city=Medford day="sun",temp=55 22"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
-    seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-        r#"test_table,city=Reading day="mon",temp=58 40"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
-
-    let mut partitions = BTreeMap::new();
-    partitions.insert(PartitionKey::from(TEST_PARTITION_1), p1);
-
-    partitions
+    let tables_by_id = [(table_id, tables_by_name.remove(table_name).unwrap())]
+        .into_iter()
+        .collect();
+    DmlWrite::new(
+        namespace_id,
+        tables_by_id,
+        partition_key.clone(),
+        DmlMeta::sequenced(
+            Sequence {
+                shard_index,
+                sequence_number: SequenceNumber::new(sequence_number),
+            },
+            Time::MIN,
+            None,
+            42,
+        ),
+    )
 }
 
 fn make_first_partition_data(
-    partition_id: PartitionId,
-    loc: DataLocation,
-    sequencer_id: SequencerId,
+    partition_key: &PartitionKey,
+    shard_index: ShardIndex,
     table_id: TableId,
-    table_name: &str,
-) -> (PartitionData, SequenceNumber) {
+    ns_id: NamespaceId,
+) -> (Vec<DmlOperation>, SequenceNumber) {
     // In-memory data includes these rows but split between 3 groups go into
     // different batches of parittion p1
     // let expected = vec![
@@ -912,67 +637,109 @@ fn make_first_partition_data(
     //         "+------------+-----+------+--------------------------------+",
     //     ];
 
+    let mut out = Vec::default();
+
     // ------------------------------------------
     // Build the first partition
-    let mut p1 = PartitionData::new(partition_id);
     let mut seq_num = 0;
 
     // --------------------
     // Group 1
-    // Fill `buffer`
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
         r#"test_table,city=Boston day="sun",temp=60 36"#,
-    );
+    )));
     seq_num += 1;
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
-    seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-        r#"test_table,city=Andover day="tue",temp=56 30"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
-    if loc.contains(DataLocation::PERSISTING) {
-        // Move group 1 data to persisting
-        p1.snapshot_to_persisting_batch(sequencer_id, table_id, partition_id, table_name);
-    } else if loc.contains(DataLocation::SNAPSHOT) {
-        // move group 1 data to snapshot
-        p1.snapshot().unwrap();
-    } else {
-    } // keep it in buffer
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
+        r#"test_table,city=Andover day="tue",temp=56 30"#,
+    )));
+    seq_num += 1;
 
     // --------------------
     // Group 2
-    // Fill `buffer`
-    seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
         r#"test_table,city=Andover day="mon" 46"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
+    )));
     seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-        r#"test_table,city=Medford day="wed" 26"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
-    if loc.contains(DataLocation::SNAPSHOT) {
-        // move group 2 data to snapshot
-        p1.snapshot().unwrap();
-    } else {
-    } // keep it in buffer
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
+        r#"test_table,city=Medford day="wed" 26"#,
+    )));
+    seq_num += 1;
 
     // --------------------
     // Group 3: always in buffer
     // Fill `buffer`
-    seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
         r#"test_table,city=Boston day="mon" 38"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
+    )));
     seq_num += 1;
-    let (_, mb) = mutable_batch_lp::test_helpers::lp_to_mutable_batch(
-        r#"test_table,city=Wilmington day="mon" 35"#,
-    );
-    p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
-    (p1, SequenceNumber::new(seq_num))
+    out.push(DmlOperation::Write(make_write_op(
+        partition_key,
+        shard_index,
+        ns_id,
+        TEST_TABLE,
+        table_id,
+        seq_num,
+        r#"test_table,city=Wilmington day="mon" 35"#,
+    )));
+    seq_num += 1;
+
+    (out, SequenceNumber::new(seq_num))
+}
+
+pub(crate) async fn populate_catalog(
+    catalog: &dyn Catalog,
+    shard_index: ShardIndex,
+    namespace: &str,
+    table: &str,
+) -> (ShardId, NamespaceId, TableId) {
+    let mut c = catalog.repositories().await;
+    let topic = c.topics().create_or_get("kafka-topic").await.unwrap();
+    let query_pool = c.query_pools().create_or_get("query-pool").await.unwrap();
+    let ns_id = c
+        .namespaces()
+        .create(namespace, None, topic.id, query_pool.id)
+        .await
+        .unwrap()
+        .id;
+    let table_id = c.tables().create_or_get(table, ns_id).await.unwrap().id;
+    let shard_id = c
+        .shards()
+        .create_or_get(&topic, shard_index)
+        .await
+        .unwrap()
+        .id;
+    (shard_id, ns_id, table_id)
 }

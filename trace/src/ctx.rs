@@ -54,6 +54,9 @@ pub struct SpanContext {
     pub links: Vec<(TraceId, SpanId)>,
 
     pub collector: Option<Arc<dyn TraceCollector>>,
+
+    /// If we should also sample based on this context (i.e. emit child spans).
+    pub sampled: bool,
 }
 
 impl SpanContext {
@@ -61,6 +64,11 @@ impl SpanContext {
     /// new span context has a random trace_id and span_id, and thus
     /// is not connected to any existing span or trace.
     pub fn new(collector: Arc<dyn TraceCollector>) -> Self {
+        Self::new_with_optional_collector(Some(collector))
+    }
+
+    /// Same as [`new`](Self::new), but with an optional collector.
+    pub fn new_with_optional_collector(collector: Option<Arc<dyn TraceCollector>>) -> Self {
         let mut rng = rand::thread_rng();
         let trace_id: u128 = rng.gen_range(1..u128::MAX);
         let span_id: u64 = rng.gen_range(1..u64::MAX);
@@ -70,7 +78,8 @@ impl SpanContext {
             parent_span_id: None,
             span_id: SpanId(NonZeroU64::new(span_id).unwrap()),
             links: vec![],
-            collector: Some(collector),
+            collector,
+            sampled: true,
         }
     }
 
@@ -80,8 +89,9 @@ impl SpanContext {
             trace_id: self.trace_id,
             span_id: SpanId::gen(),
             collector: self.collector.clone(),
-            links: vec![],
+            links: Vec::with_capacity(0),
             parent_span_id: Some(self.span_id),
+            sampled: self.sampled,
         };
         Span::new(name, ctx)
     }
@@ -106,6 +116,7 @@ impl PartialEq for SpanContext {
             && self.span_id == other.span_id
             && self.links == other.links
             && self.collector.is_some() == other.collector.is_some()
+            && self.sampled == other.sampled
     }
 }
 
@@ -141,6 +152,7 @@ mod tests {
                 (TraceId::new(6).unwrap(), SpanId::new(7).unwrap()),
             ],
             collector: Some(collector_1),
+            sampled: true,
         };
 
         let ctx = SpanContext { ..ctx_ref.clone() };
@@ -181,5 +193,11 @@ mod tests {
             ..ctx_ref.clone()
         };
         assert_eq!(ctx_ref, ctx);
+
+        let ctx = SpanContext {
+            sampled: false,
+            ..ctx_ref.clone()
+        };
+        assert_ne!(ctx_ref, ctx);
     }
 }

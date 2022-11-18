@@ -1,24 +1,23 @@
 pub(crate) mod request;
 pub(crate) mod response;
 
-use std::num::NonZeroU64;
-use std::time::Duration;
-
-use snafu::{ResultExt, Snafu};
-use tonic::Status;
-
-use generated_types::{aggregate::AggregateType, Predicate};
+use generated_types::{
+    aggregate::AggregateType, influxdata::platform::storage::read_group_request::Group, Predicate,
+};
 use influxdb_storage_client::{connection::Connection, Client, OrgAndBucket};
 use influxrpc_parser::predicate;
 use iox_time;
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use std::{num::NonZeroU64, time::Duration};
+use tonic::Status;
 
 #[derive(Debug, Snafu)]
 pub enum ParseError {
     #[snafu(display("unable to parse timestamp '{:?}'", t))]
     Timestamp { t: String },
 
-    #[snafu(display("unable to parse database name '{:?}'", db_name))]
-    DBName { db_name: String },
+    #[snafu(display("unable to parse namespace name '{:?}'", db_name))]
+    NamespaceName { db_name: String },
 
     #[snafu(display("unable to parse predicate: {:?}", source))]
     Predicate { source: predicate::Error },
@@ -32,11 +31,20 @@ pub enum ParseError {
     #[snafu(display("error building response: {:?}", source))]
     ResponseError { source: response::Error },
 
-    #[snafu(display("value {:?} not supported for flag {:?}", value, flag))]
-    UnsupportedFlagValue { value: String, flag: String },
+    #[snafu(display(
+        "value {} not supported for format. Expected 'pretty' or 'quiet'",
+        value
+    ))]
+    UnsupportedFormat { value: String },
 
     #[snafu(display("unsupported aggregate type: '{:?}'", agg))]
     Aggregate { agg: String },
+
+    #[snafu(display(
+        "unsupported group. Expected '0', 'none', '2', or 'by': got '{:?}'",
+        group
+    ))]
+    Group { group: String },
 }
 
 pub type Result<T, E = ParseError> = std::result::Result<T, E>;
@@ -47,9 +55,9 @@ pub struct Config {
     #[clap(subcommand)]
     command: Command,
 
-    /// The name of the database
+    /// The name of the namespace
     #[clap(
-        value_parser = parse_db_name,
+        value_parser = parse_namespace_name,
     )]
     db_name: OrgAndBucket,
 
@@ -113,31 +121,23 @@ fn parse_predicate(expr: &str) -> Result<Predicate, ParseError> {
     predicate::expr_to_rpc_predicate(expr).context(PredicateSnafu)
 }
 
-// Attempts to parse the database name into and org and bucket ID.
-fn parse_db_name(db_name: &str) -> Result<OrgAndBucket, ParseError> {
+// Attempts to parse the namespace name into and org and bucket ID.
+fn parse_namespace_name(db_name: &str) -> Result<OrgAndBucket, ParseError> {
     let parts = db_name.split('_').collect::<Vec<_>>();
-    if parts.len() != 2 {
-        return DBNameSnafu {
-            db_name: db_name.to_owned(),
-        }
-        .fail();
-    }
 
-    let org_id = usize::from_str_radix(parts[0], 16).map_err(|_| ParseError::DBName {
-        db_name: db_name.to_owned(),
-    })?;
+    ensure!(parts.len() == 2, NamespaceNameSnafu { db_name });
 
-    let bucket_id = usize::from_str_radix(parts[1], 16).map_err(|_| ParseError::DBName {
-        db_name: db_name.to_owned(),
-    })?;
+    let org_id = usize::from_str_radix(parts[0], 16)
+        .ok()
+        .context(NamespaceNameSnafu { db_name })?;
+
+    let bucket_id = usize::from_str_radix(parts[1], 16)
+        .ok()
+        .context(NamespaceNameSnafu { db_name })?;
 
     Ok(OrgAndBucket::new(
-        NonZeroU64::new(org_id as u64).ok_or_else(|| ParseError::DBName {
-            db_name: db_name.to_owned(),
-        })?,
-        NonZeroU64::new(bucket_id as u64).ok_or_else(|| ParseError::DBName {
-            db_name: db_name.to_owned(),
-        })?,
+        NonZeroU64::new(org_id as u64).context(NamespaceNameSnafu { db_name })?,
+        NonZeroU64::new(bucket_id as u64).context(NamespaceNameSnafu { db_name })?,
     ))
 }
 
@@ -147,9 +147,8 @@ fn parse_format(format: &str) -> Result<Format, ParseError> {
         "pretty" => Ok(Format::Pretty),
         "quiet" => Ok(Format::Quiet),
         // TODO - raw frame format?
-        _ => Err(ParseError::UnsupportedFlagValue {
+        _ => Err(ParseError::UnsupportedFormat {
             value: format.to_owned(),
-            flag: "format".to_owned(),
         }),
     }
 }
@@ -164,7 +163,9 @@ pub enum Format {
 #[derive(Debug, clap::Parser)]
 enum Command {
     MeasurementFields(MeasurementFields),
+    MeasurementTagKeys(MeasurementTagKeys),
     ReadFilter,
+    ReadGroup(ReadGroup),
     ReadWindowAggregate(ReadWindowAggregate),
     TagValues(TagValues),
 }
@@ -173,6 +174,30 @@ enum Command {
 struct MeasurementFields {
     #[clap(action)]
     measurement: String,
+}
+
+#[derive(Debug, clap::Parser)]
+struct MeasurementTagKeys {
+    #[clap(action)]
+    measurement: String,
+}
+
+#[derive(Debug, clap::Parser)]
+struct ReadGroup {
+    #[clap(
+        long,
+        value_parser = parse_aggregate,
+    )]
+    aggregate: Option<AggregateType>,
+
+    #[clap(
+        long,
+        value_parser = parse_group,
+    )]
+    group: Group,
+
+    #[clap(long, action)]
+    group_keys: Vec<String>,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -211,6 +236,14 @@ fn parse_aggregate(aggs: &str) -> Result<AggregateType, ParseError> {
     }
 }
 
+fn parse_group(g: &str) -> Result<Group, ParseError> {
+    match g.to_lowercase().as_str() {
+        "0" | "none" => Ok(Group::None),
+        "2" | "by" => Ok(Group::By),
+        _ => GroupSnafu { group: g }.fail(),
+    }
+}
+
 #[derive(Debug, clap::Parser)]
 struct TagValues {
     /// The tag key value to interrogate for tag values.
@@ -223,7 +256,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
     let mut client = influxdb_storage_client::Client::new(connection);
 
     // convert predicate with no root node into None.
-    let predicate = config.predicate.root.is_some().then(|| config.predicate);
+    let predicate = config.predicate.root.is_some().then_some(config.predicate);
 
     let source = Client::read_source(&config.db_name, 0);
     let now = std::time::Instant::now();
@@ -244,6 +277,22 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
                 Format::Quiet => {}
             }
         }
+        Command::MeasurementTagKeys(m) => {
+            let result = client
+                .measurement_tag_keys(request::measurement_tag_keys(
+                    source,
+                    m.measurement,
+                    config.start,
+                    config.stop,
+                    predicate,
+                ))
+                .await
+                .context(ServerSnafu)?;
+            match config.format {
+                Format::Pretty => response::pretty_print_strings(result).context(ResponseSnafu)?,
+                Format::Quiet => {}
+            }
+        }
         Command::ReadFilter => {
             let result = client
                 .read_filter(request::read_filter(
@@ -251,6 +300,24 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
                     config.start,
                     config.stop,
                     predicate,
+                ))
+                .await
+                .context(ServerSnafu)?;
+            match config.format {
+                Format::Pretty => response::pretty_print_frames(&result).context(ResponseSnafu)?,
+                Format::Quiet => {}
+            }
+        }
+        Command::ReadGroup(rg) => {
+            let result = client
+                .read_group(request::read_group(
+                    source,
+                    config.start,
+                    config.stop,
+                    predicate,
+                    rg.aggregate,
+                    rg.group,
+                    rg.group_keys,
                 ))
                 .await
                 .context(ServerSnafu)?;

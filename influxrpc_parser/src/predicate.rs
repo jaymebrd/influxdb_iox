@@ -75,22 +75,29 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///     way to denote them (we need to add a `u` suffix support).
 ///
 pub fn expr_to_rpc_predicate(expr: &str) -> Result<RPCPredicate> {
-    let dialect = sqlparser::dialect::GenericDialect {};
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let mut tokenizer = Tokenizer::new(&dialect, expr);
     let tokens = tokenizer.tokenize().unwrap();
     let mut parser = Parser::new(tokens, &dialect);
 
     Ok(RPCPredicate {
-        root: Some(build_node(&parser.parse_expr().context(ExprParseSnafu)?)?),
+        root: Some(build_node(
+            &parser.parse_expr().context(ExprParseSnafu)?,
+            false,
+        )?),
     })
 }
 
 // Builds an RPCNode given the value Expr and the converted children
-fn build_node(expr: &Expr) -> Result<RPCNode> {
+fn build_node(expr: &Expr, strings_are_regex: bool) -> Result<RPCNode> {
     match expr {
-        Expr::Nested(expr) => make_node(RPCType::ParenExpression, vec![build_node(expr)?], None),
+        Expr::Nested(expr) => make_node(
+            RPCType::ParenExpression,
+            vec![build_node(expr, strings_are_regex)?],
+            None,
+        ),
         Expr::Cast { expr, data_type } => match data_type {
-            sqlparser::ast::DataType::Custom(ident) => {
+            sqlparser::ast::DataType::Custom(ident, _modifiers) => {
                 if let Some(Ident { value, .. }) = ident.0.get(0) {
                     // See https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#syntax
                     match value.as_str() {
@@ -144,17 +151,30 @@ fn build_node(expr: &Expr) -> Result<RPCNode> {
         Expr::Value(v) => match v {
             Value::Boolean(b) => make_lit(RPCValue::BoolValue(*b)),
             Value::Number(n, _) => make_lit(parse_number(n)?),
-            Value::DoubleQuotedString(v) => make_lit(RPCValue::StringValue(v.clone())),
-            Value::SingleQuotedString(v) => make_lit(RPCValue::StringValue(v.clone())),
-            Value::HexStringLiteral(v) => make_lit(RPCValue::StringValue(v.clone())),
-            Value::NationalStringLiteral(v) => make_lit(RPCValue::StringValue(v.clone())),
+            Value::DoubleQuotedString(v)
+            | Value::SingleQuotedString(v)
+            | Value::HexStringLiteral(v)
+            | Value::NationalStringLiteral(v) => {
+                if strings_are_regex {
+                    make_lit(RPCValue::RegexValue(v.clone()))
+                } else {
+                    make_lit(RPCValue::StringValue(v.clone()))
+                }
+            }
             _ => UnexpectedValueSnafu {
                 value: v.to_owned(),
             }
             .fail(),
         },
         Expr::BinaryOp { left, op, right } => {
-            build_binary_node(build_node(left)?, op.clone(), build_node(right)?)
+            let strings_are_regex =
+                matches!(op, Operator::PGRegexMatch | Operator::PGRegexNotMatch);
+
+            build_binary_node(
+                build_node(left, strings_are_regex)?,
+                op.clone(),
+                build_node(right, strings_are_regex)?,
+            )
         }
         _ => UnexpectedExprTypeSnafu {
             expr: expr.to_owned(),
@@ -186,6 +206,8 @@ fn build_binary_node(left: RPCNode, op: Operator, right: RPCNode) -> Result<RPCN
         Operator::LtEq => make_comparison_node(left, RPCComparison::Lte, right),
         Operator::Gt => make_comparison_node(left, RPCComparison::Gt, right),
         Operator::GtEq => make_comparison_node(left, RPCComparison::Gte, right),
+        Operator::PGRegexMatch => make_comparison_node(left, RPCComparison::Regex, right),
+        Operator::PGRegexNotMatch => make_comparison_node(left, RPCComparison::NotRegex, right),
         // logical nodes
         Operator::And => make_logical_node(left, RPCLogical::And, right),
         Operator::Or => make_logical_node(left, RPCLogical::Or, right),
@@ -258,6 +280,8 @@ mod test {
             ">=" => RPCComparison::Gte,
             "<" => RPCComparison::Lt,
             "<=" => RPCComparison::Lte,
+            "~" => RPCComparison::Regex,
+            "!~" => RPCComparison::NotRegex,
             _ => panic!("invalid comparator string: {:?}", cmp),
         }
     }
@@ -274,10 +298,19 @@ mod test {
         let parts = input.split_whitespace().collect::<Vec<_>>();
         assert_eq!(parts.len(), 3, "invalid input string: {:?}", input);
 
+        let comparison = rpc_op_from_str(parts[1]);
+        let is_regex =
+            (comparison == RPCComparison::Regex) || (comparison == RPCComparison::NotRegex);
+
         // remove quoting from literal - whilst we need the quoting to parse
         // the sql statement correctly, the RPCNode for the literal would not
         // have the quoting present.
-        let literal = parts[2].replace('\'', "").replace('"', "");
+        let literal = parts[2].replace(['\'', '"'], "");
+        let literal = if is_regex {
+            RPCValue::RegexValue(literal)
+        } else {
+            RPCValue::StringValue(literal)
+        };
         RPCNode {
             node_type: RPCType::ComparisonExpression as i32,
             children: vec![
@@ -289,10 +322,10 @@ mod test {
                 RPCNode {
                     node_type: RPCType::Literal as i32,
                     children: vec![],
-                    value: Some(RPCValue::StringValue(literal)),
+                    value: Some(literal),
                 },
             ],
-            value: Some(RPCValue::Comparison(rpc_op_from_str(parts[1]) as i32)),
+            value: Some(RPCValue::Comparison(comparison as i32)),
         }
     }
 
@@ -342,7 +375,7 @@ mod test {
     // Test that simple sqlparser binary expressions are converted into the
     // correct tag comparison nodes
     fn test_from_sql_expr_tag_comparisons() {
-        let ops = vec!["=", "!=", ">", ">=", "<", "<="];
+        let ops = vec!["=", "!=", ">", ">=", "<", "<=", "~", "!~"];
         let exprs = ops
             .into_iter()
             .map(|op| format!("server {} 'abc'", op))
@@ -368,11 +401,6 @@ mod test {
         let expr = make_sql_expr(r#""server"::tag = 'foo'"#);
         let exp_rpc_node = make_tag_expr("server = 'foo'");
         assert_eq!(expr, exp_rpc_node);
-
-        // Converting a binary expression with a regex matches is not
-        // currently implemented.
-        let expr = expr_to_rpc_predicate("server ~ Abc");
-        assert!(matches!(expr, Err(Error::UnexpectedBinaryOperator { .. })));
     }
 
     #[test]

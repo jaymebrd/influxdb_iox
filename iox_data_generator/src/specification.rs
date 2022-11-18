@@ -12,8 +12,13 @@ use tracing::warn;
 #[allow(missing_docs)]
 pub enum Error {
     /// File-related error that may happen while reading a specification
-    #[snafu(display(r#"Error reading data spec from TOML file: {}"#, source))]
+    #[snafu(display(
+        r#"Error reading data spec from TOML file at {}: {}"#,
+        file_name,
+        source
+    ))]
     ReadFile {
+        file_name: String,
         /// Underlying I/O error that caused this problem
         source: std::io::Error,
     },
@@ -76,7 +81,7 @@ pub struct DataSpec {
 impl DataSpec {
     /// Given a filename, read the file and parse the specification.
     pub fn from_file(file_name: &str) -> Result<Self> {
-        let spec_toml = fs::read_to_string(file_name).context(ReadFileSnafu)?;
+        let spec_toml = fs::read_to_string(file_name).context(ReadFileSnafu { file_name })?;
         Self::from_str(&spec_toml)
     }
 
@@ -89,8 +94,8 @@ impl DataSpec {
 
         let mut start = 0;
 
-        // either all database writers must use regex or none of them can. It's either ratio or regex
-        // for assignment
+        // either all database writers must use regex or none of them can. It's either ratio or
+        // regex for assignment
         let use_ratio = self.database_writers[0].database_regex.is_none();
         for b in &self.database_writers {
             if use_ratio && b.database_regex.is_some() {
@@ -160,13 +165,7 @@ impl DataSpec {
 
     /// Get the agent spec by its name
     pub fn agent_by_name(&self, name: &str) -> Option<&AgentSpec> {
-        for a in &self.agents {
-            if a.name == name {
-                return Some(a);
-            }
-        }
-
-        None
+        self.agents.iter().find(|&a| a.name == name)
     }
 }
 
@@ -206,7 +205,8 @@ impl FromStr for DataSpec {
 pub struct ValuesSpec {
     /// The name of the collection of values
     pub name: String,
-    /// If values not specified this handlebars template will be used to create each value in the collection
+    /// If values not specified this handlebars template will be used to create each value in the
+    /// collection
     pub template: String,
     /// How many of these values should be generated. If belongs_to is
     /// specified, each parent will have this many of this value. So
@@ -303,8 +303,8 @@ pub struct AgentSpec {
     pub has_one: Vec<String>,
     /// Specification of tag key/value pairs that get generated once and reused for
     /// every sampling. Every measurement (and thus line) will have these tag pairs added onto it.
-    /// The template can use `{{agent.id}}` to reference the agent's id and `{{guid}}` or `{{random N}}`
-    /// to generate random strings.
+    /// The template can use `{{agent.id}}` to reference the agent's id and `{{guid}}` or
+    /// `{{random N}}` to generate random strings.
     #[serde(default)]
     pub tag_pairs: Vec<TagPairSpec>,
 }
@@ -481,7 +481,7 @@ pub enum FieldValueSpec {
 }
 
 /// The kind of field value to create using the data generation tool's uptime
-#[derive(Debug, PartialEq, Copy, Clone, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Deserialize)]
 pub enum UptimeKind {
     /// Number of seconds since the tool started running as an i64 field
     #[serde(rename = "i64")]
@@ -575,7 +575,7 @@ struct FieldSpecIntermediate {
 
 /// The specification of what values to substitute in for placeholders specified
 /// in `String` field values.
-#[derive(Deserialize, Debug, PartialEq, Clone)]
+#[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Replacement {
     /// A placeholder key that can be used in field `pattern`s.
@@ -592,7 +592,7 @@ pub struct Replacement {
     pub with: Vec<ReplacementValue>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 #[serde(untagged, deny_unknown_fields)]
 /// A possible value to use instead of a placeholder key, optionally with an
 /// associated weight. If no weight is specified, the weight used will be 1.
@@ -681,7 +681,10 @@ agents = [{name = "foo", sampling_interval = "10s"}]
         let field_spec = &a0m0f0.field_value_spec;
 
         assert!(
-            matches!(field_spec, FieldValueSpec::String { replacements, .. } if replacements.is_empty()),
+            matches!(
+                field_spec,
+                FieldValueSpec::String { replacements, .. } if replacements.is_empty()
+            ),
             "expected a String field with empty replacements; was {:?}",
             field_spec
         );

@@ -209,15 +209,15 @@ impl SortKey {
     /// # Panics
     ///
     /// Panics if any columns in the primary key are NOT present in this sort key.
-    pub fn filter_to(&self, primary_key: &[&str]) -> SortKey {
+    pub fn filter_to(&self, primary_key: &[&str], partition_id: i64) -> SortKey {
         let missing_from_catalog_key: Vec<_> = primary_key
             .iter()
             .filter(|col| !self.contains(col))
             .collect();
         if !missing_from_catalog_key.is_empty() {
             panic!(
-                "Primary key column(s) found that don't appear in the catalog sort key: [{:?}]",
-                missing_from_catalog_key
+                "Primary key column(s) found that don't appear in the catalog sort key [{:?}] of partition: {}. Sort key: {:?}",
+                missing_from_catalog_key, partition_id, self
             )
         }
 
@@ -515,7 +515,11 @@ pub fn adjust_sort_key_columns(
         ))
     };
 
-    debug!(?primary_key, input_catalog_sort_key=?catalog_sort_key, output_chunk_sort_key=?metadata_sort_key, output_catalog_sort_key=?catalog_update, "Adjusted sort key");
+    debug!(?primary_key,
+           input_catalog_sort_key=?catalog_sort_key,
+           output_chunk_sort_key=?metadata_sort_key,
+           output_catalog_sort_key=?catalog_update,
+           "Adjusted sort key");
 
     (metadata_sort_key, catalog_update)
 }
@@ -910,7 +914,7 @@ mod tests {
         let catalog_sort_key = SortKey::from_columns(["host", "env", "time"]);
         let data_primary_key = ["host", "env", "time"];
 
-        let filtered = catalog_sort_key.filter_to(&data_primary_key);
+        let filtered = catalog_sort_key.filter_to(&data_primary_key, 1);
         assert_eq!(catalog_sort_key, filtered);
 
         // If the catalog sort key contains more columns than the primary key, the filtered key
@@ -918,7 +922,7 @@ mod tests {
         let catalog_sort_key = SortKey::from_columns(["host", "env", "time"]);
         let data_primary_key = ["host", "time"];
 
-        let filtered = catalog_sort_key.filter_to(&data_primary_key);
+        let filtered = catalog_sort_key.filter_to(&data_primary_key, 1);
         let expected = SortKey::from_columns(["host", "time"]);
         assert_eq!(expected, filtered);
 
@@ -927,7 +931,7 @@ mod tests {
         let catalog_sort_key = SortKey::from_columns(["host", "env", "zone", "time"]);
         let data_primary_key = ["env", "host", "time"];
 
-        let filtered = catalog_sort_key.filter_to(&data_primary_key);
+        let filtered = catalog_sort_key.filter_to(&data_primary_key, 1);
         let expected = SortKey::from_columns(["host", "env", "time"]);
         assert_eq!(expected, filtered);
     }
@@ -942,7 +946,7 @@ mod tests {
         let catalog_sort_key = SortKey::from_columns(["host", "env", "time"]);
         let data_primary_key = ["host", "env", "zone", "time"];
 
-        catalog_sort_key.filter_to(&data_primary_key);
+        catalog_sort_key.filter_to(&data_primary_key, 1);
     }
 
     #[test]

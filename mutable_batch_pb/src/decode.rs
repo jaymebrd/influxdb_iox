@@ -1,14 +1,13 @@
 //! Code to decode [`MutableBatch`] from pbdata protobuf
 
-use hashbrown::{HashMap, HashSet};
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
-
 use generated_types::influxdata::pbdata::v1::{
     column::{SemanticType, Values as PbValues},
     Column as PbColumn, DatabaseBatch, PackedStrings, TableBatch,
 };
+use hashbrown::{HashMap, HashSet};
 use mutable_batch::{writer::Writer, MutableBatch};
 use schema::{InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 /// Error type for line protocol conversion
 #[derive(Debug, Snafu)]
@@ -57,19 +56,17 @@ pub enum Error {
 /// Result type for pbdata conversion
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Decodes a [`DatabaseBatch`] to a map of [`MutableBatch`] keyed by table name
-pub fn decode_database_batch(
-    database_batch: &DatabaseBatch,
-) -> Result<HashMap<String, MutableBatch>> {
-    let mut ret = HashMap::with_capacity(database_batch.table_batches.len());
+/// Decodes a [`DatabaseBatch`] to a map of [`MutableBatch`] keyed by table ID
+pub fn decode_database_batch(database_batch: &DatabaseBatch) -> Result<HashMap<i64, MutableBatch>> {
+    let mut id_to_data = HashMap::with_capacity(database_batch.table_batches.len());
+
     for table_batch in &database_batch.table_batches {
-        let (_, batch) = ret
-            .raw_entry_mut()
-            .from_key(table_batch.table_name.as_str())
-            .or_insert_with(|| (table_batch.table_name.clone(), MutableBatch::new()));
+        let batch = id_to_data.entry(table_batch.table_id).or_default();
+
         write_table_batch(batch, table_batch)?;
     }
-    Ok(ret)
+
+    Ok(id_to_data)
 }
 
 /// Writes the provided [`TableBatch`] to a [`MutableBatch`] on error any changes made
@@ -432,7 +429,7 @@ fn pb_value_type(column: &str, values: &PbValues) -> Result<InfluxFieldType> {
 mod tests {
     use arrow_util::assert_batches_eq;
     use generated_types::influxdata::pbdata::v1::InternedStrings;
-    use schema::selection::Selection;
+    use schema::Projection;
 
     use super::*;
 
@@ -586,7 +583,6 @@ mod tests {
     #[test]
     fn test_basic() {
         let mut table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![
                 with_strings(
                     column("tag1", SemanticType::Tag),
@@ -620,6 +616,7 @@ mod tests {
                 ),
             ],
             row_count: 5,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();
@@ -638,7 +635,7 @@ mod tests {
             "+-----+-----+------+------+--------------------------------+-----+",
         ];
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         table_batch.columns.push(table_batch.columns[0].clone());
 
@@ -658,7 +655,7 @@ mod tests {
             .to_string();
         assert_eq!(err, "table batch must contain time column");
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         // Nulls in time column -> error
         time.null_mask = vec![1];
@@ -669,7 +666,7 @@ mod tests {
             .to_string();
         assert_eq!(err, "time column must not contain nulls");
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         // Missing values -> error
         table_batch.columns[0].values.take().unwrap();
@@ -679,7 +676,7 @@ mod tests {
             .to_string();
         assert_eq!(err, "column with no values: tag1");
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         // No data -> error
         table_batch.columns[0].values = Some(PbValues {
@@ -698,13 +695,12 @@ mod tests {
             .to_string();
         assert_eq!(err, "column with no values: tag1");
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
     }
 
     #[test]
     fn test_strings() {
         let table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![
                 with_packed_strings(
                     column("tag1", SemanticType::Tag),
@@ -759,6 +755,7 @@ mod tests {
                 ),
             ],
             row_count: 6,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();
@@ -777,12 +774,11 @@ mod tests {
             "+----------+----+--------+-------+------+--------------------------------+",
         ];
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         // Try to write 6 rows expecting an error
         let mut try_write = |other: PbColumn, expected_err: &str| {
             let table_batch = TableBatch {
-                table_name: "table".to_string(),
                 columns: vec![
                     with_i64(
                         column("time", SemanticType::Time),
@@ -792,6 +788,7 @@ mod tests {
                     other,
                 ],
                 row_count: 6,
+                table_id: 42,
             };
 
             let err = write_table_batch(&mut batch, &table_batch)
@@ -799,7 +796,7 @@ mod tests {
                 .to_string();
 
             assert_eq!(err, expected_err);
-            assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+            assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
         };
 
         try_write(
@@ -835,7 +832,7 @@ mod tests {
                 },
                 vec![0b000111010],
             ),
-            "error writing column tag2: Unable to insert iox::column_type::field::string type into a column of iox::column_type::tag",
+            "error writing column tag2: Unable to insert iox::column_type::field::string type into column tag2 with type iox::column_type::tag",
         );
 
         try_write(
@@ -885,7 +882,6 @@ mod tests {
     fn test_optimization_trim_null_masks() {
         // See https://github.com/influxdata/influxdb-pb-data-protocol#optimization-1-trim-null-masks
         let table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![
                 with_i64(
                     column("i64", SemanticType::Field),
@@ -899,6 +895,7 @@ mod tests {
                 ),
             ],
             row_count: 10,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();
@@ -922,20 +919,20 @@ mod tests {
             "+-----+--------------------------------+",
         ];
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
     }
 
     #[test]
     fn test_optimization_omit_null_masks() {
         // See https://github.com/influxdata/influxdb-pb-data-protocol#optimization-1b-omit-empty-null-masks
         let table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![with_i64(
                 column("time", SemanticType::Time),
                 vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
                 vec![],
             )],
             row_count: 9,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();
@@ -958,14 +955,13 @@ mod tests {
             "+--------------------------------+",
         ];
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
     }
 
     #[test]
     fn test_optimization_trim_repeated_tail_values() {
         // See https://github.com/influxdata/influxdb-pb-data-protocol#optimization-2-trim-repeated-tail-values
         let table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![
                 with_strings(
                     column("f_s", SemanticType::Field),
@@ -1038,6 +1034,7 @@ mod tests {
                 with_i64(column("time", SemanticType::Time), vec![1, 2, 3], vec![]),
             ],
             row_count: 9,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();
@@ -1060,13 +1057,13 @@ mod tests {
             "+-------+-----+-----+-----+-----+-----+-----+-----+-----+--------------------------------+-----+",
         ];
 
-        assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+        assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
         // we need at least one value though
         let table_batch = TableBatch {
-            table_name: "table".to_string(),
             columns: vec![with_i64(column("time", SemanticType::Time), vec![], vec![])],
             row_count: 9,
+            table_id: 42,
         };
 
         let mut batch = MutableBatch::new();

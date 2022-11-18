@@ -21,8 +21,7 @@ pub use low_level::{Client as LowLevelClient, PerformQuery as LowLevelPerformQue
 
 use self::low_level::LowLevelMessage;
 
-/// Error responses when querying an IOx database using the Arrow Flight gRPC
-/// API.
+/// Error responses when querying an IOx namespace using the Arrow Flight gRPC API.
 #[derive(Debug, Error)]
 pub enum Error {
     /// There were no FlightData messages returned when we expected to get one
@@ -46,7 +45,7 @@ pub enum Error {
 
     /// An unknown server error occurred. Contains the `tonic::Status` returned
     /// from the server.
-    #[error(transparent)]
+    #[error("{}", .0.message())]
     GrpcError(#[from] tonic::Status),
 
     /// Arrow Flight handshake failed.
@@ -118,13 +117,13 @@ pub struct Client {
 
 impl Client {
     /// Creates a new client with the provided connection
-    pub fn new(channel: Connection) -> Self {
+    pub fn new(connection: Connection) -> Self {
         Self {
-            inner: LowLevelClient::new(channel),
+            inner: LowLevelClient::new(connection, None),
         }
     }
 
-    /// Query the given database with the given SQL query, and return a
+    /// Query the given namespace with the given SQL query, and return a
     /// [`PerformQuery`] instance that streams Arrow `RecordBatch` results.
     pub async fn perform_query(&mut self, request: ReadInfo) -> Result<PerformQuery, Error> {
         PerformQuery::new(self, request).await

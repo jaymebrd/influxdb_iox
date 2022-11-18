@@ -1,10 +1,16 @@
 /// A query to run with optional annotations
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub struct Query {
     /// If true, results are sorted first prior to comparison, meaning
     /// that differences in the output order compared with expected
     /// order do not cause a diff
     sorted_compare: bool,
+
+    /// If true, replace UUIDs with static placeholders.
+    normalized_uuids: bool,
+
+    /// If true, normalize timings in queries by replacing them with static placeholders.
+    normalized_metrics: bool,
 
     /// The SQL string
     sql: String,
@@ -15,6 +21,8 @@ impl Query {
         let sql = sql.into();
         Self {
             sorted_compare: false,
+            normalized_uuids: false,
+            normalized_metrics: false,
             sql,
         }
     }
@@ -32,6 +40,16 @@ impl Query {
     /// Get the query's sorted compare.
     pub fn sorted_compare(&self) -> bool {
         self.sorted_compare
+    }
+
+    /// Get queries normalized UUID
+    pub fn normalized_uuids(&self) -> bool {
+        self.normalized_uuids
+    }
+
+    /// Use normalized timing values
+    pub fn normalized_metrics(&self) -> bool {
+        self.normalized_metrics
     }
 }
 
@@ -57,6 +75,14 @@ impl QueryBuilder {
         self.query.sorted_compare = true;
     }
 
+    fn normalized_uuids(&mut self) {
+        self.query.normalized_uuids = true;
+    }
+
+    fn normalize_metrics(&mut self) {
+        self.query.normalized_metrics = true;
+    }
+
     fn is_empty(&self) -> bool {
         self.query.sql.is_empty()
     }
@@ -68,7 +94,7 @@ impl QueryBuilder {
 }
 
 /// Poor man's parser to find all the SQL queries in an input file
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TestQueries {
     queries: Vec<Query>,
 }
@@ -89,8 +115,24 @@ impl TestQueries {
 
         lines.into_iter().for_each(|line| {
             let line = line.as_ref().trim();
-            if line == "-- IOX_COMPARE: sorted" {
-                builder.sorted_compare();
+            const COMPARE_STR: &str = "-- IOX_COMPARE: ";
+            if line.starts_with(COMPARE_STR) {
+                let (_, options) = line.split_at(COMPARE_STR.len());
+                for option in options.split(',') {
+                    let option = option.trim();
+                    match option {
+                        "sorted" => {
+                            builder.sorted_compare();
+                        }
+                        "uuid" => {
+                            builder.normalized_uuids();
+                        }
+                        "metrics" => {
+                            builder.normalize_metrics();
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             if line.starts_with("--") {

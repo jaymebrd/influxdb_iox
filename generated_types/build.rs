@@ -19,6 +19,7 @@ fn main() -> Result<()> {
 /// Creates:
 ///
 /// - `influxdata.iox.catalog.v1.rs`
+/// - `influxdata.iox.compactor.v1.rs`
 /// - `influxdata.iox.delete.v1.rs`
 /// - `influxdata.iox.ingester.v1.rs`
 /// - `influxdata.iox.namespace.v1.rs`
@@ -26,11 +27,13 @@ fn main() -> Result<()> {
 /// - `influxdata.iox.predicate.v1.rs`
 /// - `influxdata.iox.querier.v1.rs`
 /// - `influxdata.iox.schema.v1.rs`
+/// - `influxdata.iox.sharder.v1.rs`
 /// - `influxdata.iox.write.v1.rs`
 /// - `influxdata.iox.write_buffer.v1.rs`
 /// - `influxdata.platform.storage.rs`
 fn generate_grpc_types(root: &Path) -> Result<()> {
     let catalog_path = root.join("influxdata/iox/catalog/v1");
+    let compactor_path = root.join("influxdata/iox/compactor/v1");
     let delete_path = root.join("influxdata/iox/delete/v1");
     let ingester_path = root.join("influxdata/iox/ingester/v1");
     let namespace_path = root.join("influxdata/iox/namespace/v1");
@@ -38,17 +41,21 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
     let predicate_path = root.join("influxdata/iox/predicate/v1");
     let querier_path = root.join("influxdata/iox/querier/v1");
     let schema_path = root.join("influxdata/iox/schema/v1");
+    let sharder_path = root.join("influxdata/iox/sharder/v1");
     let write_buffer_path = root.join("influxdata/iox/write_buffer/v1");
     let write_summary_path = root.join("influxdata/iox/write_summary/v1");
     let storage_path = root.join("influxdata/platform/storage");
+    let storage_errors_path = root.join("influxdata/platform/errors");
 
     let proto_files = vec![
         catalog_path.join("parquet_file.proto"),
         catalog_path.join("service.proto"),
+        compactor_path.join("service.proto"),
         delete_path.join("service.proto"),
         ingester_path.join("parquet_metadata.proto"),
         ingester_path.join("query.proto"),
         ingester_path.join("write_info.proto"),
+        ingester_path.join("write.proto"),
         namespace_path.join("service.proto"),
         object_store_path.join("service.proto"),
         predicate_path.join("predicate.proto"),
@@ -59,6 +66,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         root.join("grpc/health/v1/service.proto"),
         root.join("influxdata/pbdata/v1/influxdb_pb_data_protocol.proto"),
         schema_path.join("service.proto"),
+        sharder_path.join("sharder.proto"),
         write_buffer_path.join("write_buffer.proto"),
         write_summary_path.join("write_summary.proto"),
         storage_path.join("predicate.proto"),
@@ -66,6 +74,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         storage_path.join("source.proto"),
         storage_path.join("storage_common.proto"),
         storage_path.join("test.proto"),
+        storage_errors_path.join("errors.proto"),
     ];
 
     // Tell cargo to recompile if any of these proto files are changed
@@ -77,9 +86,9 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
 
     config
         .compile_well_known_types()
-        .disable_comments(&[".google"])
+        .disable_comments([".google"])
         .extern_path(".google.protobuf", "::pbjson_types")
-        .btree_map(&[
+        .btree_map([
             ".influxdata.iox.ingester.v1.IngesterQueryResponseMetadata.unpersisted_partitions",
         ]);
 
@@ -98,6 +107,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
             ".influxdata.iox",
             ".influxdata.pbdata",
             ".influxdata.platform.storage",
+            ".influxdata.platform.errors",
             ".google.longrunning",
             ".google.rpc",
         ])?;

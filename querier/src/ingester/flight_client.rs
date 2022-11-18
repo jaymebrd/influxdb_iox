@@ -5,9 +5,10 @@ use influxdb_iox_client::flight::{
     generated_types as proto,
     low_level::{Client as LowLevelFlightClient, LowLevelMessage, PerformQuery},
 };
-use observability_deps::tracing::debug;
+use observability_deps::tracing::{debug, warn};
 use snafu::{ResultExt, Snafu};
 use std::{collections::HashMap, fmt::Debug, ops::DerefMut, sync::Arc};
+use trace::ctx::SpanContext;
 
 pub use influxdb_iox_client::flight::Error as FlightError;
 
@@ -33,6 +34,9 @@ pub enum Error {
 
     #[snafu(display("Failed to perform flight request: {}", source))]
     Flight { source: FlightError },
+
+    #[snafu(display("Can not contact ingester. Circuit broken: {}", ingester_address))]
+    CircuitBroken { ingester_address: String },
 }
 
 /// Abstract Flight client.
@@ -45,6 +49,7 @@ pub trait FlightClient: Debug + Send + Sync + 'static {
         &self,
         ingester_address: Arc<str>,
         request: IngesterQueryRequest,
+        span_context: Option<SpanContext>,
     ) -> Result<Box<dyn QueryData>, Error>;
 }
 
@@ -90,17 +95,40 @@ impl FlightClient for FlightClientImpl {
         &self,
         ingester_addr: Arc<str>,
         request: IngesterQueryRequest,
+        span_context: Option<SpanContext>,
     ) -> Result<Box<dyn QueryData>, Error> {
         let connection = self.connect(Arc::clone(&ingester_addr)).await?;
 
-        let mut client = LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection);
+        let mut client =
+            LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection, span_context);
 
         debug!(%ingester_addr, ?request, "Sending request to ingester");
-        let request: proto::IngesterQueryRequest =
-            request.try_into().context(CreatingRequestSnafu)?;
+        let request = serialize_ingester_query_request(request)?;
 
         let perform_query = client.perform_query(request).await.context(FlightSnafu)?;
         Ok(Box::new(perform_query))
+    }
+}
+
+/// Tries to serialize the request to the ingester
+///
+/// Note if the predicate is too "complicated" to be serialized simply
+/// ask for all the data from the ingester. More details:
+/// <https://github.com/apache/arrow-datafusion/issues/3968>
+fn serialize_ingester_query_request(
+    mut request: IngesterQueryRequest,
+) -> Result<proto::IngesterQueryRequest, Error> {
+    match request.clone().try_into() {
+        Ok(proto) => Ok(proto),
+        Err(e) if (e.field == "exprs") && (e.description.contains("recursion limit reached")) => {
+            warn!(
+                predicate=?request.predicate,
+                "Cannot serialize predicate due to recursion limit, stripping it",
+            );
+            request.predicate = None;
+            request.try_into().context(CreatingRequestSnafu)
+        }
+        Err(e) => Err(Error::CreatingRequest { source: e }),
     }
 }
 
@@ -172,7 +200,7 @@ impl CachedConnection {
 
             // sanity check w/ a handshake
             let mut client =
-                LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection.clone());
+                LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection.clone(), None);
 
             // make contact with the ingester
             client
@@ -183,5 +211,51 @@ impl CachedConnection {
             *maybe_connection = Some(connection.clone());
             Ok(connection)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use data_types::{NamespaceId, TableId};
+    use datafusion::prelude::{col, lit};
+    use predicate::Predicate;
+
+    use super::*;
+
+    #[test]
+    fn serialize_deeply_nested_predicate() {
+        // see https://github.com/influxdata/influxdb_iox/issues/5974
+
+        // we need more stack space so this doesn't overflow in dev builds
+        std::thread::Builder::new().stack_size(10_000_000).spawn(|| {
+            // don't know what "too much" is, so let's slowly try to increase complexity
+            let n_max = 100;
+
+            for n in [1, 2, n_max] {
+                println!("testing: {n}");
+
+                let expr_base = col("a").lt(lit(5i32));
+                let expr = (0..n).fold(expr_base.clone(), |expr, _| expr.and(expr_base.clone()));
+
+                let predicate = Predicate {exprs: vec![expr], ..Default::default()};
+
+                let request = IngesterQueryRequest {
+                    namespace_id: NamespaceId::new(42),
+                    table_id: TableId::new(1337),
+                    columns: vec![String::from("col1"), String::from("col2")],
+                    predicate: Some(predicate),
+                };
+
+                let proto = serialize_ingester_query_request(request.clone()).expect("serialization");
+                let request2 = IngesterQueryRequest::try_from(proto).expect("deserialization");
+
+                if request2.predicate.is_none() {
+                    assert!(n > 2, "not really deeply nested");
+                    return;
+                }
+            }
+
+            panic!("did not find a 'too deeply nested' expression, tested up to a depth of {n_max}")
+        }).expect("spawning thread").join().expect("joining thread");
     }
 }

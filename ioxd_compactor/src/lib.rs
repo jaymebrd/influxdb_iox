@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use clap_blocks::compactor::CompactorConfig;
 use compactor::{
     handler::{CompactorHandler, CompactorHandlerImpl},
-    server::CompactorServer,
+    server::{grpc::GrpcDelegate, CompactorServer},
 };
-use data_types::KafkaPartition;
+use data_types::ShardIndex;
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
@@ -18,7 +18,6 @@ use ioxd_common::{
     setup_builder,
 };
 use metric::Registry;
-use object_store::DynObjectStore;
 use parquet_file::storage::ParquetStorage;
 use std::{
     fmt::{Debug, Display},
@@ -32,11 +31,14 @@ pub enum Error {
     #[error("Catalog error: {0}")]
     Catalog(#[from] iox_catalog::interface::Error),
 
-    #[error("Kafka topic {0} not found in the catalog")]
-    KafkaTopicNotFound(String),
+    #[error("No topic named '{topic_name}' found in the catalog")]
+    TopicCatalogLookup { topic_name: String },
 
-    #[error("kafka_partition_range_start must be <= kafka_partition_range_end")]
-    KafkaRange,
+    #[error("shard_index_range_start must be <= shard_index_range_end")]
+    ShardIndexRange,
+
+    #[error("split_percentage must be between 1 and 100, inclusive. Was: {split_percentage}")]
+    SplitPercentageRange { split_percentage: u16 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -81,9 +83,13 @@ impl<C: CompactorHandler + std::fmt::Debug + 'static> ServerType for CompactorSe
         Err(Box::new(IoxHttpError::NotFound))
     }
 
-    /// Provide a placeholder gRPC service.
+    /// Configure the gRPC services.
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
+
+        add_service!(builder, self.server.grpc().compaction_service());
+        add_service!(builder, self.server.grpc().catalog_service());
+
         serve_builder!(builder);
 
         Ok(())
@@ -131,55 +137,110 @@ pub async fn create_compactor_server_type(
     common_state: &CommonServerState,
     metric_registry: Arc<metric::Registry>,
     catalog: Arc<dyn Catalog>,
-    object_store: Arc<DynObjectStore>,
+    parquet_store: ParquetStorage,
     exec: Arc<Executor>,
     time_provider: Arc<dyn TimeProvider>,
     compactor_config: CompactorConfig,
 ) -> Result<Arc<dyn ServerType>> {
-    if compactor_config.write_buffer_partition_range_start
-        > compactor_config.write_buffer_partition_range_end
-    {
-        return Err(Error::KafkaRange);
-    }
-
-    let mut txn = catalog.start_transaction().await?;
-    let kafka_topic = txn
-        .kafka_topics()
-        .get_by_name(&compactor_config.topic)
-        .await?
-        .ok_or(Error::KafkaTopicNotFound(compactor_config.topic))?;
-
-    let kafka_partitions: Vec<_> = (compactor_config.write_buffer_partition_range_start
-        ..=compactor_config.write_buffer_partition_range_end)
-        .map(KafkaPartition::new)
-        .collect();
-
-    let mut sequencers = Vec::with_capacity(kafka_partitions.len());
-    for k in kafka_partitions {
-        let s = txn.sequencers().create_or_get(&kafka_topic, k).await?;
-        sequencers.push(s.id);
-    }
-    txn.commit().await?;
-
-    let parquet_store = ParquetStorage::new(object_store);
-
-    let compactor_config = compactor::handler::CompactorConfig::new(
-        compactor_config.compaction_max_number_level_0_files,
-        compactor_config.compaction_max_desired_file_size_bytes,
-        compactor_config.compaction_percentage_max_file_size,
-        compactor_config.compaction_split_percentage,
-        compactor_config.max_concurrent_compaction_size_bytes,
-    );
-    let compactor_handler = Arc::new(CompactorHandlerImpl::new(
-        sequencers,
+    let grpc_catalog = Arc::clone(&catalog);
+    let compactor = build_compactor_from_config(
+        compactor_config,
         catalog,
         parquet_store,
         exec,
         time_provider,
         Arc::clone(&metric_registry),
-        compactor_config,
-    ));
+    )
+    .await?;
 
-    let compactor = CompactorServer::new(metric_registry, compactor_handler);
+    let compactor_handler = Arc::new(CompactorHandlerImpl::new(Arc::new(compactor)));
+
+    let grpc = GrpcDelegate::new(grpc_catalog, Arc::clone(&compactor_handler));
+
+    let compactor = CompactorServer::new(metric_registry, grpc, compactor_handler);
     Ok(Arc::new(CompactorServerType::new(compactor, common_state)))
+}
+
+pub async fn build_compactor_from_config(
+    compactor_config: CompactorConfig,
+    catalog: Arc<dyn Catalog>,
+    parquet_store: ParquetStorage,
+    exec: Arc<Executor>,
+    time_provider: Arc<dyn TimeProvider>,
+    metric_registry: Arc<Registry>,
+) -> Result<compactor::compact::Compactor, Error> {
+    if compactor_config.shard_index_range_start > compactor_config.shard_index_range_end {
+        return Err(Error::ShardIndexRange);
+    }
+
+    if compactor_config.split_percentage < 1 || compactor_config.split_percentage > 100 {
+        return Err(Error::SplitPercentageRange {
+            split_percentage: compactor_config.split_percentage,
+        });
+    }
+
+    let mut txn = catalog.start_transaction().await?;
+    let topic = txn
+        .topics()
+        .get_by_name(&compactor_config.topic)
+        .await?
+        .ok_or(Error::TopicCatalogLookup {
+            topic_name: compactor_config.topic,
+        })?;
+
+    let shard_indexes: Vec<_> = (compactor_config.shard_index_range_start
+        ..=compactor_config.shard_index_range_end)
+        .map(ShardIndex::new)
+        .collect();
+
+    let mut shards = Vec::with_capacity(shard_indexes.len());
+    for k in shard_indexes {
+        let s = txn.shards().create_or_get(&topic, k).await?;
+        shards.push(s.id);
+    }
+    txn.commit().await?;
+
+    let CompactorConfig {
+        max_desired_file_size_bytes,
+        percentage_max_file_size,
+        split_percentage,
+        max_number_partitions_per_shard,
+        min_number_recent_ingested_files_per_partition,
+        hot_multiple,
+        memory_budget_bytes,
+        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+        max_num_compacting_files,
+        max_num_compacting_files_first_in_partition,
+        minutes_without_new_writes_to_be_cold,
+        hot_compaction_hours_threshold_1,
+        hot_compaction_hours_threshold_2,
+        ..
+    } = compactor_config;
+
+    let compactor_config = compactor::handler::CompactorConfig {
+        max_desired_file_size_bytes,
+        percentage_max_file_size,
+        split_percentage,
+        max_number_partitions_per_shard,
+        min_number_recent_ingested_files_per_partition,
+        hot_multiple,
+        memory_budget_bytes,
+        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
+        max_num_compacting_files,
+        max_num_compacting_files_first_in_partition,
+        minutes_without_new_writes_to_be_cold,
+        hot_compaction_hours_threshold_1,
+        hot_compaction_hours_threshold_2,
+    };
+
+    Ok(compactor::compact::Compactor::new(
+        shards,
+        catalog,
+        parquet_store,
+        exec,
+        time_provider,
+        backoff::BackoffConfig::default(),
+        compactor_config,
+        metric_registry,
+    ))
 }

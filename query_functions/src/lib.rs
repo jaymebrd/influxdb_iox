@@ -6,12 +6,14 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use datafusion::{
-    logical_plan::{Expr, FunctionRegistry},
-    prelude::lit,
+    execution::FunctionRegistry,
+    prelude::{lit, Expr},
 };
 use group_by::WindowDuration;
 use window::EncodedWindowDuration;
@@ -30,6 +32,9 @@ mod window;
 
 /// Function registry
 mod registry;
+
+pub use crate::regex::REGEX_MATCH_UDF_NAME;
+pub use crate::regex::REGEX_NOT_MATCH_UDF_NAME;
 
 /// Return an Expr that invokes a InfluxRPC compatible regex match to
 /// determine which values satisfy the pattern. Equivalent to:
@@ -92,7 +97,7 @@ mod test {
         array::{ArrayRef, StringArray, TimestampNanosecondArray},
         record_batch::RecordBatch,
     };
-    use datafusion::{assert_batches_eq, logical_plan::col};
+    use datafusion::{assert_batches_eq, prelude::col};
     use datafusion_util::context_with_table;
     use std::sync::Arc;
 
@@ -185,8 +190,8 @@ mod test {
             "+----------------------------+-------------------------------+",
             "| time                       | bound                         |",
             "+----------------------------+-------------------------------+",
-            "| 1970-01-01 00:00:00.000001 | 1970-01-01 00:00:00.000001100 |",
-            "| 1970-01-01 00:00:00.000002 | 1970-01-01 00:00:00.000002100 |",
+            "| 1970-01-01T00:00:00.000001 | 1970-01-01T00:00:00.000001100 |",
+            "| 1970-01-01T00:00:00.000002 | 1970-01-01T00:00:00.000002100 |",
             "+----------------------------+-------------------------------+",
         ];
 

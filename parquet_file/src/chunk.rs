@@ -1,11 +1,12 @@
 //! A metadata summary of a Parquet file in object storage, with the ability to
 //! download & execute a scan.
 
-use crate::{storage::ParquetStorage, ParquetFilePath};
+use crate::{
+    storage::{ParquetExecInput, ParquetStorage},
+    ParquetFilePath,
+};
 use data_types::{ParquetFile, TimestampMinMax};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use predicate::Predicate;
-use schema::{selection::Selection, Schema};
+use schema::{Projection, Schema};
 use std::{collections::BTreeSet, mem, sync::Arc};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ pub struct ParquetChunk {
     /// Schema that goes with this table's parquet file
     schema: Arc<Schema>,
 
-    /// Persists the parquet file within a database's relative path
+    /// Persists the parquet file within a namespace's relative path
     store: ParquetStorage,
 }
 
@@ -31,6 +32,11 @@ impl ParquetChunk {
             schema,
             store,
         }
+    }
+
+    /// Store that contains this file.
+    pub fn store(&self) -> &ParquetStorage {
+        &self.store
     }
 
     /// Return raw parquet file metadata.
@@ -55,11 +61,11 @@ impl ParquetChunk {
     }
 
     /// Return the columns names that belong to the given column selection
-    pub fn column_names(&self, selection: Selection<'_>) -> Option<BTreeSet<String>> {
+    pub fn column_names(&self, selection: Projection<'_>) -> Option<BTreeSet<String>> {
         let fields = self.schema.inner().fields().iter();
 
         Some(match selection {
-            Selection::Some(cols) => fields
+            Projection::Some(cols) => fields
                 .filter_map(|x| {
                     if cols.contains(&x.name().as_str()) {
                         Some(x.name().clone())
@@ -68,23 +74,19 @@ impl ParquetChunk {
                     }
                 })
                 .collect(),
-            Selection::All => fields.map(|x| x.name().clone()).collect(),
+            Projection::All => fields.map(|x| x.name().clone()).collect(),
         })
     }
 
     /// Return stream of data read from parquet file
-    pub fn read_filter(
-        &self,
-        predicate: &Predicate,
-        selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, crate::storage::ReadError> {
+    /// Inputs for [`ParquetExec`].
+    ///
+    /// See [`ParquetExecInput`] for more information.
+    ///
+    /// [`ParquetExec`]: datafusion::physical_plan::file_format::ParquetExec
+    pub fn parquet_exec_input(&self) -> ParquetExecInput {
         let path: ParquetFilePath = self.parquet_file.as_ref().into();
-        self.store.read_filter(
-            predicate,
-            selection,
-            Arc::clone(&self.schema.as_arrow()),
-            &path,
-        )
+        self.store.parquet_exec_input(&path, self.file_size_bytes())
     }
 
     /// The total number of rows in all row groups in this chunk.

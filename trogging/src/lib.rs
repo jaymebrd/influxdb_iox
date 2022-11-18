@@ -7,7 +7,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 #[cfg(feature = "clap")]
@@ -52,7 +54,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Builder for tracing and logging.
+/// Builder to configure tracing and logging.
 #[derive(Debug)]
 pub struct Builder<W = fn() -> io::Stdout> {
     log_format: LogFormat,
@@ -72,7 +74,8 @@ impl Default for Builder {
             default_log_filter: EnvFilter::try_new(Self::DEFAULT_LOG_FILTER).unwrap(),
             make_writer: io::stdout,
             with_target: true,
-            with_ansi: true,
+            // use ansi control codes for color if connected to a TTY
+            with_ansi: atty::is(atty::Stream::Stdout),
         }
     }
 }
@@ -185,7 +188,8 @@ where
 
     /// Enable/disable ANSI encoding for formatted events (i.e. colors).
     ///
-    /// Defaults to true. See [tracing_subscriber::fmt::Layer::with_ansi]
+    /// Defaults to true if connected to a TTY, false otherwise. See
+    /// [tracing_subscriber::fmt::Layer::with_ansi]
     pub fn with_ansi(self, with_ansi: bool) -> Self {
         Self { with_ansi, ..self }
     }
@@ -202,58 +206,41 @@ where
         let with_target = self.with_target;
         let with_ansi = self.with_ansi;
 
-        let (log_format_full, log_format_pretty, log_format_json, log_format_logfmt) =
-            match log_format {
-                LogFormat::Full => (
-                    Some(
-                        fmt::layer()
-                            .with_writer(log_writer)
-                            .with_target(with_target)
-                            .with_ansi(with_ansi),
-                    ),
-                    None,
-                    None,
-                    None,
-                ),
-                LogFormat::Pretty => (
-                    None,
-                    Some(
-                        fmt::layer()
-                            .pretty()
-                            .with_writer(log_writer)
-                            .with_target(with_target)
-                            .with_ansi(with_ansi),
-                    ),
-                    None,
-                    None,
-                ),
-                LogFormat::Json => (
-                    None,
-                    None,
-                    Some(
-                        fmt::layer()
-                            .json()
-                            .with_writer(log_writer)
-                            .with_target(with_target)
-                            .with_ansi(with_ansi),
-                    ),
-                    None,
-                ),
-                LogFormat::Logfmt => (
-                    None,
-                    None,
-                    None,
-                    Some(logfmt::LogFmtLayer::new(log_writer).with_target(with_target)),
-                ),
-            };
-
         let log_filter = self.log_filter.unwrap_or(self.default_log_filter);
 
-        Ok(log_filter
-            .and_then(log_format_full)
-            .and_then(log_format_pretty)
-            .and_then(log_format_json)
-            .and_then(log_format_logfmt))
+        let res: Box<dyn Layer<S> + Send + Sync> = match log_format {
+            LogFormat::Full => Box::new(
+                log_filter.and_then(
+                    fmt::layer()
+                        .with_writer(log_writer)
+                        .with_target(with_target)
+                        .with_ansi(with_ansi),
+                ),
+            ),
+            LogFormat::Pretty => Box::new(
+                log_filter.and_then(
+                    fmt::layer()
+                        .pretty()
+                        .with_writer(log_writer)
+                        .with_target(with_target)
+                        .with_ansi(with_ansi),
+                ),
+            ),
+            LogFormat::Json => Box::new(
+                log_filter.and_then(
+                    fmt::layer()
+                        .json()
+                        .with_writer(log_writer)
+                        .with_target(with_target)
+                        .with_ansi(with_ansi),
+                ),
+            ),
+            LogFormat::Logfmt => Box::new(
+                log_filter.and_then(logfmt::LogFmtLayer::new(log_writer).with_target(with_target)),
+            ),
+        };
+
+        Ok(res)
     }
 
     /// Build a tracing subscriber and install it as a global default subscriber
@@ -263,10 +250,23 @@ where
     pub fn install_global(self) -> Result<TroggingGuard> {
         let layer = self.build()?;
         let subscriber = tracing_subscriber::Registry::default().with(layer);
-        tracing::subscriber::set_global_default(subscriber)?;
-        tracing_log::LogTracer::init()?;
-        Ok(TroggingGuard)
+        install_global(subscriber)
     }
+}
+
+/// Install a global tracing/logging subscriber.
+///
+/// Call this function when installing a subscriber instead of calling
+/// `tracing::subscriber::set_global_default` directly.
+///
+/// This function also sets up the `log::Log` -> `tracing` bridge.
+pub fn install_global<S>(subscriber: S) -> Result<TroggingGuard>
+where
+    S: Subscriber + Send + Sync + 'static,
+{
+    tracing::subscriber::set_global_default(subscriber)?;
+    tracing_log::LogTracer::init()?;
+    Ok(TroggingGuard)
 }
 
 /// A RAII guard. On Drop, ensures all events are flushed

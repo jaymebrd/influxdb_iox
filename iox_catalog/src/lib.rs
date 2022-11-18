@@ -1,5 +1,5 @@
-//! The IOx catalog which keeps track of what namespaces, tables, columns, parquet files,
-//! and deletes are in the system. Configuration information for distributing ingest, query
+//! The IOx catalog keeps track of the namespaces, tables, columns, parquet files,
+//! and deletes in the system. Configuration information for distributing ingest, query
 //! and compaction is also stored here.
 #![warn(
     missing_copy_implementations,
@@ -8,28 +8,60 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
-use crate::interface::{ColumnUpsertRequest, Error, RepoCollection, Result, Transaction};
+use crate::interface::{ColumnTypeMismatchSnafu, Error, RepoCollection, Result, Transaction};
 use data_types::{
-    ColumnType, KafkaPartition, KafkaTopic, NamespaceSchema, QueryPool, Sequencer, SequencerId,
-    TableSchema,
+    ColumnType, NamespaceSchema, QueryPool, Shard, ShardId, ShardIndex, TableSchema, TopicMetadata,
 };
 use mutable_batch::MutableBatch;
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+};
+use thiserror::Error;
 
-const SHARED_KAFKA_TOPIC: &str = "iox-shared";
-const SHARED_QUERY_POOL: &str = SHARED_KAFKA_TOPIC;
+const SHARED_TOPIC_NAME: &str = "iox-shared";
+const SHARED_QUERY_POOL: &str = SHARED_TOPIC_NAME;
 const TIME_COLUMN: &str = "time";
 
-/// A string value representing an infinite retention policy.
-pub const INFINITE_RETENTION_POLICY: &str = "inf";
+/// Default per-namespace table count service protection limit.
+pub const DEFAULT_MAX_TABLES: i32 = 10_000;
+/// Default per-table column count service protection limit.
+pub const DEFAULT_MAX_COLUMNS_PER_TABLE: i32 = 200;
+/// Default retention period for data in the catalog.
+pub const DEFAULT_RETENTION_PERIOD: Option<i64> = None;
 
+/// A string value representing an infinite retention policy.
 pub mod interface;
 pub mod mem;
 pub mod metrics;
 pub mod postgres;
+
+/// An [`crate::interface::Error`] scoped to a single table for schema validation errors.
+#[derive(Debug, Error)]
+#[error("table {}, {}", .0, .1)]
+pub struct TableScopedError(String, Error);
+
+impl TableScopedError {
+    /// Return the table name for this error.
+    pub fn table(&self) -> &str {
+        &self.0
+    }
+
+    /// Return a reference to the error.
+    pub fn err(&self) -> &Error {
+        &self.1
+    }
+
+    /// Return ownership of the error, discarding the table name.
+    pub fn into_err(self) -> Error {
+        self.1
+    }
+}
 
 /// Given an iterator of `(table_name, batch)` to validate, this function
 /// ensures all the columns within `batch` match the existing schema for
@@ -43,7 +75,7 @@ pub async fn validate_or_insert_schema<'a, T, U, R>(
     tables: T,
     schema: &NamespaceSchema,
     repos: &mut R,
-) -> Result<Option<NamespaceSchema>>
+) -> Result<Option<NamespaceSchema>, TableScopedError>
 where
     T: IntoIterator<IntoIter = U, Item = (&'a str, &'a MutableBatch)> + Send + Sync,
     U: Iterator<Item = T::Item> + Send,
@@ -55,7 +87,9 @@ where
     let mut schema = Cow::Borrowed(schema);
 
     for (table_name, batch) in tables {
-        validate_mutable_batch(batch, table_name, &mut schema, repos).await?;
+        validate_mutable_batch(batch, table_name, &mut schema, repos)
+            .await
+            .map_err(|e| TableScopedError(table_name.to_string(), e))?;
     }
 
     match schema {
@@ -116,12 +150,14 @@ where
     // If the table itself needs to be updated during column validation it
     // becomes a Cow::owned() copy and the modified copy should be inserted into
     // the schema before returning.
-    let mut column_batch = Vec::default();
+    let mut column_batch: HashMap<&str, ColumnType> = HashMap::new();
+
     for (name, col) in mb.columns() {
         // Check if the column exists in the cached schema.
         //
         // If it does, validate it. If it does not exist, create it and insert
         // it into the cached schema.
+
         match table.columns.get(name.as_str()) {
             Some(existing) if existing.matches_type(col.influx_type()) => {
                 // No action is needed as the column matches the existing column
@@ -130,28 +166,29 @@ where
             Some(existing) => {
                 // The column schema, and the column in the mutable batch are of
                 // different types.
-                return Err(Error::ColumnTypeMismatch {
-                    name: name.to_string(),
-                    existing: existing.column_type.to_string(),
-                    new: col.influx_type().to_string(),
-                });
+                return ColumnTypeMismatchSnafu {
+                    name,
+                    existing: existing.column_type,
+                    new: col.influx_type(),
+                }
+                .fail();
             }
             None => {
                 // The column does not exist in the cache, add it to the column
                 // batch to be bulk inserted later.
-                column_batch.push(ColumnUpsertRequest {
-                    name: name.as_str(),
-                    table_id: table.id,
-                    column_type: ColumnType::from(col.influx_type()),
-                });
+                let old = column_batch.insert(name.as_str(), ColumnType::from(col.influx_type()));
+                assert!(
+                    old.is_none(),
+                    "duplicate column name `{name}` in new column batch shouldn't be possible"
+                );
             }
-        };
+        }
     }
 
     if !column_batch.is_empty() {
         repos
             .columns()
-            .create_or_get_many(&column_batch)
+            .create_or_get_many_unchecked(table.id, column_batch)
             .await?
             .into_iter()
             .for_each(|c| table.to_mut().add_column(&c));
@@ -170,28 +207,28 @@ where
     Ok(())
 }
 
-/// Creates or gets records in the catalog for the shared kafka topic, query pool, and sequencers
+/// Creates or gets records in the catalog for the shared topic, query pool, and shards
 /// for each of the partitions.
 ///
 /// Used in tests and when creating an in-memory catalog.
 pub async fn create_or_get_default_records(
-    kafka_partition_count: i32,
+    shard_count: i32,
     txn: &mut dyn Transaction,
-) -> Result<(KafkaTopic, QueryPool, BTreeMap<SequencerId, Sequencer>)> {
-    let kafka_topic = txn.kafka_topics().create_or_get(SHARED_KAFKA_TOPIC).await?;
+) -> Result<(TopicMetadata, QueryPool, BTreeMap<ShardId, Shard>)> {
+    let topic = txn.topics().create_or_get(SHARED_TOPIC_NAME).await?;
     let query_pool = txn.query_pools().create_or_get(SHARED_QUERY_POOL).await?;
 
-    let mut sequencers = BTreeMap::new();
-    // Start at 0 to match the one write buffer partition ID used in all-in-one mode
-    for partition in 0..kafka_partition_count {
-        let sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka_topic, KafkaPartition::new(partition))
+    let mut shards = BTreeMap::new();
+    // Start at 0 to match the one write buffer shard index used in all-in-one mode
+    for shard_index in 0..shard_count {
+        let shard = txn
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(shard_index))
             .await?;
-        sequencers.insert(sequencer.id, sequencer);
+        shards.insert(shard.id, shard);
     }
 
-    Ok((kafka_topic, query_pool, sequencers))
+    Ok((topic, query_pool, shards))
 }
 
 #[cfg(test)]
@@ -226,21 +263,23 @@ mod tests {
                     let metrics = Arc::new(metric::Registry::default());
                     let repo = MemCatalog::new(metrics);
                     let mut txn = repo.start_transaction().await.unwrap();
-                    let (kafka_topic, query_pool, _) = create_or_get_default_records(
+                    let (topic, query_pool, _) = create_or_get_default_records(
                         2,
                         txn.deref_mut()
                     ).await.unwrap();
 
                     let namespace = txn
                         .namespaces()
-                        .create(NAMESPACE_NAME, "inf", kafka_topic.id, query_pool.id)
+                        .create(NAMESPACE_NAME, None, topic.id, query_pool.id)
                         .await
                         .unwrap();
 
                     let schema = NamespaceSchema::new(
                         namespace.id,
-                        namespace.kafka_topic_id,
+                        namespace.topic_id,
                         namespace.query_pool_id,
+                        namespace.max_columns_per_table,
+                        namespace.retention_period_ns,
                     );
 
                     // Apply all the lp literals as individual writes, feeding
@@ -258,7 +297,7 @@ mod tests {
                                 .await;
 
                             match got {
-                                Err(Error::ColumnTypeMismatch{ .. }) => {
+                                Err(TableScopedError(_, Error::ColumnTypeMismatch{ .. })) => {
                                     observed_conflict = true;
                                     schema
                                 },

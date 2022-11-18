@@ -1,18 +1,20 @@
 [package]
 name = "mutable_batch"
-version = "0.1.0"
-edition = "2021"
 description = "A mutable arrow RecordBatch"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-arrow = { version = "17.0.0", features = ["prettyprint"] }
+arrow = { workspace = true, features = ["prettyprint"] }
 arrow_util = { path = "../arrow_util" }
 chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 iox_time = { path = "../iox_time" }
 schema = { path = "../schema" }
 snafu = "0.7"
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 itertools = "0.10"
 workspace-hack = { path = "../workspace-hack"}
 

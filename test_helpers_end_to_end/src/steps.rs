@@ -1,12 +1,11 @@
 use crate::{
-    get_write_token, get_write_token_from_grpc, run_query, token_is_persisted, wait_for_persisted,
+    get_write_token, run_query, token_is_persisted, try_run_query, wait_for_persisted,
     wait_for_readable, MiniCluster,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_sorted_eq;
 use futures::future::BoxFuture;
 use http::StatusCode;
-use influxdb_iox_client::write::generated_types::TableBatch;
 use observability_deps::tracing::info;
 
 /// Test harness for end to end tests that are comprised of several steps
@@ -66,20 +65,23 @@ impl<'a> StepTestState<'a> {
 /// ```
 pub type FCustom = Box<dyn for<'b> FnOnce(&'b mut StepTestState) -> BoxFuture<'b, ()>>;
 
+/// Function to do custom validation on metrics. Expected to panic on validation failure.
+pub type MetricsValidationFn = Box<dyn Fn(&mut StepTestState, String)>;
+
 /// Possible test steps that a test can perform
 pub enum Step {
     /// Writes the specified line protocol to the `/api/v2/write`
     /// endpoint, assert the data was written successfully
     WriteLineProtocol(String),
 
-    /// Writes the specified `TableBatch`es to the gRPC write API
-    WriteTableBatches(Vec<TableBatch>),
-
     /// Wait for all previously written data to be readable
     WaitForReadable,
 
     /// Assert that all previously written data is NOT persisted yet
     AssertNotPersisted,
+
+    /// Assert that last previously written data is NOT persisted yet.
+    AssertLastNotPersisted,
 
     /// Wait for all previously written data to be persisted
     WaitForPersisted,
@@ -88,12 +90,23 @@ pub enum Step {
     /// know about the ingester, so the test needs to ask the ingester directly.
     WaitForPersistedAccordingToIngester,
 
+    /// Run one hot and one cold compaction operation and wait for it to finish.
+    Compact,
+
     /// Run a query using the FlightSQL interface and verify that the
     /// results match the expected results using the
     /// `assert_batches_eq!` macro
     Query {
         sql: String,
         expected: Vec<&'static str>,
+    },
+
+    /// Run a query that's expected to fail using the FlightSQL interface and verify that the
+    /// request returns the expected error code and message
+    QueryExpectingError {
+        sql: String,
+        expected_error_code: tonic::Code,
+        expected_message: String,
     },
 
     /// Run a query using the FlightSQL interface, and then verifies
@@ -112,7 +125,7 @@ pub enum Step {
     ///
     /// The validation function is expected to panic on validation
     /// failure.
-    VerifiedMetrics(Box<dyn Fn(&mut StepTestState, String)>),
+    VerifiedMetrics(MetricsValidationFn),
 
     /// A custom step that can be used to implement special cases that
     /// are only used once.
@@ -147,13 +160,6 @@ impl<'a> StepTest<'a> {
                     assert_eq!(response.status(), StatusCode::NO_CONTENT);
                     let write_token = get_write_token(&response);
                     info!("====Done writing line protocol, got token {}", write_token);
-                    state.write_tokens.push(write_token);
-                }
-                Step::WriteTableBatches(table_batches) => {
-                    info!("====Begin writing TableBatches to gRPC API");
-                    let response = state.cluster.write_to_router_grpc(table_batches).await;
-                    let write_token = get_write_token_from_grpc(&response);
-                    info!("====Done writing TableBatches, got token {}", write_token);
                     state.write_tokens.push(write_token);
                 }
                 Step::WaitForReadable => {
@@ -196,6 +202,21 @@ impl<'a> StepTest<'a> {
                     }
                     info!("====Done checking all tokens not persisted");
                 }
+                Step::AssertLastNotPersisted => {
+                    info!("====Begin checking last tokens not persisted");
+                    let querier_grpc_connection =
+                        state.cluster().querier().querier_grpc_connection();
+                    let write_token = state.write_tokens.last().expect("No data written yet");
+                    let persisted =
+                        token_is_persisted(write_token, querier_grpc_connection.clone()).await;
+                    assert!(!persisted);
+                    info!("====Done checking last tokens not persisted");
+                }
+                Step::Compact => {
+                    info!("====Begin running compaction");
+                    state.cluster.run_compaction();
+                    info!("====Done running compaction");
+                }
                 Step::Query { sql, expected } => {
                     info!("====Begin running query: {}", sql);
                     // run query
@@ -206,6 +227,36 @@ impl<'a> StepTest<'a> {
                     )
                     .await;
                     assert_batches_sorted_eq!(&expected, &batches);
+                    info!("====Done running");
+                }
+                Step::QueryExpectingError {
+                    sql,
+                    expected_error_code,
+                    expected_message,
+                } => {
+                    info!("====Begin running query expected to error: {}", sql);
+
+                    let err = try_run_query(
+                        sql,
+                        state.cluster().namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                    )
+                    .await
+                    .unwrap_err();
+
+                    if let influxdb_iox_client::flight::Error::GrpcError(status) = err {
+                        assert_eq!(
+                            status.code(),
+                            expected_error_code,
+                            "Wrong status code: {}\n\nStatus:\n{}",
+                            status.code(),
+                            status,
+                        );
+                        assert_eq!(status.message(), expected_message);
+                    } else {
+                        panic!("Not a gRPC error: {err}");
+                    }
+
                     info!("====Done running");
                 }
                 Step::VerifiedQuery { sql, verify } => {

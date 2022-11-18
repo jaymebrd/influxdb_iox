@@ -6,12 +6,15 @@ mod setup;
 use arrow::record_batch::RecordBatch;
 use arrow_util::{display::pretty_format_batches, test_util::sort_record_batch};
 use iox_query::frontend::sql::SqlQueryPlanner;
+use regex::{Captures, Regex};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
+    collections::HashMap,
     io::LineWriter,
     io::Write,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 use self::{
     parse::{Query, TestQueries},
@@ -198,6 +201,12 @@ impl<W: Write> Runner<W> {
             if q.sorted_compare() {
                 output.push("-- Results After Sorting".into())
             }
+            if q.normalized_uuids() {
+                output.push("-- Results After Normalizing UUIDs".into())
+            }
+            if q.normalized_metrics() {
+                output.push("-- Results After Normalizing Metrics".into())
+            }
 
             output.append(&mut self.run_query(q, db_setup.as_ref()).await?);
         }
@@ -285,16 +294,95 @@ impl<W: Write> Runner<W> {
             // compare against sorted results, if requested
             if query.sorted_compare() && !results.is_empty() {
                 let schema = results[0].schema();
-                let batch = RecordBatch::concat(&schema, &results).expect("concatenating batches");
+                let batch = arrow::compute::concat_batches(&schema, &results)
+                    .expect("concatenating batches");
                 results = vec![sort_record_batch(batch)];
             }
 
-            let current_results = pretty_format_batches(&results)
+            let mut current_results = pretty_format_batches(&results)
                 .unwrap()
                 .trim()
                 .lines()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
+
+            // normalize UUIDs, if requested
+            if query.normalized_uuids() {
+                let regex =
+                    Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                        .expect("UUID regex");
+                let mut seen: HashMap<String, u128> = HashMap::new();
+                current_results = current_results
+                    .into_iter()
+                    .map(|s| {
+                        regex
+                            .replace_all(&s, |s: &Captures| {
+                                let next = seen.len() as u128;
+                                Uuid::from_u128(
+                                    *seen
+                                        .entry(s.get(0).unwrap().as_str().to_owned())
+                                        .or_insert(next),
+                                )
+                                .to_string()
+                            })
+                            .to_string()
+                    })
+                    .collect();
+            }
+
+            // normalize metrics, if requested
+            if query.normalized_metrics() {
+                // Parse regex once and apply to all rows. See description around the `replace...` calls on why/how the
+                // regexes are used.
+                let regex_metrics = Regex::new(r#"metrics=\[([^\]]*)\]"#).expect("metrics regex");
+                let regex_timing = Regex::new(r#"[0-9]+(\.[0-9]+)?.s"#).expect("timing regex");
+                let regex_linesep = Regex::new(r#"[+-]{6,}"#).expect("linesep regex");
+                let regex_col = Regex::new(r#"\s+\|"#).expect("col regex");
+
+                current_results = current_results
+                    .into_iter()
+                    .map(|s| {
+                        // Replace timings with fixed value, e.g.:
+                        //
+                        //   `1s`     -> `1.234ms`
+                        //   `1.2ms`  -> `1.234ms`
+                        //   `10.2μs` -> `1.234ms`
+                        let s = regex_timing.replace_all(&s, "1.234ms");
+
+                        // Replace table row separators of flexible width with fixed with. This is required because the
+                        // original timing values may differ in "printed width", so the table cells have different
+                        // widths and hence the separators / borders. E.g.:
+                        //
+                        //   `+--+--+`     -> `----------`
+                        //   `+--+------+` -> `----------`
+                        //
+                        // Note that we're kinda inexact with our regex here, but it gets the job done.
+                        let s = regex_linesep.replace_all(&s, "----------");
+
+                        // Similar to the row separator issue above, the table columns are right-padded with spaces. Due
+                        // to the different "printed width" of the timing values, we need to normalize this padding as
+                        // well. E.g.:
+                        //
+                        //   `        |`  -> `    |`
+                        //   `         |` -> `    |`
+                        let s = regex_col.replace_all(&s, "    |");
+
+                        // Metrics are currently ordered by value (not by key), so different timings may reorder them.
+                        // We "parse" the list and normalize the sorting. E.g.:
+                        //
+                        // `metrics=[]`             => `metrics=[]`
+                        // `metrics=[foo=1, bar=2]` => `metrics=[bar=2, foo=1]`
+                        // `metrics=[foo=2, bar=1]` => `metrics=[bar=1, foo=2]`
+                        regex_metrics
+                            .replace_all(&s, |c: &Captures| {
+                                let mut metrics: Vec<_> = c[1].split(", ").collect();
+                                metrics.sort();
+                                format!("metrics=[{}]", metrics.join(", "))
+                            })
+                            .to_string()
+                    })
+                    .collect();
+            }
 
             if !previous_results.is_empty() && previous_results != current_results {
                 let err = ScenarioMismatchSnafu {

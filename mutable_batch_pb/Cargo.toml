@@ -1,14 +1,16 @@
 [package]
 name = "mutable_batch_pb"
-version = "0.1.0"
-edition = "2021"
 description = "Conversion logic for binary write protocol <-> MutableBatch"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 arrow_util = { path = "../arrow_util" }
 dml = { path = "../dml" }
 generated_types = { path = "../generated_types" }
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 mutable_batch = { path = "../mutable_batch" }
 schema = { path = "../schema" }
 snafu = "0.7"

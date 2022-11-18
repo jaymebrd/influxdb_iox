@@ -282,12 +282,12 @@ impl ColumnData {
 
     fn pad_none(&mut self, additional: usize) {
         match self {
-            ColumnData::Float(data) => data.extend(iter::repeat(None).take(additional)),
-            ColumnData::Integer(data) => data.extend(iter::repeat(None).take(additional)),
-            ColumnData::Unsigned(data) => data.extend(iter::repeat(None).take(additional)),
-            ColumnData::Boolean(data) => data.extend(iter::repeat(None).take(additional)),
-            ColumnData::String(data) => data.extend(iter::repeat(None).take(additional)),
-            ColumnData::Tag(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::Float(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::Integer(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::Unsigned(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::Boolean(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::String(data) => data.extend(iter::repeat(None).take(additional)),
+            Self::Tag(data) => data.extend(iter::repeat(None).take(additional)),
         }
     }
 
@@ -333,12 +333,12 @@ impl ColumnData {
 
     fn len(&self) -> usize {
         match self {
-            ColumnData::Float(arr) => arr.len(),
-            ColumnData::Integer(arr) => arr.len(),
-            ColumnData::Unsigned(arr) => arr.len(),
-            ColumnData::Boolean(arr) => arr.len(),
-            ColumnData::String(arr) => arr.len(),
-            ColumnData::Tag(arr) => arr.len(),
+            Self::Float(arr) => arr.len(),
+            Self::Integer(arr) => arr.len(),
+            Self::Unsigned(arr) => arr.len(),
+            Self::Boolean(arr) => arr.len(),
+            Self::String(arr) => arr.len(),
+            Self::Tag(arr) => arr.len(),
         }
     }
 }
@@ -501,9 +501,14 @@ fn determine_tag_columns(frames: &[Data]) -> BTreeMap<Vec<u8>, TableColumns> {
         if let Data::Series(sf) = frame {
             assert!(!sf.tags.is_empty(), "expected _measurement and _field tags");
 
-            assert!(tag_key_is_measurement(&sf.tags[0].key));
             // PERF: avoid clone of value
-            let measurement_name = sf.tags[0].value.clone();
+            let measurement_name = sf
+                .tags
+                .iter()
+                .find(|t| tag_key_is_measurement(&t.key))
+                .expect("measurement name not found")
+                .value
+                .clone();
             let table = schema.entry(measurement_name).or_default();
 
             for Tag { key, value } in sf.tags.iter().skip(1) {
@@ -756,12 +761,12 @@ mod test_super {
                     "+--------+------------+----------------+---------+-------------------------------+",
                     "| region | bool_field | unsigned_field | voltage | time                          |",
                     "+--------+------------+----------------+---------+-------------------------------+",
-                    "|        |            |                | hello   | 1970-01-01 00:00:00.000000200 |",
-                    "|        |            |                | abc     | 1970-01-01 00:00:00.000000201 |",
-                    "| west   |            |                | foo     | 1970-01-01 00:00:00.000000302 |",
-                    "| west   |            |                | bar     | 1970-01-01 00:00:00.000000304 |",
-                    "| north  | true       |                |         | 1970-01-01 00:00:00.000001    |",
-                    "| south  |            | 600            |         | 1970-01-01 00:00:00.000002    |",
+                    "|        |            |                | hello   | 1970-01-01T00:00:00.000000200 |",
+                    "|        |            |                | abc     | 1970-01-01T00:00:00.000000201 |",
+                    "| west   |            |                | foo     | 1970-01-01T00:00:00.000000302 |",
+                    "| west   |            |                | bar     | 1970-01-01T00:00:00.000000304 |",
+                    "| north  | true       |                |         | 1970-01-01T00:00:00.000001    |",
+                    "| south  |            | 600            |         | 1970-01-01T00:00:00.000002    |",
                     "+--------+------------+----------------+---------+-------------------------------+",
                 ],
             ),
@@ -771,18 +776,18 @@ mod test_super {
                 "+------+------------+--------+------+---------+-------------------------------+",
                 "| host | new_column | server | temp | voltage | time                          |",
                 "+------+------------+--------+------+---------+-------------------------------+",
-                "| foo  |            | a      | 1.1  |         | 1970-01-01 00:00:00.000000001 |",
-                "| foo  |            | a      | 2.2  |         | 1970-01-01 00:00:00.000000002 |",
-                "| foo  |            | a      | 3.3  |         | 1970-01-01 00:00:00.000000003 |",
-                "| foo  |            | a      | 4.4  |         | 1970-01-01 00:00:00.000000004 |",
-                "| foo  |            | a      | 5.1  |         | 1970-01-01 00:00:00.000000005 |",
-                "| foo  |            | a      | 5.2  |         | 1970-01-01 00:00:00.000000006 |",
-                "| foo  |            | a      | 5.3  |         | 1970-01-01 00:00:00.000000007 |",
-                "| foo  |            | a      | 10.4 |         | 1970-01-01 00:00:00.000000010 |",
-                "| foo  |            | a      |      | 22      | 1970-01-01 00:00:00.000000001 |",
-                "| foo  |            | a      |      | 22      | 1970-01-01 00:00:00.000000002 |",
-                "| foo  | a          |        |      | 1000    | 1970-01-01 00:00:00.000000100 |",
-                "| foo  | a          |        |      | 2000    | 1970-01-01 00:00:00.000000200 |",
+                "| foo  |            | a      | 1.1  |         | 1970-01-01T00:00:00.000000001 |",
+                "| foo  |            | a      | 2.2  |         | 1970-01-01T00:00:00.000000002 |",
+                "| foo  |            | a      | 3.3  |         | 1970-01-01T00:00:00.000000003 |",
+                "| foo  |            | a      | 4.4  |         | 1970-01-01T00:00:00.000000004 |",
+                "| foo  |            | a      | 5.1  |         | 1970-01-01T00:00:00.000000005 |",
+                "| foo  |            | a      | 5.2  |         | 1970-01-01T00:00:00.000000006 |",
+                "| foo  |            | a      | 5.3  |         | 1970-01-01T00:00:00.000000007 |",
+                "| foo  |            | a      | 10.4 |         | 1970-01-01T00:00:00.000000010 |",
+                "| foo  |            | a      |      | 22      | 1970-01-01T00:00:00.000000001 |",
+                "| foo  |            | a      |      | 22      | 1970-01-01T00:00:00.000000002 |",
+                "| foo  | a          |        |      | 1000    | 1970-01-01T00:00:00.000000100 |",
+                "| foo  | a          |        |      | 2000    | 1970-01-01T00:00:00.000000200 |",
                 "+------+------------+--------+------+---------+-------------------------------+",
             ],
             ),

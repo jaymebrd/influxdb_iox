@@ -1,5 +1,5 @@
 pub mod generated_types {
-    pub use generated_types::influxdata::platform::storage::*;
+    pub use generated_types::influxdata::platform::storage::{read_group_request::Group, *};
 }
 
 use snafu::Snafu;
@@ -33,6 +33,21 @@ pub fn measurement_fields(
     }
 }
 
+pub fn measurement_tag_keys(
+    org_bucket: Any,
+    measurement: String,
+    start: i64,
+    stop: i64,
+    predicate: std::option::Option<Predicate>,
+) -> MeasurementTagKeysRequest {
+    generated_types::MeasurementTagKeysRequest {
+        source: Some(org_bucket),
+        measurement,
+        range: Some(TimestampRange { start, end: stop }),
+        predicate,
+    }
+}
+
 pub fn read_filter(
     org_bucket: Any,
     start: i64,
@@ -45,6 +60,25 @@ pub fn read_filter(
         range: Some(TimestampRange { start, end: stop }),
         key_sort: read_filter_request::KeySort::Unspecified as i32, // IOx doesn't support any other sort
         tag_key_meta_names: TagKeyMetaNames::Text as i32,
+    }
+}
+
+pub fn read_group(
+    org_bucket: Any,
+    start: i64,
+    stop: i64,
+    predicate: std::option::Option<Predicate>,
+    aggregate: std::option::Option<AggregateType>,
+    group: Group,
+    group_keys: Vec<String>,
+) -> ReadGroupRequest {
+    generated_types::ReadGroupRequest {
+        predicate,
+        read_source: Some(org_bucket),
+        range: Some(TimestampRange { start, end: stop }),
+        aggregate: aggregate.map(|a| Aggregate { r#type: a as i32 }),
+        group: group as i32,
+        group_keys,
     }
 }
 
@@ -85,6 +119,7 @@ pub fn read_window_aggregate(
         offset,
         aggregate,
         window,
+        tag_key_meta_names: TagKeyMetaNames::Text as i32,
     })
 }
 

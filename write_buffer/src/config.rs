@@ -12,12 +12,13 @@ use parking_lot::RwLock;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     num::NonZeroU32,
+    ops::Range,
     path::PathBuf,
     sync::Arc,
 };
 use trace::TraceCollector;
 
-pub const DEFAULT_N_SEQUENCERS: u32 = 1;
+pub const DEFAULT_N_SHARDS: u32 = 1;
 
 #[derive(Debug, Clone)]
 enum Mock {
@@ -32,6 +33,7 @@ pub struct WriteBufferConnection {
     pub type_: String,
 
     /// Connection string, depends on [`type_`](Self::type_).
+    /// When Kafka type is selected, multiple bootstrap_broker can be separated by commas.
     pub connection: String,
 
     /// Special configs to be applied when establishing the connection.
@@ -41,7 +43,7 @@ pub struct WriteBufferConnection {
     /// Note: This config should be a [`BTreeMap`] to ensure that a stable hash.
     pub connection_config: BTreeMap<String, String>,
 
-    /// Specifies if the sequencers (e.g. for Kafka in form of a topic) should be automatically
+    /// Specifies if the shards (e.g. for Kafka in form of a topic) should be automatically
     /// created if they do not existing prior to reading or writing.
     pub creation_config: Option<WriteBufferCreationConfig>,
 }
@@ -57,19 +59,19 @@ impl Default for WriteBufferConnection {
     }
 }
 
-/// Configs sequencer auto-creation for write buffers.
+/// Configs shard auto-creation for write buffers.
 ///
 /// What that means depends on the used write buffer, e.g. for Kafka this will create a new topic w/
-/// [`n_sequencers`](Self::n_sequencers) partitions.
+/// [`n_shards`](Self::n_shards) partitions.
 #[derive(Debug, Eq, PartialEq, Clone, Hash)]
 pub struct WriteBufferCreationConfig {
-    /// Number of sequencers.
+    /// Number of shards.
     ///
     /// How they are implemented depends on [type](WriteBufferConnection::type_), e.g. for Kafka
     /// this is mapped to the number of partitions.
-    pub n_sequencers: NonZeroU32,
+    pub n_shards: NonZeroU32,
 
-    /// Special configs to by applied when sequencers are created.
+    /// Special configs to by applied when shards are created.
     ///
     /// This depends on [type](WriteBufferConnection::type_) and can setup parameters like
     /// retention policy.
@@ -81,7 +83,7 @@ pub struct WriteBufferCreationConfig {
 impl Default for WriteBufferCreationConfig {
     fn default() -> Self {
         Self {
-            n_sequencers: NonZeroU32::try_from(DEFAULT_N_SEQUENCERS).unwrap(),
+            n_shards: NonZeroU32::try_from(DEFAULT_N_SHARDS).unwrap(),
             options: Default::default(),
         }
     }
@@ -151,6 +153,7 @@ impl WriteBufferConfigFactory {
     pub async fn new_config_write(
         &self,
         db_name: &str,
+        partitions: Option<Range<i32>>,
         trace_collector: Option<&Arc<dyn TraceCollector>>,
         cfg: &WriteBufferConnection,
     ) -> Result<Arc<dyn WriteBufferWriting>, WriteBufferError> {
@@ -171,9 +174,11 @@ impl WriteBufferConfigFactory {
                     cfg.connection.clone(),
                     db_name.to_owned(),
                     &cfg.connection_config,
-                    cfg.creation_config.as_ref(),
                     Arc::clone(&self.time_provider),
+                    cfg.creation_config.as_ref(),
+                    partitions,
                     trace_collector.map(Arc::clone),
+                    &self.metric_registry,
                 )
                 .await?;
                 Arc::new(rskafa_buffer) as _
@@ -204,6 +209,7 @@ impl WriteBufferConfigFactory {
     pub async fn new_config_read(
         &self,
         db_name: &str,
+        partitions: Option<Range<i32>>,
         trace_collector: Option<&Arc<dyn TraceCollector>>,
         cfg: &WriteBufferConnection,
     ) -> Result<Arc<dyn WriteBufferReading>, WriteBufferError> {
@@ -225,6 +231,7 @@ impl WriteBufferConfigFactory {
                     db_name.to_owned(),
                     &cfg.connection_config,
                     cfg.creation_config.as_ref(),
+                    partitions,
                     trace_collector.map(Arc::clone),
                 )
                 .await?;
@@ -257,7 +264,7 @@ mod tests {
         core::test_utils::random_topic_name, maybe_skip_kafka_integration,
         mock::MockBufferSharedState,
     };
-    use data_types::DatabaseName;
+    use data_types::NamespaceName;
     use std::{convert::TryFrom, num::NonZeroU32};
     use tempfile::TempDir;
 
@@ -265,7 +272,7 @@ mod tests {
     async fn test_writing_file() {
         let root = TempDir::new().unwrap();
         let factory = factory();
-        let db_name = DatabaseName::try_from("foo").unwrap();
+        let db_name = NamespaceName::try_from("foo").unwrap();
         let cfg = WriteBufferConnection {
             type_: "file".to_string(),
             connection: root.path().display().to_string(),
@@ -274,7 +281,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "file");
@@ -284,7 +291,7 @@ mod tests {
     async fn test_reading_file() {
         let root = TempDir::new().unwrap();
         let factory = factory();
-        let db_name = DatabaseName::try_from("foo").unwrap();
+        let db_name = NamespaceName::try_from("foo").unwrap();
         let cfg = WriteBufferConnection {
             type_: "file".to_string(),
             connection: root.path().display().to_string(),
@@ -293,7 +300,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "file");
@@ -303,12 +310,11 @@ mod tests {
     async fn test_writing_mock() {
         let factory = factory();
 
-        let state =
-            MockBufferSharedState::empty_with_n_sequencers(NonZeroU32::try_from(1).unwrap());
+        let state = MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
         let mock_name = "some_mock";
         factory.register_mock(mock_name.to_string(), state);
 
-        let db_name = DatabaseName::try_from(random_topic_name()).unwrap();
+        let db_name = NamespaceName::try_from(random_topic_name()).unwrap();
         let cfg = WriteBufferConnection {
             type_: "mock".to_string(),
             connection: mock_name.to_string(),
@@ -316,7 +322,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "mock");
@@ -328,7 +334,7 @@ mod tests {
             ..Default::default()
         };
         let err = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Unknown mock ID:"));
@@ -338,12 +344,11 @@ mod tests {
     async fn test_reading_mock() {
         let factory = factory();
 
-        let state =
-            MockBufferSharedState::empty_with_n_sequencers(NonZeroU32::try_from(1).unwrap());
+        let state = MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
         let mock_name = "some_mock";
         factory.register_mock(mock_name.to_string(), state);
 
-        let db_name = DatabaseName::try_from(random_topic_name()).unwrap();
+        let db_name = NamespaceName::try_from(random_topic_name()).unwrap();
         let cfg = WriteBufferConnection {
             type_: "mock".to_string(),
             connection: mock_name.to_string(),
@@ -351,7 +356,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "mock");
@@ -363,7 +368,7 @@ mod tests {
             ..Default::default()
         };
         let err = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Unknown mock ID:"));
@@ -376,7 +381,7 @@ mod tests {
         let mock_name = "some_mock";
         factory.register_always_fail_mock(mock_name.to_string());
 
-        let db_name = DatabaseName::try_from(random_topic_name()).unwrap();
+        let db_name = NamespaceName::try_from(random_topic_name()).unwrap();
         let cfg = WriteBufferConnection {
             type_: "mock".to_string(),
             connection: mock_name.to_string(),
@@ -384,7 +389,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "mock_failing");
@@ -396,7 +401,7 @@ mod tests {
             ..Default::default()
         };
         let err = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Unknown mock ID:"));
@@ -409,7 +414,7 @@ mod tests {
         let mock_name = "some_mock";
         factory.register_always_fail_mock(mock_name.to_string());
 
-        let db_name = DatabaseName::new("foo").unwrap();
+        let db_name = NamespaceName::new("foo").unwrap();
         let cfg = WriteBufferConnection {
             type_: "mock".to_string(),
             connection: mock_name.to_string(),
@@ -417,7 +422,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "mock_failing");
@@ -429,7 +434,7 @@ mod tests {
             ..Default::default()
         };
         let err = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Unknown mock ID:"));
@@ -440,8 +445,7 @@ mod tests {
     fn test_register_mock_twice_panics() {
         let factory = factory();
 
-        let state =
-            MockBufferSharedState::empty_with_n_sequencers(NonZeroU32::try_from(1).unwrap());
+        let state = MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
         let mock_name = "some_mock";
         factory.register_always_fail_mock(mock_name.to_string());
         factory.register_mock(mock_name.to_string(), state);
@@ -457,7 +461,7 @@ mod tests {
     async fn test_writing_kafka() {
         let conn = maybe_skip_kafka_integration!();
         let factory = factory();
-        let db_name = DatabaseName::try_from(random_topic_name()).unwrap();
+        let db_name = NamespaceName::try_from(random_topic_name()).unwrap();
         let cfg = WriteBufferConnection {
             type_: "kafka".to_string(),
             connection: conn,
@@ -466,7 +470,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_write(db_name.as_str(), None, &cfg)
+            .new_config_write(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "kafka");
@@ -477,7 +481,7 @@ mod tests {
         let conn = maybe_skip_kafka_integration!();
         let factory = factory();
 
-        let db_name = DatabaseName::try_from(random_topic_name()).unwrap();
+        let db_name = NamespaceName::try_from(random_topic_name()).unwrap();
         let cfg = WriteBufferConnection {
             type_: "kafka".to_string(),
             connection: conn,
@@ -486,7 +490,7 @@ mod tests {
         };
 
         let conn = factory
-            .new_config_read(db_name.as_str(), None, &cfg)
+            .new_config_read(db_name.as_str(), None, None, &cfg)
             .await
             .unwrap();
         assert_eq!(conn.type_name(), "kafka");

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use datafusion::logical_plan::{provider_as_source, ExprRewritable, LogicalPlanBuilder};
+use datafusion::{
+    datasource::provider_as_source,
+    logical_expr::{expr_rewriter::ExprRewritable, LogicalPlanBuilder},
+};
 use observability_deps::tracing::trace;
 use predicate::Predicate;
 use schema::{sort::SortKey, Schema};
@@ -83,26 +86,30 @@ impl ScanPlan {
 
 #[derive(Debug)]
 pub struct ScanPlanBuilder<'a> {
-    ctx: Option<IOxSessionContext>,
-    table_name: Option<String>,
+    ctx: IOxSessionContext,
+    table_name: Arc<str>,
     /// The schema of the resulting table (any chunks that don't have
     /// all the necessary columns will be extended appropriately)
     table_schema: Arc<Schema>,
     chunks: Vec<Arc<dyn QueryChunk>>,
     /// The sort key that describes the desired output sort order
-    sort_key: Option<SortKey>,
+    output_sort_key: Option<SortKey>,
     predicate: Option<&'a Predicate>,
+    /// Do deduplication
+    deduplication: bool,
 }
 
 impl<'a> ScanPlanBuilder<'a> {
-    pub fn new(table_schema: Arc<Schema>) -> Self {
+    pub fn new(table_name: Arc<str>, table_schema: Arc<Schema>, ctx: IOxSessionContext) -> Self {
         Self {
-            ctx: None,
-            table_name: None,
+            ctx,
+            table_name,
             table_schema,
             chunks: vec![],
-            sort_key: None,
+            output_sort_key: None,
             predicate: None,
+            // always do deduplication in query
+            deduplication: true,
         }
     }
 
@@ -115,16 +122,9 @@ impl<'a> ScanPlanBuilder<'a> {
     /// Sets the desired output sort key. If the output of this plan
     /// is not already sorted this way, it will be re-sorted to conform
     /// to this key
-    pub fn with_sort_key(mut self, sort_key: SortKey) -> Self {
-        assert!(self.sort_key.is_none());
-        self.sort_key = Some(sort_key);
-        self
-    }
-
-    /// Sets the session context (for profiling) if any
-    pub fn with_session_context(mut self, ctx: IOxSessionContext) -> Self {
-        assert!(self.ctx.is_none());
-        self.ctx = Some(ctx);
+    pub fn with_output_sort_key(mut self, output_sort_key: SortKey) -> Self {
+        assert!(self.output_sort_key.is_none());
+        self.output_sort_key = Some(output_sort_key);
         self
     }
 
@@ -135,52 +135,46 @@ impl<'a> ScanPlanBuilder<'a> {
         self
     }
 
+    /// Deduplication
+    pub fn enable_deduplication(mut self, deduplication: bool) -> Self {
+        self.deduplication = deduplication;
+        self
+    }
+
     /// Creates a `ScanPlan` from the specified chunks
     pub fn build(self) -> Result<ScanPlan> {
         let Self {
             ctx,
             table_name,
             chunks,
-            sort_key,
+            output_sort_key,
             table_schema,
             predicate,
+            deduplication,
         } = self;
 
         assert!(!chunks.is_empty(), "no chunks provided");
 
-        let table_name = table_name.unwrap_or_else(|| chunks[0].table_name().to_string());
-        let table_name = &table_name;
-
         // Prepare the plan for the table
-        let mut builder = ProviderBuilder::new(table_name, table_schema)
-            // Assumes the caller has picked exactly what chunks they want
-            // so no need to prune them
-            .add_no_op_pruner();
+        let mut builder = ProviderBuilder::new(
+            Arc::clone(&table_name),
+            table_schema,
+            ctx.child_ctx("provider_builder"),
+        )
+        .with_enable_deduplication(deduplication);
 
-        if let Some(ctx) = ctx {
-            builder = builder.with_execution_context(ctx.child_ctx("provider_builder"));
-        }
-
-        if let Some(sort_key) = sort_key {
+        if let Some(output_sort_key) = output_sort_key {
             // Tell the scan of this provider to sort its output on the given sort_key
-            builder = builder.with_sort_key(sort_key);
+            builder = builder.with_output_sort_key(output_sort_key);
         }
 
         for chunk in chunks {
-            // check that it is consistent with this table_name
-            assert_eq!(
-                chunk.table_name(),
-                table_name,
-                "Chunk {} expected table mismatch",
-                chunk.id(),
-            );
-
             builder = builder.add_chunk(chunk);
         }
 
-        let provider = builder
-            .build()
-            .context(CreatingProviderSnafu { table_name })?;
+        let provider = builder.build().context(CreatingProviderSnafu {
+            table_name: table_name.as_ref(),
+        })?;
 
         let provider = Arc::new(provider);
         let source = provider_as_source(Arc::clone(&provider) as _);
@@ -189,8 +183,8 @@ impl<'a> ScanPlanBuilder<'a> {
         // later if possible)
         let projection = None;
 
-        let mut plan_builder =
-            LogicalPlanBuilder::scan(table_name, source, projection).context(BuildingPlanSnafu)?;
+        let mut plan_builder = LogicalPlanBuilder::scan(table_name.as_ref(), source, projection)
+            .context(BuildingPlanSnafu)?;
 
         // Use a filter node to add general predicates + timestamp
         // range, if any
@@ -200,9 +194,12 @@ impl<'a> ScanPlanBuilder<'a> {
                 let schema = provider.iox_schema();
                 trace!(%table_name, ?filter_expr, "Adding filter expr");
                 let mut rewriter = MissingColumnsToNull::new(&schema);
-                let filter_expr = filter_expr
-                    .rewrite(&mut rewriter)
-                    .context(RewritingFilterPredicateSnafu { table_name })?;
+                let filter_expr =
+                    filter_expr
+                        .rewrite(&mut rewriter)
+                        .context(RewritingFilterPredicateSnafu {
+                            table_name: table_name.as_ref(),
+                        })?;
 
                 trace!(?filter_expr, "Rewritten filter_expr");
 

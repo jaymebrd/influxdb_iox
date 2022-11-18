@@ -8,11 +8,15 @@ members = [
     "client_util",
     "compactor",
     "data_types",
-    "datafusion",
     "datafusion_util",
     "dml",
     "executor",
     "generated_types",
+    "grpc-binary-logger-proto",
+    "grpc-binary-logger-test-proto",
+    "grpc-binary-logger",
+    "import",
+    "influxdb_influxql_parser",
     "influxdb_iox",
     "influxdb_iox_client",
     "influxdb_line_protocol",
@@ -23,13 +27,14 @@ members = [
     "ingester",
     "iox_catalog",
     "iox_data_generator",
-    "iox_objectstore_garbage_collect",
+    "garbage_collector",
     "iox_query",
     "iox_tests",
     "iox_time",
     "ioxd_common",
     "ioxd_compactor",
     "ioxd_ingester",
+    "ioxd_garbage_collector",
     "ioxd_querier",
     "ioxd_router",
     "ioxd_test",
@@ -42,19 +47,19 @@ members = [
     "mutable_batch_tests",
     "object_store_metrics",
     "observability_deps",
-    "packers",
     "panic_logging",
     "parquet_file",
+    "parquet_to_line_protocol",
     "predicate",
     "querier",
     "query_functions",
     "query_tests",
-    "read_buffer",
     "router",
     "schema",
     "service_common",
     "service_grpc_influxrpc",
     "service_grpc_flight",
+    "service_grpc_namespace",
     "service_grpc_object_store",
     "service_grpc_catalog",
     "service_grpc_schema",
@@ -97,6 +102,20 @@ exclude = [
     "tools/",
 ]
 
+[workspace.package]
+version = "0.1.0"
+authors = ["IOx Project Developers"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+arrow = { version = "26.0.0" }
+arrow-flight = { version = "26.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="dd081d64a2fba8574e63bdd0662c14aec5852b48", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="dd081d64a2fba8574e63bdd0662c14aec5852b48" }
+hashbrown = { version = "0.13.1" }
+parquet = { version = "26.0.0" }
+
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.
 [profile.release]
@@ -115,6 +134,9 @@ codegen-units = 16
 lto = false
 incremental = true
 
-[patch.crates-io]
-# remove and bump object_store dep version once this revision is released.
-object_store = { git = 'https://github.com/influxdata/object_store_rs', rev = "3c51870ac41a90942c2e45bb499a893d514ed1da"}
+# Per insta docs: https://insta.rs/docs/quickstart/#optional-faster-runs
+[profile.dev.package.insta]
+opt-level = 3
+
+[profile.dev.package.similar]
+opt-level = 3

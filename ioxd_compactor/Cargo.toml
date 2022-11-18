@@ -1,12 +1,13 @@
 [package]
 name = "ioxd_compactor"
-version = "0.1.0"
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # Workspace dependencies, in alphabetical order
+backoff = { path = "../backoff" }
 clap_blocks = { path = "../clap_blocks" }
 compactor = { path = "../compactor" }
 data_types = { path = "../data_types" }
@@ -14,13 +15,13 @@ iox_catalog = { path = "../iox_catalog" }
 ioxd_common = { path = "../ioxd_common" }
 metric = { path = "../metric" }
 iox_query = { path = "../iox_query" }
-object_store = "0.3.0"
+object_store = "0.5.1"
 iox_time = { path = "../iox_time" }
 trace = { path = "../trace" }
 
 # Crates.io dependencies, in alphabetical order
 async-trait = "0.1"
 hyper = "0.14"
-thiserror = "1.0.31"
+thiserror = "1.0.37"
 workspace-hack = { path = "../workspace-hack"}
 parquet_file = { version = "0.1.0", path = "../parquet_file" }

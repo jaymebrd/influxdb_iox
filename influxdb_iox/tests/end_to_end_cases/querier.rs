@@ -1,11 +1,16 @@
 pub(crate) mod influxrpc;
 mod multi_ingester;
 
-use assert_cmd::Command;
+use std::time::Duration;
+
+use arrow_util::assert_batches_sorted_eq;
+use assert_cmd::{assert::Assert, Command};
 use futures::FutureExt;
 use predicates::prelude::*;
+use test_helpers::assert_contains;
 use test_helpers_end_to_end::{
-    maybe_skip_integration, try_run_query, MiniCluster, Step, StepTest, StepTestState, TestConfig,
+    maybe_skip_integration, run_query, try_run_query, GrpcRequestBuilder, MiniCluster, Step,
+    StepTest, StepTestState, TestConfig,
 };
 
 #[tokio::test]
@@ -161,7 +166,8 @@ async fn query_after_persist_sees_new_files() {
             ],
         },
         // write another parquet file
-        Step::WriteLineProtocol(setup.lp_to_force_persistence()),
+        // that has non duplicated data
+        Step::WriteLineProtocol(setup.lp_to_force_persistence().replace("tag=A", "tag=B")),
         Step::WaitForPersisted,
         // query should correctly see the data in the second parquet file
         Step::Query {
@@ -219,7 +225,7 @@ async fn table_not_found_on_ingester() {
 }
 
 #[tokio::test]
-async fn ingester_panic() {
+async fn ingester_panic_1() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
@@ -228,8 +234,9 @@ async fn ingester_panic() {
     // Set up the cluster  ====================================
     let router_config = TestConfig::new_router(&database_url);
     // can't use standard mini cluster here as we setup the querier to panic
-    let ingester_config =
-        TestConfig::new_ingester(&router_config).with_ingester_flight_do_get_panic(2);
+    let ingester_config = TestConfig::new_ingester(&router_config)
+        .with_ingester_flight_do_get_panic(2)
+        .with_ingester_persist_memory_threshold(1_000_000);
     let querier_config = TestConfig::new_querier(&ingester_config).with_json_logs();
     let mut cluster = MiniCluster::new()
         .with_router(router_config)
@@ -251,67 +258,142 @@ async fn ingester_panic() {
             Step::AssertNotPersisted,
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 async move {
-                    // SQL query fails, error is propagated
+                    // Ingester panics but querier will retry.
                     let sql = format!("select * from {} where tag2='B'", table_name);
-                    let err = try_run_query(
+                    let batches = run_query(
                         sql,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
                     )
-                    .await
-                    .unwrap_err();
-                    if let influxdb_iox_client::flight::Error::GrpcError(status) = err {
-                        assert_eq!(status.code(), tonic::Code::Internal);
-                    } else {
-                        panic!("wrong error type");
-                    }
+                    .await;
+                    let expected = [
+                        "+------+------+--------------------------------+-----+",
+                        "| tag1 | tag2 | time                           | val |",
+                        "+------+------+--------------------------------+-----+",
+                        "| A    | B    | 1970-01-01T00:00:00.000123456Z | 42  |",
+                        "+------+------+--------------------------------+-----+",
+                    ];
+                    assert_batches_sorted_eq!(&expected, &batches);
 
-                    // find relevant log line for debugging
-                    let querier_logs =
-                        std::fs::read_to_string(state.cluster().querier().log_path().await)
+                    // verify that the ingester panicked
+                    let ingester_logs =
+                        std::fs::read_to_string(state.cluster().ingester().log_path().await)
                             .unwrap();
-                    let log_line = querier_logs
-                        .split('\n')
-                        .find(|s| s.contains("Failed to perform ingester query"))
-                        .unwrap();
-                    let log_data: serde_json::Value = serde_json::from_str(log_line).unwrap();
-                    let log_data = log_data.as_object().unwrap();
-                    let log_data = log_data["fields"].as_object().unwrap();
+                    assert_contains!(
+                        ingester_logs,
+                        "thread 'tokio-runtime-worker' panicked at 'Panicking in `do_get` for testing purposes.'"
+                    );
 
-                    // query ingester using debug information
-                    for i in 0..2 {
-                        let assert = Command::cargo_bin("influxdb_iox")
-                            .unwrap()
-                            .arg("-h")
-                            .arg(log_data["ingester_address"].as_str().unwrap())
-                            .arg("query-ingester")
-                            .arg(log_data["namespace"].as_str().unwrap())
-                            .arg(log_data["table"].as_str().unwrap())
-                            .arg("--columns")
-                            .arg(log_data["columns"].as_str().unwrap())
-                            .arg("--predicate-base64")
-                            .arg(log_data["predicate_binary"].as_str().unwrap())
-                            .assert();
-
-                        // The ingester is configured to fail 2 times, once for the original query and once during
-                        // debugging. The 2nd debug query should work and should only return data for `tag2=B` (not for
-                        // `tag2=C`).
-                        if i == 0 {
-                            assert.failure().stderr(predicate::str::contains(
-                                "Error querying: status: Internal, message: \"Panicking in `do_get` for testing purposes.\"",
-                            ));
-                        } else {
-                            assert.success().stdout(
-                                predicate::str::contains(
-                                    "| A    | B    | 1970-01-01T00:00:00.000123456Z | 42  |",
-                                )
-                                .and(predicate::str::contains("C").not()),
-                            );
-                        }
-                    }
+                     // The debug query should work.
+                     let assert = repeat_ingester_request_based_on_querier_logs(state).await;
+                     assert.success().stdout(
+                         predicate::str::contains(
+                             "| A    | B    | 1970-01-01T00:00:00.000123456Z | 42  |",
+                         )
+                     );
                 }
                 .boxed()
             })),
+        ],
+    )
+    .run()
+    .await
+}
+
+#[tokio::test]
+async fn ingester_panic_2() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    let table_name = "the_table";
+
+    // Set up the cluster  ====================================
+    let router_config = TestConfig::new_router(&database_url);
+    // can't use standard mini cluster here as we setup the querier to panic
+    let ingester_config = TestConfig::new_ingester(&router_config)
+        .with_ingester_flight_do_get_panic(10)
+        .with_ingester_persist_memory_threshold(2_000);
+    let querier_config = TestConfig::new_querier(&ingester_config)
+        .with_querier_ingester_circuit_breaker_threshold(2)
+        .with_json_logs();
+    let mut cluster = MiniCluster::new()
+        .with_router(router_config)
+        .await
+        .with_ingester(ingester_config)
+        .await
+        .with_querier(querier_config)
+        .await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocol(format!(
+                "{},tag=A val=1i 1\n\
+                 {},tag=B val=2i,trigger=\"{}\" 2",
+                table_name,
+                table_name,
+                "x".repeat(10_000),
+            )),
+            Step::WaitForPersisted,
+            Step::WriteLineProtocol(format!("{},tag=A val=3i 3", table_name)),
+            Step::WaitForReadable,
+            Step::AssertLastNotPersisted,
+            // circuit breaker will prevent ingester from being queried, so we only get the persisted data
+            Step::Query {
+                sql: format!("select tag,val,time from {} where tag='A'", table_name),
+                expected: vec![
+                    "+-----+-----+--------------------------------+",
+                    "| tag | val | time                           |",
+                    "+-----+-----+--------------------------------+",
+                    "| A   | 1   | 1970-01-01T00:00:00.000000001Z |",
+                    "+-----+-----+--------------------------------+",
+                ],
+            },
+            Step::Custom(Box::new(move |state: &mut StepTestState| {
+                async move {
+                    // "de-panic" the ingester
+                    for trail in 1.. {
+                        let assert = repeat_ingester_request_based_on_querier_logs(state).await;
+                        if assert.try_success().is_ok() {
+                            break;
+                        }
+                        assert!(trail < 20);
+                    }
+
+                    // wait for circuit breaker to close circuits again
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let sql =
+                                format!("select tag,val,time from {} where tag='A'", table_name);
+                            let batches = run_query(
+                                sql,
+                                state.cluster().namespace(),
+                                state.cluster().querier().querier_grpc_connection(),
+                            )
+                            .await;
+
+                            let n_lines = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                            if n_lines > 1 {
+                                let expected = [
+                                    "+-----+-----+--------------------------------+",
+                                    "| tag | val | time                           |",
+                                    "+-----+-----+--------------------------------+",
+                                    "| A   | 1   | 1970-01-01T00:00:00.000000001Z |",
+                                    "| A   | 3   | 1970-01-01T00:00:00.000000003Z |",
+                                    "+-----+-----+--------------------------------+",
+                                ];
+                                assert_batches_sorted_eq!(&expected, &batches);
+
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                .boxed()
+            })),
+            Step::AssertLastNotPersisted,
         ],
     )
     .run()
@@ -451,6 +533,140 @@ async fn issue_4631_b() {
     .await
 }
 
+#[tokio::test]
+async fn unsupported_sql_returns_error() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    // Set up the cluster  ====================================
+    let mut cluster = MiniCluster::create_shared(database_url).await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocol("this_table_does_exist,tag=A val=\"foo\" 1".into()),
+            Step::QueryExpectingError {
+                sql: "drop table this_table_doesnt_exist".into(),
+                expected_error_code: tonic::Code::InvalidArgument,
+                expected_message: "Error while planning query: This feature is not implemented: \
+                    DropTable"
+                    .into(),
+            },
+            Step::QueryExpectingError {
+                sql: "create view some_view as select * from this_table_does_exist".into(),
+                expected_error_code: tonic::Code::InvalidArgument,
+                expected_message: "Error while planning query: This feature is not implemented: \
+                    CreateView"
+                    .into(),
+            },
+            Step::QueryExpectingError {
+                sql: "create database my_new_database".into(),
+                // Should be InvalidArgument after
+                // https://github.com/apache/arrow-datafusion/issues/3873
+                expected_error_code: tonic::Code::Internal,
+                expected_message: "Error while planning query: Internal error: Unsupported \
+                    logical plan: CreateCatalog. This was likely caused by a bug in DataFusion's \
+                    code and we would welcome that you file an bug report in our issue tracker"
+                    .into(),
+            },
+            Step::QueryExpectingError {
+                sql: "create schema foo".into(),
+                // Should be InvalidArgument after
+                // https://github.com/apache/arrow-datafusion/issues/3873
+                expected_error_code: tonic::Code::Internal,
+                expected_message: "Error while planning query: Internal error: Unsupported \
+                    logical plan: CreateCatalogSchema. This was likely caused by a bug in \
+                    DataFusion's code and we would welcome that you file an bug report in our \
+                    issue tracker"
+                    .into(),
+            },
+        ],
+    )
+    .run()
+    .await
+}
+
+#[tokio::test]
+async fn oom_protection() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    let table_name = "the_table";
+
+    // Set up the cluster  ====================================
+    let router_config = TestConfig::new_router(&database_url);
+    let ingester_config = TestConfig::new_ingester(&router_config);
+    let querier_config =
+        TestConfig::new_querier(&ingester_config).with_querier_max_table_query_bytes(1);
+    let mut cluster = MiniCluster::new()
+        .with_router(router_config)
+        .await
+        .with_ingester(ingester_config)
+        .await
+        .with_querier(querier_config)
+        .await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocol(format!("{},tag1=A,tag2=B val=42i 123457", table_name)),
+            Step::WaitForReadable,
+            Step::AssertNotPersisted,
+            // SQL query
+            Step::Custom(Box::new(move |state: &mut StepTestState| {
+                async move {
+                    let sql = format!("select * from {}", table_name);
+                    let err = try_run_query(
+                        sql,
+                        state.cluster().namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                    )
+                    .await
+                    .unwrap_err();
+
+                    if let influxdb_iox_client::flight::Error::GrpcError(status) = err {
+                        assert_eq!(
+                            status.code(),
+                            tonic::Code::ResourceExhausted,
+                            "Wrong status code: {}\n\nStatus:\n{}",
+                            status.code(),
+                            status,
+                        );
+                    } else {
+                        panic!("Not a gRPC error: {err}");
+                    }
+                }
+                .boxed()
+            })),
+            // InfluxRPC/storage query
+            Step::Custom(Box::new(move |state: &mut StepTestState| {
+                async move {
+                    let mut storage_client = state.cluster().querier_storage_client();
+
+                    let read_filter_request = GrpcRequestBuilder::new()
+                        .source(state.cluster())
+                        .build_read_filter();
+
+                    let status = storage_client
+                        .read_filter(read_filter_request)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        status.code(),
+                        tonic::Code::ResourceExhausted,
+                        "Wrong status code: {}\n\nStatus:\n{}",
+                        status.code(),
+                        status,
+                    );
+                }
+                .boxed()
+            })),
+        ],
+    )
+    .run()
+    .await
+}
+
 /// This structure holds information for tests that need to force a parquet file to be persisted
 struct ForcePersistenceSetup {
     // Set up a cluster that will will persist quickly
@@ -499,4 +715,29 @@ impl ForcePersistenceSetup {
     pub fn super_long_string(&self) -> String {
         "x".repeat(10_000)
     }
+}
+
+async fn repeat_ingester_request_based_on_querier_logs(state: &StepTestState<'_>) -> Assert {
+    let querier_logs = std::fs::read_to_string(state.cluster().querier().log_path().await).unwrap();
+    let log_line = querier_logs
+        .split('\n')
+        .find(|s| s.contains("Failed to perform ingester query"))
+        .unwrap();
+    let log_data: serde_json::Value = serde_json::from_str(log_line).unwrap();
+    let log_data = log_data.as_object().unwrap();
+    let log_data = log_data["fields"].as_object().unwrap();
+
+    // query ingester using debug information
+    Command::cargo_bin("influxdb_iox")
+        .unwrap()
+        .arg("-h")
+        .arg(log_data["ingester_address"].as_str().unwrap())
+        .arg("query-ingester")
+        .arg(log_data["namespace_id"].as_u64().unwrap().to_string())
+        .arg(log_data["table_id"].as_u64().unwrap().to_string())
+        .arg("--columns")
+        .arg(log_data["columns"].as_str().unwrap())
+        .arg("--predicate-base64")
+        .arg(log_data["predicate_binary"].as_str().unwrap())
+        .assert()
 }

@@ -1,3 +1,5 @@
+use client_util::connection::GrpcConnection;
+
 use self::generated_types::{delete_service_client::DeleteServiceClient, *};
 
 use crate::connection::Connection;
@@ -50,7 +52,7 @@ pub mod generated_types {
 /// };
 /// client
 ///     .delete(
-///         "my_db",
+///         42,
 ///         "my_table",
 ///         pred,
 ///     )
@@ -60,31 +62,30 @@ pub mod generated_types {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Client {
-    inner: DeleteServiceClient<Connection>,
+    inner: DeleteServiceClient<GrpcConnection>,
 }
 
 impl Client {
     /// Creates a new client with the provided connection
-    pub fn new(channel: Connection) -> Self {
+    pub fn new(connection: Connection) -> Self {
         Self {
-            inner: DeleteServiceClient::new(channel),
+            inner: DeleteServiceClient::new(connection.into_grpc_connection()),
         }
     }
 
     /// Delete data from a table on a specified predicate
     pub async fn delete(
         &mut self,
-        db_name: impl Into<String> + Send,
+        database_id: i64,
         table_name: impl Into<String> + Send,
         predicate: Predicate,
     ) -> Result<(), Error> {
-        let db_name = db_name.into();
         let table_name = table_name.into();
 
         self.inner
             .delete(DeleteRequest {
                 payload: Some(DeletePayload {
-                    db_name,
+                    database_id,
                     table_name,
                     predicate: Some(predicate),
                 }),

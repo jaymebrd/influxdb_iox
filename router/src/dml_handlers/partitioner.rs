@@ -1,11 +1,14 @@
-use super::DmlHandler;
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate, PartitionKey, PartitionTemplate};
+use data_types::{
+    DeletePredicate, NamespaceId, NamespaceName, PartitionKey, PartitionTemplate, TableId,
+};
 use hashbrown::HashMap;
 use mutable_batch::{MutableBatch, PartitionWrite, WritePayload};
 use observability_deps::tracing::*;
 use thiserror::Error;
 use trace::ctx::SpanContext;
+
+use super::DmlHandler;
 
 /// An error raised by the [`Partitioner`] handler.
 #[derive(Debug, Error)]
@@ -16,7 +19,7 @@ pub enum PartitionError {
 }
 
 /// A decorator of `T`, tagging it with the partition key derived from it.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Partitioned<T> {
     key: PartitionKey,
     payload: T,
@@ -63,20 +66,22 @@ impl DmlHandler for Partitioner {
     type WriteError = PartitionError;
     type DeleteError = PartitionError;
 
-    type WriteInput = HashMap<String, MutableBatch>;
+    type WriteInput = HashMap<TableId, (String, MutableBatch)>;
     type WriteOutput = Vec<Partitioned<Self::WriteInput>>;
 
     /// Partition the per-table [`MutableBatch`].
     async fn write(
         &self,
-        _namespace: &DatabaseName<'static>,
+        _namespace: &NamespaceName<'static>,
+        _namespace_id: NamespaceId,
         batch: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
         // A collection of partition-keyed, per-table MutableBatch instances.
-        let mut partitions: HashMap<PartitionKey, HashMap<_, MutableBatch>> = HashMap::default();
+        let mut partitions: HashMap<PartitionKey, HashMap<_, (String, MutableBatch)>> =
+            HashMap::default();
 
-        for (table_name, batch) in batch {
+        for (table_id, (table_name, batch)) in batch {
             // Partition the table batch according to the configured partition
             // template and write it into the partition-keyed map.
             for (partition_key, partition_payload) in
@@ -85,10 +90,12 @@ impl DmlHandler for Partitioner {
                 let partition = partitions.entry(partition_key).or_default();
                 let table_batch = partition
                     .raw_entry_mut()
-                    .from_key(&table_name)
-                    .or_insert_with(|| (table_name.to_owned(), MutableBatch::default()));
+                    .from_key(&table_id)
+                    .or_insert_with(|| {
+                        (table_id, (table_name.to_owned(), MutableBatch::default()))
+                    });
 
-                partition_payload.write_to_batch(table_batch.1)?;
+                partition_payload.write_to_batch(&mut table_batch.1 .1)?;
             }
         }
 
@@ -101,7 +108,8 @@ impl DmlHandler for Partitioner {
     /// Pass the delete request through unmodified to the next handler.
     async fn delete(
         &self,
-        _namespace: &DatabaseName<'static>,
+        _namespace: &NamespaceName<'static>,
+        _namespace_id: NamespaceId,
         _table_name: &str,
         _predicate: &DeletePredicate,
         _span_ctx: Option<SpanContext>,
@@ -112,13 +120,22 @@ impl DmlHandler for Partitioner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use assert_matches::assert_matches;
     use data_types::TemplatePart;
 
-    /// The default timestamp applied to test LP if the write does not specify
-    /// one.
-    const DEFAULT_TIMESTAMP_NANOS: i64 = 42000000000000000;
+    use super::*;
+
+    // Parse `lp` into a table-keyed MutableBatch map.
+    pub(crate) fn lp_to_writes(lp: &str) -> HashMap<TableId, (String, MutableBatch)> {
+        let (writes, _) = mutable_batch_lp::lines_to_batches_stats(lp, 42)
+            .expect("failed to build test writes from LP");
+
+        writes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, data))| (TableId::new(i as _), (name, data)))
+            .collect()
+    }
 
     // Generate a test case that partitions "lp".
     //
@@ -139,11 +156,11 @@ mod tests {
                     };
 
                     let partitioner = Partitioner::new(partition_template);
-                    let ns = DatabaseName::new("bananas").expect("valid db name");
+                    let ns = NamespaceName::new("bananas").expect("valid db name");
 
-                    let (writes, _) = mutable_batch_lp::lines_to_batches_stats($lp, DEFAULT_TIMESTAMP_NANOS).expect("failed to parse test LP");
+                    let writes = lp_to_writes($lp);
 
-                    let handler_ret = partitioner.write(&ns, writes, None).await;
+                    let handler_ret = partitioner.write(&ns, NamespaceId::new(42), writes, None).await;
                     assert_matches!(handler_ret, $($want_handler_ret)+);
 
                     // Check the partition -> table mapping.
@@ -153,8 +170,7 @@ mod tests {
                             // Extract the table names in this partition
                             let mut tables = partition
                                 .payload
-                                .keys()
-                                .cloned()
+                                .values().map(|v| v.0.clone())
                                 .collect::<Vec<String>>();
 
                             tables.sort();

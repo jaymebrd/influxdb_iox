@@ -1,4 +1,4 @@
-//! gRPC service for the Catalog. Used in router, but can be included in any gRPC server.
+//! gRPC service for the Catalog.
 
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
@@ -8,7 +8,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use data_types::{PartitionId, TableId};
@@ -78,18 +80,63 @@ impl catalog_service_server::CatalogService for CatalogService {
 
         Ok(Response::new(response))
     }
+
+    async fn get_parquet_files_by_namespace_table(
+        &self,
+        request: Request<GetParquetFilesByNamespaceTableRequest>,
+    ) -> Result<Response<GetParquetFilesByNamespaceTableResponse>, Status> {
+        let mut repos = self.catalog.repositories().await;
+        let req = request.into_inner();
+
+        let namespace = repos
+            .namespaces()
+            .get_by_name(&req.namespace_name)
+            .await
+            .map_err(|e| Status::unknown(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!("Namespace {} not found", req.namespace_name))
+            })?;
+
+        let table = repos
+            .tables()
+            .get_by_namespace_and_name(namespace.id, &req.table_name)
+            .await
+            .map_err(|e| Status::unknown(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("Table {} not found", req.table_name)))?;
+
+        let table_id = table.id;
+
+        let parquet_files = repos
+            .parquet_files()
+            .list_by_table_not_to_delete(table_id)
+            .await
+            .map_err(|e| {
+                warn!(
+                    error=%e,
+                    %req.namespace_name,
+                    %req.table_name,
+                    "failed to get parquet_files for table"
+                );
+                Status::not_found(e.to_string())
+            })?;
+
+        let parquet_files: Vec<_> = parquet_files.into_iter().map(to_parquet_file).collect();
+
+        let response = GetParquetFilesByNamespaceTableResponse { parquet_files };
+
+        Ok(Response::new(response))
+    }
 }
 
 // converts the catalog ParquetFile to protobuf
 fn to_parquet_file(p: data_types::ParquetFile) -> ParquetFile {
     ParquetFile {
         id: p.id.get(),
-        sequencer_id: p.sequencer_id.get(),
+        shard_id: p.shard_id.get(),
         namespace_id: p.namespace_id.get(),
         table_id: p.table_id.get(),
         partition_id: p.partition_id.get(),
         object_store_id: p.object_store_id.to_string(),
-        min_sequence_number: p.min_sequence_number.get(),
         max_sequence_number: p.max_sequence_number.get(),
         min_time: p.min_time.get(),
         max_time: p.max_time.get(),
@@ -106,7 +153,7 @@ fn to_parquet_file(p: data_types::ParquetFile) -> ParquetFile {
 fn to_partition(p: data_types::Partition) -> Partition {
     Partition {
         id: p.id.get(),
-        sequencer_id: p.sequencer_id.get(),
+        shard_id: p.shard_id.get(),
         key: p.partition_key.to_string(),
         table_id: p.table_id.get(),
         array_sort_key: p.sort_key,
@@ -117,7 +164,7 @@ fn to_partition(p: data_types::Partition) -> Partition {
 mod tests {
     use super::*;
     use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, KafkaPartition, ParquetFileParams, SequenceNumber,
+        ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
         Timestamp,
     };
     use generated_types::influxdata::iox::catalog::v1::catalog_service_server::CatalogService;
@@ -134,24 +181,20 @@ mod tests {
             let metrics = Arc::new(metric::Registry::default());
             let catalog = Arc::new(MemCatalog::new(metrics));
             let mut repos = catalog.repositories().await;
-            let kafka = repos
-                .kafka_topics()
-                .create_or_get("iox_shared")
-                .await
-                .unwrap();
+            let topic = repos.topics().create_or_get("iox-shared").await.unwrap();
             let pool = repos
                 .query_pools()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
-            let sequencer = repos
-                .sequencers()
-                .create_or_get(&kafka, KafkaPartition::new(1))
+            let shard = repos
+                .shards()
+                .create_or_get(&topic, ShardIndex::new(1))
                 .await
                 .unwrap();
             let namespace = repos
                 .namespaces()
-                .create("catalog_partition_test", "inf", kafka.id, pool.id)
+                .create("catalog_partition_test", None, topic.id, pool.id)
                 .await
                 .unwrap();
             let table = repos
@@ -161,16 +204,15 @@ mod tests {
                 .unwrap();
             let partition = repos
                 .partitions()
-                .create_or_get("foo".into(), sequencer.id, table.id)
+                .create_or_get("foo".into(), shard.id, table.id)
                 .await
                 .unwrap();
             let p1params = ParquetFileParams {
-                sequencer_id: sequencer.id,
+                shard_id: shard.id,
                 namespace_id: namespace.id,
                 table_id: table.id,
                 partition_id: partition.id,
                 object_store_id: Uuid::new_v4(),
-                min_sequence_number: SequenceNumber::new(1),
                 max_sequence_number: SequenceNumber::new(40),
                 min_time: Timestamp::new(1),
                 max_time: Timestamp::new(5),
@@ -182,7 +224,6 @@ mod tests {
             };
             let p2params = ParquetFileParams {
                 object_store_id: Uuid::new_v4(),
-                min_sequence_number: SequenceNumber::new(50),
                 max_sequence_number: SequenceNumber::new(70),
                 ..p1params.clone()
             };
@@ -217,24 +258,20 @@ mod tests {
             let metrics = Arc::new(metric::Registry::default());
             let catalog = Arc::new(MemCatalog::new(metrics));
             let mut repos = catalog.repositories().await;
-            let kafka = repos
-                .kafka_topics()
-                .create_or_get("iox_shared")
-                .await
-                .unwrap();
+            let topic = repos.topics().create_or_get("iox-shared").await.unwrap();
             let pool = repos
                 .query_pools()
-                .create_or_get("iox_shared")
+                .create_or_get("iox-shared")
                 .await
                 .unwrap();
-            let sequencer = repos
-                .sequencers()
-                .create_or_get(&kafka, KafkaPartition::new(1))
+            let shard = repos
+                .shards()
+                .create_or_get(&topic, ShardIndex::new(1))
                 .await
                 .unwrap();
             let namespace = repos
                 .namespaces()
-                .create("catalog_partition_test", "inf", kafka.id, pool.id)
+                .create("catalog_partition_test", None, topic.id, pool.id)
                 .await
                 .unwrap();
             let table = repos
@@ -244,22 +281,22 @@ mod tests {
                 .unwrap();
             partition1 = repos
                 .partitions()
-                .create_or_get("foo".into(), sequencer.id, table.id)
+                .create_or_get("foo".into(), shard.id, table.id)
                 .await
                 .unwrap();
             partition2 = repos
                 .partitions()
-                .create_or_get("bar".into(), sequencer.id, table.id)
+                .create_or_get("bar".into(), shard.id, table.id)
                 .await
                 .unwrap();
-            let sequencer2 = repos
-                .sequencers()
-                .create_or_get(&kafka, KafkaPartition::new(2))
+            let shard2 = repos
+                .shards()
+                .create_or_get(&topic, ShardIndex::new(2))
                 .await
                 .unwrap();
             partition3 = repos
                 .partitions()
-                .create_or_get("foo".into(), sequencer2.id, table.id)
+                .create_or_get("foo".into(), shard2.id, table.id)
                 .await
                 .unwrap();
 

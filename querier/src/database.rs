@@ -2,19 +2,18 @@
 
 use crate::{
     cache::CatalogCache, chunk::ChunkAdapter, ingester::IngesterConnection,
-    namespace::QuerierNamespace, query_log::QueryLog,
+    namespace::QuerierNamespace, query_log::QueryLog, table::PruneMetrics,
 };
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
-use data_types::{KafkaPartition, Namespace};
+use data_types::{Namespace, ShardIndex};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
-use parquet_file::storage::ParquetStorage;
-use service_common::QueryDatabaseProvider;
+use service_common::QueryNamespaceProvider;
 use sharder::JumpHash;
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use std::{collections::BTreeSet, sync::Arc};
-use trace::span::Span;
+use trace::span::{Span, SpanRecorder};
 use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
 };
@@ -31,9 +30,8 @@ pub enum Error {
     Catalog {
         source: iox_catalog::interface::Error,
     },
-
-    #[snafu(display("Sharder error: {source}"))]
-    Sharder { source: sharder::Error },
+    #[snafu(display("No shards loaded"))]
+    NoShards,
 }
 
 /// Database for the querier.
@@ -67,19 +65,25 @@ pub struct QuerierDatabase {
     ///
     /// This should be a 1-to-1 relation to the number of active queries.
     ///
-    /// If the same database is requested twice for different queries, it is counted twice.
+    /// If the same namespace is requested twice for different queries, it is counted twice.
     query_execution_semaphore: Arc<InstrumentedAsyncSemaphore>,
 
     /// Sharder to determine which ingesters to query for a particular table and namespace.
-    sharder: Arc<JumpHash<Arc<KafkaPartition>>>,
+    sharder: Arc<JumpHash<Arc<ShardIndex>>>,
+
+    /// Max combined chunk size for all chunks returned to the query subsystem by a single table.
+    max_table_query_bytes: usize,
+
+    /// Chunk prune metrics.
+    prune_metrics: Arc<PruneMetrics>,
 }
 
 #[async_trait]
-impl QueryDatabaseProvider for QuerierDatabase {
+impl QueryNamespaceProvider for QuerierDatabase {
     type Db = QuerierNamespace;
 
-    async fn db(&self, name: &str) -> Option<Arc<Self::Db>> {
-        self.namespace(name).await
+    async fn db(&self, name: &str, span: Option<Span>) -> Option<Arc<Self::Db>> {
+        self.namespace(name, span).await
     }
 
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit {
@@ -102,10 +106,10 @@ impl QuerierDatabase {
     pub async fn new(
         catalog_cache: Arc<CatalogCache>,
         metric_registry: Arc<metric::Registry>,
-        store: ParquetStorage,
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         max_concurrent_queries: usize,
+        max_table_query_bytes: usize,
     ) -> Result<Self, Error> {
         assert!(
             max_concurrent_queries <= Self::MAX_CONCURRENT_QUERIES_MAX,
@@ -118,9 +122,7 @@ impl QuerierDatabase {
 
         let chunk_adapter = Arc::new(ChunkAdapter::new(
             Arc::clone(&catalog_cache),
-            store,
             Arc::clone(&metric_registry),
-            Default::default(),
         ));
         let query_log = Arc::new(QueryLog::new(QUERY_LOG_SIZE, catalog_cache.time_provider()));
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
@@ -134,6 +136,8 @@ impl QuerierDatabase {
             create_sharder(catalog_cache.catalog().as_ref(), backoff_config.clone()).await?,
         );
 
+        let prune_metrics = Arc::new(PruneMetrics::new(&metric_registry));
+
         Ok(Self {
             backoff_config,
             catalog_cache,
@@ -144,6 +148,8 @@ impl QuerierDatabase {
             query_log,
             query_execution_semaphore,
             sharder,
+            max_table_query_bytes,
+            prune_metrics,
         })
     }
 
@@ -151,25 +157,29 @@ impl QuerierDatabase {
     ///
     /// This will await the internal namespace semaphore. Existence of namespaces is checked AFTER
     /// a semaphore permit was acquired since this lowers the chance that we obtain stale data.
-    pub async fn namespace(&self, name: &str) -> Option<Arc<QuerierNamespace>> {
+    pub async fn namespace(&self, name: &str, span: Option<Span>) -> Option<Arc<QuerierNamespace>> {
+        let span_recorder = SpanRecorder::new(span);
         let name = Arc::from(name.to_owned());
-        let schema = self
+        let ns = self
             .catalog_cache
             .namespace()
-            .schema(
+            .get(
                 Arc::clone(&name),
                 // we have no specific need for any tables or columns at this point, so nothing to cover
                 &[],
+                span_recorder.child_span("cache GET namespace schema"),
             )
             .await?;
         Some(Arc::new(QuerierNamespace::new(
             Arc::clone(&self.chunk_adapter),
-            schema,
+            ns,
             name,
             Arc::clone(&self.exec),
             self.ingester_connection.clone(),
             Arc::clone(&self.query_log),
             Arc::clone(&self.sharder),
+            self.max_table_query_bytes,
+            Arc::clone(&self.prune_metrics),
         )))
     }
 
@@ -198,26 +208,30 @@ impl QuerierDatabase {
 pub async fn create_sharder(
     catalog: &dyn Catalog,
     backoff_config: BackoffConfig,
-) -> Result<JumpHash<Arc<KafkaPartition>>, Error> {
-    let sequencers = Backoff::new(&backoff_config)
-        .retry_all_errors("get sequencers", || async {
-            catalog.repositories().await.sequencers().list().await
+) -> Result<JumpHash<Arc<ShardIndex>>, Error> {
+    let shards = Backoff::new(&backoff_config)
+        .retry_all_errors("get shards", || async {
+            catalog.repositories().await.shards().list().await
         })
         .await
         .expect("retry forever");
 
-    // Construct the (ordered) set of sequencers.
+    // Construct the (ordered) set of shard indexes.
     //
     // The sort order must be deterministic in order for all nodes to shard to
-    // the same sequencers, therefore we type assert the returned set is of the
+    // the same indexes, therefore we type assert the returned set is of the
     // ordered variety.
-    let shards: BTreeSet<_> = sequencers
-        //          ^ don't change this to an unordered set
+    let shard_indexes: BTreeSet<_> = shards
+        //             ^ don't change this to an unordered set
         .into_iter()
-        .map(|sequencer| sequencer.kafka_partition)
+        .map(|shard| shard.shard_index)
         .collect();
 
-    JumpHash::new(shards.into_iter().map(Arc::new)).context(SharderSnafu)
+    if shard_indexes.is_empty() {
+        return Err(Error::NoShards);
+    }
+
+    Ok(JumpHash::new(shard_indexes.into_iter().map(Arc::new)))
 }
 
 #[cfg(test)]
@@ -226,6 +240,7 @@ mod tests {
     use crate::create_ingester_connection_for_testing;
     use iox_tests::util::TestCatalog;
     use test_helpers::assert_error;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     #[should_panic(
@@ -238,101 +253,103 @@ mod tests {
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
-            usize::MAX,
+            catalog.object_store(),
+            &Handle::current(),
         ));
         QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX.saturating_add(1),
+            usize::MAX,
         )
         .await
         .unwrap();
     }
 
     #[tokio::test]
-    async fn sequencers_in_catalog_are_required_for_startup() {
+    async fn shards_in_catalog_are_required_for_startup() {
         let catalog = TestCatalog::new();
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
-            usize::MAX,
+            catalog.object_store(),
+            &Handle::current(),
         ));
 
         assert_error!(
             QuerierDatabase::new(
                 catalog_cache,
                 catalog.metric_registry(),
-                ParquetStorage::new(catalog.object_store()),
                 catalog.exec(),
                 Some(create_ingester_connection_for_testing()),
                 QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
+                usize::MAX,
             )
             .await,
-            Error::Sharder {
-                source: sharder::Error::NoShards
-            },
+            Error::NoShards
         );
     }
 
     #[tokio::test]
     async fn test_namespace() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no sequencers in the catalog
-        catalog.create_sequencer(0).await;
+        // QuerierDatabase::new returns an error if there are no shards in the catalog
+        catalog.create_shard(0).await;
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
-            usize::MAX,
+            catalog.object_store(),
+            &Handle::current(),
         ));
         let db = QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
+            usize::MAX,
         )
         .await
         .unwrap();
 
-        catalog.create_namespace("ns1").await;
+        catalog.create_namespace_1hr_retention("ns1").await;
 
-        assert!(db.namespace("ns1").await.is_some());
-        assert!(db.namespace("ns2").await.is_none());
+        assert!(db.namespace("ns1", None).await.is_some());
+        assert!(db.namespace("ns2", None).await.is_none());
     }
 
     #[tokio::test]
     async fn test_namespaces() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no sequencers in the catalog
-        catalog.create_sequencer(0).await;
+        // QuerierDatabase::new returns an error if there are no shards in the catalog
+        catalog.create_shard(0).await;
 
         let catalog_cache = Arc::new(CatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
             catalog.metric_registry(),
-            usize::MAX,
+            catalog.object_store(),
+            &Handle::current(),
         ));
         let db = QuerierDatabase::new(
             catalog_cache,
             catalog.metric_registry(),
-            ParquetStorage::new(catalog.object_store()),
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
+            usize::MAX,
         )
         .await
         .unwrap();
 
-        catalog.create_namespace("ns1").await;
-        catalog.create_namespace("ns2").await;
+        catalog.create_namespace_1hr_retention("ns1").await;
+        catalog.create_namespace_1hr_retention("ns2").await;
 
         let mut namespaces = db.namespaces().await;
         namespaces.sort_by_key(|ns| ns.name.clone());

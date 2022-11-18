@@ -7,22 +7,28 @@
     missing_copy_implementations,
     missing_debug_implementations,
     missing_docs,
+    clippy::todo,
+    clippy::dbg_macro,
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
-pub mod compact;
+mod arcmap;
+pub(crate) mod compact;
 pub mod data;
 pub mod handler;
 mod job;
 pub mod lifecycle;
 mod poison;
 pub mod querier_handler;
-pub mod query;
+pub(crate) mod query_adaptor;
 pub mod server;
-pub mod stream_handler;
+pub(crate) mod stream_handler;
 
+mod deferred_load;
 #[cfg(test)]
-pub mod test_util;
+pub(crate) mod test_util;

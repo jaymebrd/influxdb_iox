@@ -32,9 +32,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::{
+    common::{DFSchemaRef, ToDFSchema},
     error::{DataFusionError as Error, Result},
     execution::context::TaskContext,
-    logical_plan::{DFSchemaRef, Expr, LogicalPlan, ToDFSchema, UserDefinedLogicalNode},
+    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
@@ -138,7 +139,7 @@ fn make_schema_pivot_output_schema() -> DFSchemaRef {
     .unwrap()
 }
 
-/// Physical operator that implements the SchemaPivot operation aginst
+/// Physical operator that implements the SchemaPivot operation against
 /// data types
 pub struct SchemaPivotExec {
     input: Arc<dyn ExecutionPlan>,

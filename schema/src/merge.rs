@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
-use arrow::{
-    datatypes::{DataType as ArrowDataType, Field},
-    record_batch::RecordBatch,
-};
+use arrow::{datatypes::Field, record_batch::RecordBatch};
 use hashbrown::hash_map::RawEntryMut;
 use hashbrown::HashMap;
 use snafu::Snafu;
 
+use crate::interner::SchemaInterner;
+
 use super::{InfluxColumnType, Schema};
 
-/// Database schema creation / validation errors.
+/// Namespace schema creation / validation errors.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("No schemas found when building merged schema"))]
@@ -33,42 +32,12 @@ pub enum Error {
     ))]
     TryMergeBadColumnType {
         field_name: String,
-        existing_column_type: Option<InfluxColumnType>,
-        new_column_type: Option<InfluxColumnType>,
-    },
-
-    #[snafu(display(
-        "Schema Merge Error: Incompatible data type for '{}'. Existing type {:?}, new type {:?}",
-        field_name,
-        existing_data_type,
-        new_data_type
-    ))]
-    TryMergeBadArrowType {
-        field_name: String,
-        existing_data_type: ArrowDataType,
-        new_data_type: ArrowDataType,
-    },
-
-    #[snafu(display(
-        "Schema Merge Error: Incompatible nullability for '{}'. Existing field {}, new field {}",
-        field_name, nullable_to_str(*existing_nullability), nullable_to_str(*new_nullability)
-    ))]
-    TryMergeBadNullability {
-        field_name: String,
-        existing_nullability: bool,
-        new_nullability: bool,
+        existing_column_type: InfluxColumnType,
+        new_column_type: InfluxColumnType,
     },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-fn nullable_to_str(nullability: bool) -> &'static str {
-    if nullability {
-        "can be null"
-    } else {
-        "can not be null"
-    }
-}
 
 /// Return the merged schema for RecordBatches
 ///
@@ -81,7 +50,7 @@ pub fn merge_record_batch_schemas(batches: &[Arc<RecordBatch>]) -> Arc<Schema> {
         let schema = Schema::try_from(batch.schema()).expect("Schema conversion error");
         merger = merger.merge(&schema).expect("Schemas compatible");
     }
-    Arc::new(merger.build())
+    merger.build()
 }
 
 /// Schema Merger
@@ -96,17 +65,29 @@ pub fn merge_record_batch_schemas(batches: &[Arc<RecordBatch>]) -> Arc<Schema> {
 ///
 /// 2. The measurement names must be consistent: one or both can be
 ///    `None`, or they can both be `Some(name`)
-#[derive(Debug, Default, Clone)]
-pub struct SchemaMerger {
+#[derive(Debug, Default)]
+pub struct SchemaMerger<'a> {
     /// Maps column names to their definition
-    fields: HashMap<String, (Field, Option<InfluxColumnType>)>,
+    fields: HashMap<String, (Field, InfluxColumnType)>,
     /// The measurement name if any
     measurement: Option<String>,
+    /// Interner, if any.
+    interner: Option<&'a mut SchemaInterner>,
 }
 
-impl SchemaMerger {
+impl SchemaMerger<'static> {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl<'a> SchemaMerger<'a> {
+    pub fn with_interner(self, interner: &mut SchemaInterner) -> SchemaMerger<'_> {
+        SchemaMerger {
+            fields: self.fields,
+            measurement: self.measurement,
+            interner: Some(interner),
+        }
     }
 
     /// Appends the schema to the merged schema being built,
@@ -138,7 +119,7 @@ impl SchemaMerger {
     pub fn merge_field(
         &mut self,
         field: &Field,
-        column_type: Option<InfluxColumnType>,
+        column_type: InfluxColumnType,
     ) -> Result<&mut Self> {
         let field_name = field.name();
         match self.fields.raw_entry_mut().from_key(field_name) {
@@ -163,21 +144,9 @@ impl SchemaMerger {
                     });
                 }
 
-                if field.data_type() != existing_field.data_type() {
-                    return Err(Error::TryMergeBadArrowType {
-                        field_name: field_name.to_string(),
-                        existing_data_type: existing_field.data_type().clone(),
-                        new_data_type: field.data_type().clone(),
-                    });
-                }
-
-                if field.is_nullable() != existing_field.is_nullable() {
-                    return Err(Error::TryMergeBadNullability {
-                        field_name: field_name.to_string(),
-                        existing_nullability: existing_field.is_nullable(),
-                        new_nullability: field.is_nullable(),
-                    });
-                }
+                // both are valid schemas, so this should always hold
+                assert_eq!(field.is_nullable(), existing_field.is_nullable());
+                assert_eq!(field.data_type(), existing_field.data_type());
             }
         }
 
@@ -185,13 +154,19 @@ impl SchemaMerger {
     }
 
     /// Returns the schema that was built, the columns are always sorted in lexicographic order
-    pub fn build(mut self) -> Schema {
-        Schema::new_from_parts(
+    pub fn build(mut self) -> Arc<Schema> {
+        let schema = Schema::new_from_parts(
             self.measurement.take(),
             self.fields.drain().map(|x| x.1),
             true,
         )
-        .expect("failed to build merged schema")
+        .expect("failed to build merged schema");
+
+        if let Some(interner) = self.interner.as_mut() {
+            interner.intern(schema)
+        } else {
+            Arc::new(schema)
+        }
     }
 }
 
@@ -223,8 +198,8 @@ mod tests {
             .unwrap()
             .build();
 
-        assert_eq!(merged_schema, schema1);
-        assert_eq!(merged_schema, schema2);
+        assert_eq!(merged_schema.as_ref(), &schema1);
+        assert_eq!(merged_schema.as_ref(), &schema2);
     }
 
     #[test]
@@ -264,9 +239,11 @@ mod tests {
             .sort_fields_by_name();
 
         assert_eq!(
-            expected_schema, merged_schema,
+            &expected_schema,
+            merged_schema.as_ref(),
             "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            expected_schema, merged_schema
+            expected_schema,
+            merged_schema
         );
     }
 
@@ -292,9 +269,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            expected_schema, merged_schema,
+            &expected_schema,
+            merged_schema.as_ref(),
             "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            expected_schema, merged_schema
+            expected_schema,
+            merged_schema
         );
     }
 
@@ -324,9 +303,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            expected_schema, merged_schema,
+            &expected_schema,
+            merged_schema.as_ref(),
             "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            expected_schema, merged_schema
+            expected_schema,
+            merged_schema
         );
     }
 
@@ -354,9 +335,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            expected_schema, merged_schema,
+            &expected_schema,
+            merged_schema.as_ref(),
             "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            expected_schema, merged_schema
+            expected_schema,
+            merged_schema
         );
     }
 
@@ -388,29 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_incompatible_data_types() {
-        // same field name with different type
-        let schema1 = SchemaBuilder::new()
-            .field("the_field", ArrowDataType::Int16)
-            .build()
-            .unwrap();
-
-        // same field name with different type
-        let schema2 = SchemaBuilder::new()
-            .field("the_field", ArrowDataType::Int8)
-            .build()
-            .unwrap();
-
-        let merged_schema_error = SchemaMerger::new()
-            .merge(&schema1)
-            .unwrap()
-            .merge(&schema2)
-            .unwrap_err();
-
-        assert_eq!(merged_schema_error.to_string(), "Schema Merge Error: Incompatible data type for 'the_field'. Existing type Int16, new type Int8");
-    }
-
-    #[test]
     fn test_merge_incompatible_column_types() {
         let schema1 = SchemaBuilder::new().tag("the_tag").build().unwrap();
 
@@ -426,28 +386,48 @@ mod tests {
             .merge(&schema2)
             .unwrap_err();
 
-        assert_eq!(merged_schema_error.to_string(), "Schema Merge Error: Incompatible column type for 'the_tag'. Existing type Some(Tag), new type Some(Field(Integer))");
+        assert_eq!(merged_schema_error.to_string(), "Schema Merge Error: Incompatible column type for 'the_tag'. Existing type Tag, new type Field(Integer)");
     }
 
     #[test]
-    fn test_merge_incompatible_schema_nullability() {
-        let schema1 = SchemaBuilder::new()
-            .non_null_field("int_field", ArrowDataType::Int64)
+    fn test_interning() {
+        let schema_1a = SchemaBuilder::new()
+            .influx_field("int_field", Integer)
+            .tag("the_tag")
             .build()
             .unwrap();
 
-        // same field name with different nullability
-        let schema2 = SchemaBuilder::new()
-            .field("int_field", ArrowDataType::Int64)
+        let schema_1b = SchemaBuilder::new()
+            .influx_field("int_field", Integer)
+            .tag("the_tag")
             .build()
             .unwrap();
 
-        let merged_schema_error = SchemaMerger::new()
-            .merge(&schema1)
+        let schema_2 = SchemaBuilder::new()
+            .influx_field("float_field", crate::InfluxFieldType::Float)
+            .tag("the_tag")
+            .build()
+            .unwrap();
+
+        let mut interner = SchemaInterner::new();
+
+        let merged_schema_a = SchemaMerger::new()
+            .with_interner(&mut interner)
+            .merge(&schema_1a)
             .unwrap()
-            .merge(&schema2)
-            .unwrap_err();
+            .merge(&schema_2)
+            .unwrap()
+            .build();
 
-        assert_eq!(merged_schema_error.to_string(), "Schema Merge Error: Incompatible nullability for 'int_field'. Existing field can not be null, new field can be null");
+        let merged_schema_b = SchemaMerger::new()
+            .with_interner(&mut interner)
+            .merge(&schema_1b)
+            .unwrap()
+            .merge(&schema_2)
+            .unwrap()
+            .build();
+
+        assert_eq!(merged_schema_a, merged_schema_b);
+        assert!(Arc::ptr_eq(&merged_schema_a, &merged_schema_b));
     }
 }

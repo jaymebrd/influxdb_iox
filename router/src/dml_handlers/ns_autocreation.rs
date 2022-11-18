@@ -1,12 +1,14 @@
-use super::DmlHandler;
-use crate::namespace_cache::NamespaceCache;
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate, KafkaTopicId, QueryPoolId};
+use data_types::{NamespaceName, DeletePredicate, QueryPoolId, TopicId};
 use iox_catalog::interface::Catalog;
 use observability_deps::tracing::*;
-use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 use trace::ctx::SpanContext;
+
+use super::DmlHandler;
+use crate::namespace_cache::NamespaceCache;
 
 /// An error auto-creating the request namespace.
 #[derive(Debug, Error)]
@@ -26,9 +28,8 @@ pub struct NamespaceAutocreation<C, T> {
     catalog: Arc<dyn Catalog>,
     cache: C,
 
-    topic_id: KafkaTopicId,
+    topic_id: TopicId,
     query_id: QueryPoolId,
-    retention: String,
     _input: PhantomData<T>,
 }
 
@@ -44,7 +45,7 @@ impl<C, T> NamespaceAutocreation<C, T> {
     pub fn new(
         catalog: Arc<dyn Catalog>,
         cache: C,
-        topic_id: KafkaTopicId,
+        topic_id: TopicId,
         query_id: QueryPoolId,
         retention: String,
     ) -> Self {
@@ -76,7 +77,7 @@ where
     /// Write `batches` to `namespace`.
     async fn write(
         &self,
-        namespace: &'_ DatabaseName<'static>,
+        namespace: &'_ NamespaceName<'static>,
         batches: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
@@ -119,7 +120,7 @@ where
     /// Delete the data specified in `delete`.
     async fn delete(
         &self,
-        _namespace: &DatabaseName<'static>,
+        _namespace: &NamespaceName<'static>,
         _table_name: &str,
         _predicate: &DeletePredicate,
         _span_ctx: Option<SpanContext>,
@@ -130,15 +131,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::namespace_cache::MemoryNamespaceCache;
+    use std::sync::Arc;
+
     use data_types::{Namespace, NamespaceId, NamespaceSchema};
     use iox_catalog::mem::MemCatalog;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::namespace_cache::MemoryNamespaceCache;
 
     #[tokio::test]
     async fn test_cache_hit() {
-        let ns = DatabaseName::try_from("bananas").unwrap();
+        let ns = NamespaceName::try_from("bananas").unwrap();
 
         // Prep the cache before the test to cause a hit
         let cache = Arc::new(MemoryNamespaceCache::default());
@@ -146,9 +149,10 @@ mod tests {
             ns.clone(),
             NamespaceSchema {
                 id: NamespaceId::new(1),
-                kafka_topic_id: KafkaTopicId::new(2),
+                topic_id: TopicId::new(2),
                 query_pool_id: QueryPoolId::new(3),
                 tables: Default::default(),
+                max_columns_per_table: 4,
             },
         );
 
@@ -158,9 +162,8 @@ mod tests {
         let creator = NamespaceAutocreation::new(
             Arc::clone(&catalog),
             cache,
-            KafkaTopicId::new(42),
+            TopicId::new(42),
             QueryPoolId::new(42),
-            "inf".to_owned(),
         );
 
         // Drive the code under test
@@ -185,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_miss() {
-        let ns = DatabaseName::try_from("bananas").unwrap();
+        let ns = NamespaceName::try_from("bananas").unwrap();
 
         let cache = Arc::new(MemoryNamespaceCache::default());
         let metrics = Arc::new(metric::Registry::new());
@@ -194,9 +197,8 @@ mod tests {
         let creator = NamespaceAutocreation::new(
             Arc::clone(&catalog),
             cache,
-            KafkaTopicId::new(42),
+            TopicId::new(42),
             QueryPoolId::new(42),
-            "inf".to_owned(),
         );
 
         creator
@@ -219,11 +221,10 @@ mod tests {
             Namespace {
                 id: NamespaceId::new(1),
                 name: ns.to_string(),
-                retention_duration: Some("inf".to_owned()),
-                kafka_topic_id: KafkaTopicId::new(42),
+                topic_id: TopicId::new(42),
                 query_pool_id: QueryPoolId::new(42),
-                max_tables: 10000,
-                max_columns_per_table: 1000,
+                max_tables: iox_catalog::DEFAULT_MAX_TABLES,
+                max_columns_per_table: iox_catalog::DEFAULT_MAX_COLUMNS_PER_TABLE,
             }
         );
     }

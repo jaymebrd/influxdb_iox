@@ -89,8 +89,8 @@
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, InfluxDbType, NamespaceId,
-    ParquetFileParams, PartitionId, PartitionKey, SequenceNumber, SequencerId, StatValues,
-    Statistics, TableId, Timestamp,
+    ParquetFileParams, PartitionId, PartitionKey, SequenceNumber, ShardId, StatValues, Statistics,
+    TableId, Timestamp,
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
@@ -259,8 +259,8 @@ pub struct IoxMetadata {
     /// namespace name of the data
     pub namespace_name: Arc<str>,
 
-    /// sequencer id of the data
-    pub sequencer_id: SequencerId,
+    /// shard id of the data
+    pub shard_id: ShardId,
 
     /// table id of the data
     pub table_id: TableId,
@@ -274,9 +274,6 @@ pub struct IoxMetadata {
     /// parittion key of the data
     pub partition_key: PartitionKey,
 
-    /// sequence number of the first write
-    pub min_sequence_number: SequenceNumber,
-
     /// sequence number of the last write
     pub max_sequence_number: SequenceNumber,
 
@@ -289,10 +286,10 @@ pub struct IoxMetadata {
     ///      files are partitions with a lot of or/and large overlapped files that have to go
     ///      through many compaction cycles before they are fully compacted to non-overlapped
     ///      files.
-    ///  * 2 (`CompactionLevel::FileNonOverlapped`): represents a level-2 file that is persisted by
+    ///  * 2 (`CompactionLevel::FileNonOverlapped`): represents a level-1 file that is persisted by
     ///      a Compactor and does not overlap with other files except level 0 ones. Eventually,
     ///      cold partitions (partitions that no longer needs to get compacted) will only include
-    ///      one or many level-2 files
+    ///      one or many level-1 files
     pub compaction_level: CompactionLevel,
 
     /// Sort key of this chunk
@@ -300,6 +297,20 @@ pub struct IoxMetadata {
 }
 
 impl IoxMetadata {
+    /// Convert to base64 encoded protobuf format
+    pub fn to_base64(&self) -> std::result::Result<String, prost::EncodeError> {
+        Ok(base64::encode(&self.to_protobuf()?))
+    }
+
+    /// Read from base64 encoded protobuf format
+    pub fn from_base64(proto_base64: &[u8]) -> Result<Self> {
+        let proto_bytes = base64::decode(proto_base64)
+            .map_err(|err| Box::new(err) as _)
+            .context(IoxMetadataBrokenSnafu)?;
+
+        Self::from_protobuf(&proto_bytes)
+    }
+
     /// Convert to protobuf v3 message.
     pub(crate) fn to_protobuf(&self) -> std::result::Result<Vec<u8>, prost::EncodeError> {
         let sort_key = self.sort_key.as_ref().map(|key| proto::SortKey {
@@ -318,12 +329,11 @@ impl IoxMetadata {
             creation_timestamp: Some(self.creation_timestamp.date_time().into()),
             namespace_id: self.namespace_id.get(),
             namespace_name: self.namespace_name.to_string(),
-            sequencer_id: self.sequencer_id.get(),
+            shard_id: self.shard_id.get(),
             table_id: self.table_id.get(),
             table_name: self.table_name.to_string(),
             partition_id: self.partition_id.get(),
             partition_key: self.partition_key.to_string(),
-            min_sequence_number: self.min_sequence_number.get(),
             max_sequence_number: self.max_sequence_number.get(),
             sort_key,
             compaction_level: self.compaction_level as i32,
@@ -369,12 +379,11 @@ impl IoxMetadata {
             creation_timestamp,
             namespace_id: NamespaceId::new(proto_msg.namespace_id),
             namespace_name,
-            sequencer_id: SequencerId::new(proto_msg.sequencer_id),
+            shard_id: ShardId::new(proto_msg.shard_id),
             table_id: TableId::new(proto_msg.table_id),
             table_name,
             partition_id: PartitionId::new(proto_msg.partition_id),
             partition_key,
-            min_sequence_number: SequenceNumber::new(proto_msg.min_sequence_number),
             max_sequence_number: SequenceNumber::new(proto_msg.max_sequence_number),
             sort_key,
             compaction_level: proto_msg.compaction_level.try_into().context(
@@ -383,6 +392,27 @@ impl IoxMetadata {
                 },
             )?,
         })
+    }
+
+    /// Generate metadata for a file generated from some process other than IOx ingesting.
+    ///
+    /// This metadata will not have valid catalog values; inserting files with this metadata into
+    /// the catalog should get valid values out-of-band.
+    pub fn external(creation_timestamp_ns: i64, table_name: impl Into<Arc<str>>) -> Self {
+        Self {
+            object_store_id: Default::default(),
+            creation_timestamp: Time::from_timestamp_nanos(creation_timestamp_ns),
+            namespace_id: NamespaceId::new(1),
+            namespace_name: "external".into(),
+            shard_id: ShardId::new(1),
+            table_id: TableId::new(1),
+            table_name: table_name.into(),
+            partition_id: PartitionId::new(1),
+            partition_key: "unknown".into(),
+            max_sequence_number: SequenceNumber::new(1),
+            compaction_level: CompactionLevel::Initial,
+            sort_key: None,
+        }
     }
 
     /// verify uuid
@@ -434,7 +464,7 @@ impl IoxMetadata {
             .read_schema()
             .expect("failed to read encoded schema");
         let stats = decoded
-            .read_statistics(&*schema)
+            .read_statistics(&schema)
             .expect("invalid statistics");
         let columns: Vec<_> = stats.iter().map(|v| column_id_map(&v.name)).collect();
         let time_summary = stats
@@ -443,7 +473,7 @@ impl IoxMetadata {
             .expect("no time column in metadata statistics");
 
         // Sanity check the type of this column before using the values.
-        assert_eq!(time_summary.influxdb_type, Some(InfluxDbType::Timestamp));
+        assert_eq!(time_summary.influxdb_type, InfluxDbType::Timestamp);
 
         // Extract the min/max timestamps.
         let (min_time, max_time) = match time_summary.stats {
@@ -456,19 +486,18 @@ impl IoxMetadata {
         };
 
         ParquetFileParams {
-            sequencer_id: self.sequencer_id,
+            shard_id: self.shard_id,
             namespace_id: self.namespace_id,
             table_id: self.table_id,
             partition_id: self.partition_id,
             object_store_id: self.object_store_id,
-            min_sequence_number: self.min_sequence_number,
             max_sequence_number: self.max_sequence_number,
             min_time,
             max_time,
             file_size_bytes: file_size_bytes as i64,
             compaction_level: self.compaction_level,
             row_count: row_count.try_into().expect("row count overflows i64"),
-            created_at: Timestamp::new(self.creation_timestamp.timestamp_nanos()),
+            created_at: Timestamp::from(self.creation_timestamp),
             column_set: ColumnSet::new(columns),
         }
     }
@@ -516,7 +545,7 @@ fn decode_timestamp_from_field(
 }
 
 /// Parquet metadata with IOx-specific wrapper.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IoxParquetMetaData {
     /// [Apache Parquet] metadata as freestanding [Apache Thrift]-encoded, and [Zstandard]-compressed bytes.
     ///
@@ -596,7 +625,7 @@ impl IoxParquetMetaData {
             .map(|rg| rg.to_thrift())
             .collect();
 
-        let thrift_file_metadata = parquet_format::FileMetaData {
+        let thrift_file_metadata = parquet::format::FileMetaData {
             version: file_metadata.version(),
             schema: thrift_schema,
 
@@ -627,7 +656,7 @@ impl IoxParquetMetaData {
         // step 2: load thrift data from byte stream
         let thrift_file_metadata = {
             let mut protocol = TCompactInputProtocol::new(&data[..]);
-            parquet_format::FileMetaData::read_from_in_protocol(&mut protocol)
+            parquet::format::FileMetaData::read_from_in_protocol(&mut protocol)
                 .context(ThriftReadFailureSnafu {})?
         };
 
@@ -666,10 +695,10 @@ impl IoxParquetMetaData {
     }
 }
 
-impl TryFrom<parquet_format::FileMetaData> for IoxParquetMetaData {
+impl TryFrom<parquet::format::FileMetaData> for IoxParquetMetaData {
     type Error = Error;
 
-    fn try_from(v: parquet_format::FileMetaData) -> Result<Self, Self::Error> {
+    fn try_from(v: parquet::format::FileMetaData) -> Result<Self, Self::Error> {
         let mut buffer = Vec::new();
         {
             let mut protocol = TCompactOutputProtocol::new(&mut buffer);
@@ -724,12 +753,8 @@ impl DecodedIoxParquetMetaData {
 
         // extract protobuf message from key-value entry
         let proto_base64 = kv.value.as_ref().context(IoxMetadataMissingSnafu)?;
-        let proto_bytes = base64::decode(proto_base64)
-            .map_err(|err| Box::new(err) as _)
-            .context(IoxMetadataBrokenSnafu)?;
-
-        // convert to Rust object
-        IoxMetadata::from_protobuf(proto_bytes.as_slice())
+        // read to rust object
+        IoxMetadata::from_base64(proto_base64.as_bytes())
     }
 
     /// Read IOx schema from parquet metadata.
@@ -789,46 +814,41 @@ fn read_statistics_from_parquet_row_group(
     let mut column_summaries = Vec::with_capacity(schema.len());
 
     for ((iox_type, field), column_chunk_metadata) in schema.iter().zip(row_group.columns()) {
-        if let Some(iox_type) = iox_type {
-            let parquet_stats =
-                column_chunk_metadata
-                    .statistics()
-                    .context(StatisticsMissingSnafu {
-                        row_group: row_group_idx,
-                        column: field.name().clone(),
-                    })?;
+        let parquet_stats = column_chunk_metadata
+            .statistics()
+            .context(StatisticsMissingSnafu {
+                row_group: row_group_idx,
+                column: field.name().clone(),
+            })?;
 
-            let min_max_set = parquet_stats.has_min_max_set();
-            if min_max_set && parquet_stats.is_min_max_deprecated() {
-                StatisticsMinMaxDeprecatedSnafu {
-                    row_group: row_group_idx,
-                    column: field.name().clone(),
-                }
-                .fail()?;
+        let min_max_set = parquet_stats.has_min_max_set();
+        if min_max_set && parquet_stats.is_min_max_deprecated() {
+            StatisticsMinMaxDeprecatedSnafu {
+                row_group: row_group_idx,
+                column: field.name().clone(),
             }
-
-            let count = row_group.num_rows().max(0) as u64;
-
-            let stats = extract_iox_statistics(
-                parquet_stats,
-                min_max_set,
-                iox_type,
-                count,
-                row_group_idx,
-                field.name(),
-            )?;
-            column_summaries.push(ColumnSummary {
-                name: field.name().clone(),
-                influxdb_type: Some(match iox_type {
-                    InfluxColumnType::Tag => InfluxDbType::Tag,
-                    InfluxColumnType::Field(_) => InfluxDbType::Field,
-                    InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
-                }),
-                stats,
-            });
-        } else {
-            debug!(?field, "Provided schema of the field does not include IOx Column Type such as Tag, Field, Time");
+            .fail()?;
         }
+
+        let count = row_group.num_rows().max(0) as u64;
+
+        let stats = extract_iox_statistics(
+            parquet_stats,
+            min_max_set,
+            iox_type,
+            count,
+            row_group_idx,
+            field.name(),
+        )?;
+        column_summaries.push(ColumnSummary {
+            name: field.name().clone(),
+            influxdb_type: match iox_type {
+                InfluxColumnType::Tag => InfluxDbType::Tag,
+                InfluxColumnType::Field(_) => InfluxDbType::Field,
+                InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
+            },
+            stats,
+        });
     }
 
     Ok(column_summaries)
@@ -965,10 +985,11 @@ fn extract_iox_statistics(
 mod tests {
     use super::*;
     use arrow::{
-        array::{ArrayRef, StringBuilder, TimestampNanosecondBuilder},
+        array::{ArrayRef, StringArray, TimestampNanosecondArray},
         record_batch::RecordBatch,
     };
     use data_types::CompactionLevel;
+    use datafusion_util::MemoryStream;
     use schema::builder::SchemaBuilder;
 
     #[test]
@@ -979,15 +1000,14 @@ mod tests {
 
         let iox_metadata = IoxMetadata {
             object_store_id,
-            creation_timestamp: Time::from_timestamp(3234, 0),
+            creation_timestamp: Time::from_timestamp(3234, 0).unwrap(),
             namespace_id: NamespaceId::new(2),
             namespace_name: Arc::from("hi"),
-            sequencer_id: SequencerId::new(1),
+            shard_id: ShardId::new(1),
             table_id: TableId::new(3),
             table_name: Arc::from("weather"),
             partition_id: PartitionId::new(4),
             partition_key: PartitionKey::from("part"),
-            min_sequence_number: SequenceNumber::new(5),
             max_sequence_number: SequenceNumber::new(6),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key),
@@ -1007,20 +1027,18 @@ mod tests {
             creation_timestamp: Time::from_timestamp_nanos(42),
             namespace_id: NamespaceId::new(1),
             namespace_name: "bananas".into(),
-            sequencer_id: SequencerId::new(2),
+            shard_id: ShardId::new(2),
             table_id: TableId::new(3),
             table_name: "platanos".into(),
             partition_id: PartitionId::new(4),
             partition_key: "potato".into(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(11),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
         };
 
-        let mut builder = StringBuilder::new(1);
-        builder.append_value("bananas").expect("appending string");
-        let data: ArrayRef = Arc::new(builder.finish());
+        let array = StringArray::from_iter([Some("bananas")]);
+        let data: ArrayRef = Arc::new(array);
 
         let timestamps = to_timestamp_array(&[1647695292000000000]);
 
@@ -1035,7 +1053,7 @@ mod tests {
             .as_arrow();
 
         let batch = RecordBatch::try_new(schema, vec![data, timestamps]).unwrap();
-        let stream = futures::stream::iter([Ok(batch.clone())]);
+        let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
         let (bytes, file_meta) = crate::serialize::to_parquet_bytes(stream, &meta)
             .await
@@ -1080,15 +1098,12 @@ mod tests {
 
         // Try and access the IOx metadata that was embedded above (with the
         // SchemaBuilder)
-        let col_summary = decoded.read_statistics(&*schema).unwrap();
+        let col_summary = decoded.read_statistics(&schema).unwrap();
         assert!(!col_summary.is_empty());
     }
 
     fn to_timestamp_array(timestamps: &[i64]) -> ArrayRef {
-        let mut builder = TimestampNanosecondBuilder::new(timestamps.len());
-        builder
-            .append_slice(timestamps)
-            .expect("failed to append timestamp values");
-        Arc::new(builder.finish())
+        let array: TimestampNanosecondArray = timestamps.iter().map(|v| Some(*v)).collect();
+        Arc::new(array)
     }
 }

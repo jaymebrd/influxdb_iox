@@ -1,19 +1,20 @@
-use data_types::KafkaPartition;
-use futures::Future;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use pin_project::pin_project;
 use std::{
     sync::Arc,
     task::{Poll, Waker},
 };
+
+use data_types::ShardIndex;
+use futures::Future;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use pin_project::pin_project;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum PoisonPill {
     LifecyclePanic,
     LifecycleExit,
-    StreamPanic(KafkaPartition),
-    StreamExit(KafkaPartition),
+    StreamPanic(ShardIndex),
+    StreamExit(ShardIndex),
 }
 
 #[derive(Debug)]

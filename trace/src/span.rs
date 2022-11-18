@@ -44,8 +44,10 @@ impl Span {
             start: None,
             end: None,
             status: SpanStatus::Unknown,
-            metadata: Default::default(),
-            events: Default::default(),
+            // assume no metadata by default
+            metadata: HashMap::with_capacity(0),
+            // assume no events by default
+            events: Vec::with_capacity(0),
         }
     }
 
@@ -206,10 +208,7 @@ impl SpanRecorder {
     /// If this `SpanRecorder` has a `Span`, creates a new child of that `Span` and
     /// returns a `SpanRecorder` for it. Otherwise returns an empty `SpanRecorder`
     pub fn child(&self, name: &'static str) -> Self {
-        match &self.span {
-            Some(span) => Self::new(Some(span.child(name))),
-            None => Self::new(None),
-        }
+        Self::new(self.child_span(name))
     }
 
     /// Return a reference to the span contained in this SpanRecorder,
@@ -218,11 +217,34 @@ impl SpanRecorder {
         self.span.as_ref()
     }
 
+    /// Return a child span of the specified name, if this SpanRecorder
+    /// has an active span, `None` otherwise.
+    pub fn child_span(&self, name: &'static str) -> Option<Span> {
+        self.span.as_ref().map(|span| span.child(name))
+    }
+
     /// Link this span to another context.
     pub fn link(&mut self, other: &SpanContext) {
         if let Some(span) = self.span.as_mut() {
             span.link(other);
         }
+    }
+}
+
+/// Helper trait to make spans easier to work with
+pub trait SpanExt {
+    /// Return a child_span, if that makes sense
+    fn child_span(&self, name: &'static str) -> Option<Span>;
+}
+
+impl SpanExt for Option<SpanContext> {
+    fn child_span(&self, name: &'static str) -> Option<Span> {
+        self.as_ref().child_span(name)
+    }
+}
+impl SpanExt for Option<&SpanContext> {
+    fn child_span(&self, name: &'static str) -> Option<Span> {
+        self.map(|span| span.child(name))
     }
 }
 

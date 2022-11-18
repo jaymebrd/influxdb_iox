@@ -6,16 +6,13 @@
 //!
 //! Aggregates / windows --> query::GroupByAndAggregate
 use std::collections::BTreeSet;
+use std::string::FromUtf8Error;
 use std::{convert::TryFrom, fmt};
 
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::binary_expr;
-use datafusion::logical_plan::when;
-use datafusion::{
-    logical_plan::{Expr, Operator},
-    prelude::*,
-    scalar::ScalarValue,
-};
+use datafusion::logical_expr::{binary_expr, Operator};
+use datafusion::{prelude::*, scalar::ScalarValue};
+use datafusion_util::AsExpr;
 use generated_types::{
     aggregate::AggregateType as RPCAggregateType, node::Comparison as RPCComparison,
     node::Logical as RPCLogical, node::Value as RPCValue, read_group_request::Group as RPCGroup,
@@ -118,7 +115,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Defines the different ways series can be grouped and aggregated
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupByAndAggregate {
     /// group by a set of (Tag) columns, applying an agg to each field
     ///
@@ -306,12 +303,16 @@ fn convert_simple_node(
 
         // look for tag or measurement = <values>
         if let Some(RPCValue::TagRefValue(tag_name)) = lhs.value {
-            if tag_name.is_measurement() {
-                // add the table names as a predicate
-                return Ok(builder.tables(value_list));
-            } else if tag_name.is_field() {
-                builder.inner = builder.inner.with_field_columns(value_list);
-                return Ok(builder);
+            match DecodedTagKey::try_from(tag_name) {
+                Ok(DecodedTagKey::Measurement) => {
+                    // add the table names as a predicate
+                    return Ok(builder.tables(value_list));
+                }
+                Ok(DecodedTagKey::Field) => {
+                    builder.inner = builder.inner.with_field_columns(value_list);
+                    return Ok(builder);
+                }
+                _ => {}
             }
         }
     }
@@ -429,27 +430,36 @@ impl InListBuilder {
     }
 }
 
-// encodes the magic special bytes that the storage gRPC layer uses to
-// encode measurement name and field name as tag
-pub trait SpecialTagKeys {
-    /// Return true if this tag key actually refers to a measurement
-    /// name (e.g. _measurement or _m)
-    fn is_measurement(&self) -> bool;
-
-    /// Return true if this tag key actually refers to a field
-    /// name (e.g. _field or _f)
-    fn is_field(&self) -> bool;
+/// Decoded special tag key.
+///
+/// The storage gRPC layer uses magic special bytes to encode measurement name and field name as tag
+pub enum DecodedTagKey {
+    Measurement,
+    Field,
+    Normal(String),
 }
 
-impl SpecialTagKeys for Vec<u8> {
-    fn is_measurement(&self) -> bool {
-        self.as_slice() == TAG_KEY_MEASUREMENT
+impl std::fmt::Display for DecodedTagKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecodedTagKey::Measurement => write!(f, "{}", MEASUREMENT_COLUMN_NAME),
+            DecodedTagKey::Field => write!(f, "{}", FIELD_COLUMN_NAME),
+            DecodedTagKey::Normal(s) => write!(f, "{}", s),
+        }
     }
+}
 
-    /// Return true if this tag key actually refers to a field
-    /// name (e.g. _field or _f)
-    fn is_field(&self) -> bool {
-        self.as_slice() == TAG_KEY_FIELD
+impl TryFrom<Vec<u8>> for DecodedTagKey {
+    type Error = FromUtf8Error;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        if value.as_slice() == TAG_KEY_MEASUREMENT {
+            Ok(Self::Measurement)
+        } else if value.as_slice() == TAG_KEY_FIELD {
+            Ok(Self::Field)
+        } else {
+            Ok(Self::Normal(String::from_utf8(value)?))
+        }
     }
 }
 
@@ -473,18 +483,6 @@ fn convert_node_to_expr(node: RPCNode) -> Result<Expr> {
     build_node(value, inputs)
 }
 
-fn make_tag_name(tag_name: Vec<u8>) -> Result<String> {
-    if tag_name.is_measurement() {
-        // convert to "_measurement" which is handled specially in grpc planner
-        Ok(MEASUREMENT_COLUMN_NAME.to_string())
-    } else if tag_name.is_field() {
-        // convert to "_field" which is handled specially in grpc planner
-        Ok(FIELD_COLUMN_NAME.to_string())
-    } else {
-        String::from_utf8(tag_name).context(ConvertingTagNameSnafu)
-    }
-}
-
 // Builds an Expr given the Value and the converted children
 fn build_node(value: RPCValue, inputs: Vec<Expr>) -> Result<Expr> {
     // Only logical / comparison ops can have inputs.
@@ -502,7 +500,7 @@ fn build_node(value: RPCValue, inputs: Vec<Expr>) -> Result<Expr> {
         RPCValue::FloatValue(f) => Ok(lit(f)),
         RPCValue::RegexValue(pattern) => Ok(lit(pattern)),
         RPCValue::TagRefValue(tag_name) => build_tag_ref(tag_name),
-        RPCValue::FieldRefValue(field_name) => Ok(col(&field_name)),
+        RPCValue::FieldRefValue(field_name) => Ok(field_name.as_expr()),
         RPCValue::Logical(logical) => build_logical_node(logical, inputs),
         RPCValue::Comparison(comparison) => build_comparison_node(comparison, inputs),
     }
@@ -523,13 +521,18 @@ fn build_node(value: RPCValue, inputs: Vec<Expr>) -> Result<Expr> {
 /// As storage predicates such as `TagRef(tag_name) = ''` expect to
 /// match missing tags which IOx stores as NULL
 fn build_tag_ref(tag_name: Vec<u8>) -> Result<Expr> {
-    let tag_name = make_tag_name(tag_name)?;
+    let tag_name = DecodedTagKey::try_from(tag_name)
+        .context(ConvertingTagNameSnafu)?
+        .to_string();
 
     match tag_name.as_str() {
-        MEASUREMENT_COLUMN_NAME | FIELD_COLUMN_NAME => Ok(col(&tag_name)),
-        _ => when(col(&tag_name).is_null(), lit(""))
-            .otherwise(col(&tag_name))
-            .context(InternalCaseConversionSnafu { tag_name }),
+        MEASUREMENT_COLUMN_NAME | FIELD_COLUMN_NAME => Ok(tag_name.as_str().as_expr()),
+        _ => {
+            let tag = tag_name.as_str().as_expr();
+            when(tag.clone().is_null(), lit(""))
+                .otherwise(tag)
+                .context(InternalCaseConversionSnafu { tag_name })
+        }
     }
 }
 
@@ -872,8 +875,11 @@ fn format_comparison(v: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+    use datafusion_util::lit_dict;
     use generated_types::node::Type as RPCNodeType;
-    use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate, EMPTY_PREDICATE};
+    use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate};
+    use schema::{Schema, SchemaBuilder};
     use std::{collections::BTreeSet, sync::Arc};
 
     use super::*;
@@ -889,13 +895,39 @@ mod tests {
         }
     }
 
-    impl QueryDatabaseMeta for Tables {
+    impl QueryNamespaceMeta for Tables {
         fn table_names(&self) -> Vec<String> {
             self.table_names.clone()
         }
 
-        fn table_schema(&self, _table_name: &str) -> Option<Arc<schema::Schema>> {
-            None
+        fn table_schema(&self, table_name: &str) -> Option<Arc<Schema>> {
+            match table_name {
+                "foo" => {
+                    let schema = SchemaBuilder::new()
+                        .tag("t1")
+                        .tag("t2")
+                        .tag("host")
+                        .field("foo", DataType::Int64)
+                        .unwrap()
+                        .field("bar", DataType::Int64)
+                        .unwrap()
+                        .build()
+                        .unwrap();
+
+                    Some(Arc::new(schema))
+                }
+                "bar" => {
+                    let schema = SchemaBuilder::new()
+                        .tag("t3")
+                        .field("baz", DataType::Int64)
+                        .unwrap()
+                        .build()
+                        .unwrap();
+
+                    Some(Arc::new(schema))
+                }
+                _ => None,
+            }
         }
     }
 
@@ -997,9 +1029,15 @@ mod tests {
 
         for (expected_table, (table, predicate)) in tables.table_names.iter().zip(table_predicates)
         {
-            assert_eq!(expected_table, &table);
+            assert_eq!(expected_table.as_str(), table.as_ref());
 
-            let expected_exprs = vec![lit(table).not_eq(lit("foo"))];
+            let expected_exprs = if table.as_ref() == "foo" {
+                // "foo" != "foo" is optimized to false
+                vec![lit(false)]
+            } else {
+                // "bar" != "foo" is optimized to true which is then removed
+                vec![]
+            };
 
             assert_eq!(
                 &expected_exprs, &predicate.exprs,
@@ -1020,13 +1058,14 @@ mod tests {
             .build();
         let predicate = table_predicate(predicate);
 
-        // predicate is rewritten to true (which is simplified to an empty predicate list), and projection is added
-        // but, the table schema is not specified in the test, so the projection is also empty.
+        // predicate is rewritten to true (which is simplified to an
+        // empty expr), and projection is added
+        let expected = Predicate::new().with_field_columns(vec!["foo"]);
 
         assert_eq!(
-            predicate, EMPTY_PREDICATE,
+            predicate, expected,
             "expected '{:#?}' doesn't match actual '{:#?}'",
-            predicate, EMPTY_PREDICATE,
+            predicate, expected,
         );
     }
 
@@ -1258,9 +1297,9 @@ mod tests {
         make_tag_ref_node(TAG_KEY_MEASUREMENT, field_name)
     }
 
-    /// returns (RPCNode, and expected_expr for the "host > 5.0")
+    /// returns (RPCNode, and expected_expr for the "host = 'h'")
     fn make_host_comparison() -> (RPCNode, Vec<Expr>) {
-        // host > 5.0
+        // host = "h"
         let field_ref = RPCNode {
             node_type: RPCNodeType::FieldRef as i32,
             children: vec![],
@@ -1269,15 +1308,15 @@ mod tests {
         let iconst = RPCNode {
             node_type: RPCNodeType::Literal as i32,
             children: vec![],
-            value: Some(RPCValue::FloatValue(5.0)),
+            value: Some(RPCValue::StringValue("h".into())),
         };
         let comparison = RPCNode {
             node_type: RPCNodeType::ComparisonExpression as i32,
             children: vec![field_ref, iconst],
-            value: Some(RPCValue::Comparison(RPCComparison::Gt as i32)),
+            value: Some(RPCValue::Comparison(RPCComparison::Equal as i32)),
         };
 
-        let expected_expr = col("host").gt(lit(5.0));
+        let expected_expr = col("host").eq(lit_dict("h"));
 
         (comparison, vec![expected_expr])
     }
@@ -1596,7 +1635,7 @@ mod tests {
             root: Some(comparison),
         });
         assert_eq!(
-            "(FieldRef:host > 5)",
+            r#"(FieldRef:host == "h")"#,
             format!("{}", displayable_predicate(rpc_pred.as_ref()))
         );
     }

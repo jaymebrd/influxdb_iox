@@ -64,7 +64,7 @@ pub struct Config {
 
     /// Query pool name to dispatch writes to.
     #[clap(
-        long = "--query-pool",
+        long = "query-pool",
         env = "INFLUXDB_IOX_QUERY_POOL_NAME",
         default_value = "iox-shared",
         action
@@ -81,7 +81,7 @@ pub struct Config {
     /// A default maximum of 200 requests, multiplied by the default 10MiB
     /// maximum for HTTP request bodies == ~2GiB.
     #[clap(
-        long = "--max-http-requests",
+        long = "max-http-requests",
         env = "INFLUXDB_IOX_MAX_HTTP_REQUESTS",
         default_value = "200",
         action
@@ -105,7 +105,7 @@ pub async fn command(config: Config) -> Result<()> {
     let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
         time_provider,
-        &*metrics,
+        &metrics,
     ));
 
     let server_type = create_router_server_type(

@@ -5,13 +5,14 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::throttle::ThrottledStore;
 use object_store::{throttle::ThrottleConfig, DynObjectStore};
-use observability_deps::tracing::info;
+use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
 use std::sync::Arc;
 use std::{fs, num::NonZeroUsize, path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 pub enum ParseError {
     #[snafu(display("Unable to create database directory {:?}: {}", path, source))]
     CreatingDatabaseDirectory {
@@ -55,25 +56,24 @@ pub const FALLBACK_AWS_REGION: &str = "us-east-1";
 /// CLI config for object stores.
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ObjectStoreConfig {
+    /// Which object storage to use. If not specified, defaults to memory.
+    ///
+    /// Possible values (case insensitive):
+    ///
+    /// * memory (default): Effectively no object persistence.
+    /// * memorythrottled: Like `memory` but with latency and throughput that somewhat resamble a cloud
+    ///    object store. Useful for testing and benchmarking.
+    /// * file: Stores objects in the local filesystem. Must also set `--data-dir`.
+    /// * s3: Amazon S3. Must also set `--bucket`, `--aws-access-key-id`, `--aws-secret-access-key`, and
+    ///    possibly `--aws-default-region`.
+    /// * google: Google Cloud Storage. Must also set `--bucket` and `--google-service-account`.
+    /// * azure: Microsoft Azure blob storage. Must also set `--bucket`, `--azure-storage-account`,
+    ///    and `--azure-storage-access-key`.
     #[clap(
-        arg_enum,
-        long = "--object-store",
+        value_enum,
+        long = "object-store",
         env = "INFLUXDB_IOX_OBJECT_STORE",
         ignore_case = true,
-        long_help = r#"Which object storage to use. If not specified, defaults to memory.
-
-Possible values (case insensitive):
-
-* memory (default): Effectively no object persistence.
-* memorythrottled: Like `memory` but with latency and throughput that somewhat resamble a cloud
-   object store. Useful for testing and benchmarking.
-* file: Stores objects in the local filesystem. Must also set `--data-dir`.
-* s3: Amazon S3. Must also set `--bucket`, `--aws-access-key-id`, `--aws-secret-access-key`, and
-   possibly `--aws-default-region`.
-* google: Google Cloud Storage. Must also set `--bucket` and `--google-service-account`.
-* azure: Microsoft Azure blob storage. Must also set `--bucket`, `--azure-storage-account`,
-   and `--azure-storage-access-key`.
-        "#,
         action
     )]
     pub object_store: Option<ObjectStoreType>,
@@ -92,11 +92,11 @@ Possible values (case insensitive):
     /// container you've created in the associated storage account, under
     /// Blob Service > Containers. Must also set `--azure-storage-account` and
     /// `--azure-storage-access-key`.
-    #[clap(long = "--bucket", env = "INFLUXDB_IOX_BUCKET", action)]
+    #[clap(long = "bucket", env = "INFLUXDB_IOX_BUCKET", action)]
     pub bucket: Option<String>,
 
     /// The location InfluxDB IOx will use to store files locally.
-    #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR", action)]
+    #[clap(long = "data-dir", env = "INFLUXDB_IOX_DB_DIR", action)]
     pub database_directory: Option<PathBuf>,
 
     /// When using Amazon S3 as the object store, set this to an access key that
@@ -108,7 +108,7 @@ Possible values (case insensitive):
     ///
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
-    #[clap(long = "--aws-access-key-id", env = "AWS_ACCESS_KEY_ID", action)]
+    #[clap(long = "aws-access-key-id", env = "AWS_ACCESS_KEY_ID", action)]
     pub aws_access_key_id: Option<String>,
 
     /// When using Amazon S3 as the object store, set this to the secret access
@@ -119,11 +119,7 @@ Possible values (case insensitive):
     ///
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
-    #[clap(
-        long = "--aws-secret-access-key",
-        env = "AWS_SECRET_ACCESS_KEY",
-        action
-    )]
+    #[clap(long = "aws-secret-access-key", env = "AWS_SECRET_ACCESS_KEY", action)]
     pub aws_secret_access_key: Option<String>,
 
     /// When using Amazon S3 as the object store, set this to the region
@@ -133,7 +129,7 @@ Possible values (case insensitive):
     /// Must also set `--object-store=s3`, `--bucket`, `--aws-access-key-id`,
     /// and `--aws-secret-access-key`.
     #[clap(
-        long = "--aws-default-region",
+        long = "aws-default-region",
         env = "AWS_DEFAULT_REGION",
         default_value = FALLBACK_AWS_REGION,
         action,
@@ -148,7 +144,7 @@ Possible values (case insensitive):
     ///
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
-    #[clap(long = "--aws-endpoint", env = "AWS_ENDPOINT", action)]
+    #[clap(long = "aws-endpoint", env = "AWS_ENDPOINT", action)]
     pub aws_endpoint: Option<String>,
 
     /// When using Amazon S3 as an object store, set this to the session token. This is handy when using a federated
@@ -158,11 +154,11 @@ Possible values (case insensitive):
     ///
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
-    #[clap(long = "--aws-session-token", env = "AWS_SESSION_TOKEN", action)]
+    #[clap(long = "aws-session-token", env = "AWS_SESSION_TOKEN", action)]
     pub aws_session_token: Option<String>,
 
     /// Allow unencrypted HTTP connection to AWS.
-    #[clap(long = "--aws-allow-http", env = "AWS_ALLOW_HTTP", action)]
+    #[clap(long = "aws-allow-http", env = "AWS_ALLOW_HTTP", action)]
     pub aws_allow_http: bool,
 
     /// When using Google Cloud Storage as the object store, set this to the
@@ -170,7 +166,7 @@ Possible values (case insensitive):
     ///
     /// Must also set `--object-store=google` and `--bucket`.
     #[clap(
-        long = "--google-service-account",
+        long = "google-service-account",
         env = "GOOGLE_SERVICE_ACCOUNT",
         action
     )]
@@ -181,11 +177,7 @@ Possible values (case insensitive):
     ///
     /// Must also set `--object-store=azure`, `--bucket`, and
     /// `--azure-storage-access-key`.
-    #[clap(
-        long = "--azure-storage-account",
-        env = "AZURE_STORAGE_ACCOUNT",
-        action
-    )]
+    #[clap(long = "azure-storage-account", env = "AZURE_STORAGE_ACCOUNT", action)]
     pub azure_storage_account: Option<String>,
 
     /// When using Microsoft Azure as the object store, set this to one of the
@@ -197,7 +189,7 @@ Possible values (case insensitive):
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
     #[clap(
-        long = "--azure-storage-access-key",
+        long = "azure-storage-access-key",
         env = "AZURE_STORAGE_ACCESS_KEY",
         action
     )]
@@ -205,7 +197,7 @@ Possible values (case insensitive):
 
     /// When using a network-based object store, limit the number of connection to this value.
     #[clap(
-        long = "--object-store-connection-limit",
+        long = "object-store-connection-limit",
         env = "OBJECT_STORE_CONNECTION_LIMIT",
         default_value = "16",
         action
@@ -241,41 +233,48 @@ impl ObjectStoreConfig {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, clap::ArgEnum)]
+/// Object-store type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 pub enum ObjectStoreType {
+    /// In-memory.
     Memory,
+
+    /// In-memory with additional throttling applied for testing
     MemoryThrottled,
+
+    /// Filesystem.
     File,
+
+    /// AWS S3.
     S3,
+
+    /// GCS.
     Google,
+
+    /// Azure object store.
     Azure,
 }
 
 #[cfg(feature = "gcp")]
 fn new_gcs(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
-    match (
-        config.bucket.as_ref(),
-        config.google_service_account.as_ref(),
-    ) {
-        (Some(bucket), Some(service_account)) => Ok(Arc::new(
-            object_store::gcp::new_gcs(service_account, bucket).context(InvalidGCSConfigSnafu)?,
-        )),
-        (bucket, service_account) => {
-            let mut missing_args = vec![];
+    use object_store::gcp::GoogleCloudStorageBuilder;
+    use object_store::limit::LimitStore;
 
-            if bucket.is_none() {
-                missing_args.push("bucket");
-            }
-            if service_account.is_none() {
-                missing_args.push("google-service-account");
-            }
-            MissingObjectStoreConfigSnafu {
-                object_store: ObjectStoreType::Google,
-                missing: missing_args.join(", "),
-            }
-            .fail()
-        }
+    info!(bucket=?config.bucket, object_store_type="GCS", "Object Store");
+
+    let mut builder = GoogleCloudStorageBuilder::new();
+
+    if let Some(bucket) = &config.bucket {
+        builder = builder.with_bucket_name(bucket);
     }
+    if let Some(account) = &config.google_service_account {
+        builder = builder.with_service_account_path(account);
+    }
+
+    Ok(Arc::new(LimitStore::new(
+        builder.build().context(InvalidGCSConfigSnafu)?,
+        config.object_store_connection_limit.get(),
+    )))
 }
 
 #[cfg(not(feature = "gcp"))]
@@ -285,40 +284,36 @@ fn new_gcs(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
 
 #[cfg(feature = "aws")]
 fn new_s3(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
-    match (
-        config.bucket.as_ref(),
-        config.aws_access_key_id.as_ref(),
-        config.aws_secret_access_key.as_ref(),
-        config.aws_default_region.as_str(),
-        config.aws_endpoint.as_ref(),
-        config.aws_session_token.as_ref(),
-    ) {
-        (Some(bucket), key_id, secret_key, region, endpoint, session_token) => Ok(Arc::new(
-            object_store::aws::new_s3(
-                key_id,
-                secret_key,
-                region,
-                bucket,
-                endpoint,
-                session_token,
-                config.object_store_connection_limit,
-                config.aws_allow_http,
-            )
-            .context(InvalidS3ConfigSnafu)?,
-        )),
-        (bucket, _, _, _, _, _) => {
-            let mut missing_args = vec![];
+    use object_store::aws::AmazonS3Builder;
+    use object_store::limit::LimitStore;
 
-            if bucket.is_none() {
-                missing_args.push("bucket");
-            }
-            MissingObjectStoreConfigSnafu {
-                object_store: ObjectStoreType::S3,
-                missing: missing_args.join(", "),
-            }
-            .fail()
-        }
+    info!(bucket=?config.bucket, endpoint=?config.aws_endpoint, object_store_type="S3", "Object Store");
+
+    let mut builder = AmazonS3Builder::new()
+        .with_allow_http(config.aws_allow_http)
+        .with_region(&config.aws_default_region)
+        .with_imdsv1_fallback();
+
+    if let Some(bucket) = &config.bucket {
+        builder = builder.with_bucket_name(bucket);
     }
+    if let Some(key_id) = &config.aws_access_key_id {
+        builder = builder.with_access_key_id(key_id);
+    }
+    if let Some(token) = &config.aws_session_token {
+        builder = builder.with_token(token);
+    }
+    if let Some(secret) = &config.aws_secret_access_key {
+        builder = builder.with_secret_access_key(secret);
+    }
+    if let Some(endpoint) = &config.aws_endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+
+    Ok(Arc::new(LimitStore::new(
+        builder.build().context(InvalidS3ConfigSnafu)?,
+        config.object_store_connection_limit.get(),
+    )))
 }
 
 #[cfg(not(feature = "aws"))]
@@ -328,35 +323,28 @@ fn new_s3(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
 
 #[cfg(feature = "azure")]
 fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
-    match (
-        config.bucket.as_ref(),
-        config.azure_storage_account.as_ref(),
-        config.azure_storage_access_key.as_ref(),
-    ) {
-        (Some(bucket), Some(storage_account), Some(access_key)) => Ok(Arc::new(
-            object_store::azure::new_azure(storage_account, access_key, bucket, false)
-                .context(InvalidS3ConfigSnafu)?,
-        )),
-        (bucket, storage_account, access_key) => {
-            let mut missing_args = vec![];
+    use object_store::azure::MicrosoftAzureBuilder;
+    use object_store::limit::LimitStore;
 
-            if bucket.is_none() {
-                missing_args.push("bucket");
-            }
-            if storage_account.is_none() {
-                missing_args.push("azure-storage-account");
-            }
-            if access_key.is_none() {
-                missing_args.push("azure-storage-access-key");
-            }
+    info!(bucket=?config.bucket, account=?config.azure_storage_account,
+          object_store_type="Azure", "Object Store");
 
-            MissingObjectStoreConfigSnafu {
-                object_store: ObjectStoreType::Azure,
-                missing: missing_args.join(", "),
-            }
-            .fail()
-        }
+    let mut builder = MicrosoftAzureBuilder::new();
+
+    if let Some(bucket) = &config.bucket {
+        builder = builder.with_container_name(bucket);
     }
+    if let Some(account) = &config.azure_storage_account {
+        builder = builder.with_account(account)
+    }
+    if let Some(key) = &config.azure_storage_access_key {
+        builder = builder.with_access_key(key)
+    }
+
+    Ok(Arc::new(LimitStore::new(
+        builder.build().context(InvalidAzureConfigSnafu)?,
+        config.object_store_connection_limit.get(),
+    )))
 }
 
 #[cfg(not(feature = "azure"))]
@@ -364,9 +352,20 @@ fn new_azure(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     panic!("Azure blob storage support not enabled, recompile with the azure feature enabled")
 }
 
+/// Create config-dependant object store.
 pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
+    if let Some(data_dir) = &config.database_directory {
+        if !matches!(&config.object_store, Some(ObjectStoreType::File)) {
+            warn!(?data_dir, object_store_type=?config.object_store,
+                  "--data-dir / `INFLUXDB_IOX_DB_DIR` ignored. It only affects 'file' object stores");
+        }
+    }
+
     match &config.object_store {
-        Some(ObjectStoreType::Memory) | None => Ok(Arc::new(InMemory::new())),
+        Some(ObjectStoreType::Memory) | None => {
+            info!(object_store_type = "Memory", "Object Store");
+            Ok(Arc::new(InMemory::new()))
+        }
         Some(ObjectStoreType::MemoryThrottled) => {
             let config = ThrottleConfig {
                 // for every call: assume a 100ms latency
@@ -384,6 +383,7 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
                 wait_get_per_byte: Duration::from_secs(1) / 1_000_000_000,
             };
 
+            info!(?config, object_store_type = "Memory", "Object Store");
             Ok(Arc::new(ThrottledStore::new(InMemory::new(), config)))
         }
 
@@ -392,6 +392,7 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
         Some(ObjectStoreType::Azure) => new_azure(config),
         Some(ObjectStoreType::File) => match config.database_directory.as_ref() {
             Some(db_dir) => {
+                info!(?db_dir, object_store_type = "Directory", "Object Store");
                 fs::create_dir_all(db_dir)
                     .context(CreatingDatabaseDirectorySnafu { path: db_dir })?;
 
@@ -409,6 +410,7 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
 }
 
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 pub enum CheckError {
     #[snafu(display("Cannot read from object store: {}", source))]
     CannotReadObjectStore { source: object_store::Error },
@@ -440,15 +442,14 @@ pub async fn check_object_store(object_store: &DynObjectStore) -> Result<(), Che
 
 #[cfg(test)]
 mod tests {
-    use clap::StructOpt;
+    use super::*;
+    use clap::Parser;
     use std::env;
     use tempfile::TempDir;
 
-    use super::*;
-
     #[test]
     fn default_object_store_is_memory() {
-        let config = ObjectStoreConfig::try_parse_from(&["server"]).unwrap();
+        let config = ObjectStoreConfig::try_parse_from(["server"]).unwrap();
 
         let object_store = make_object_store(&config).unwrap();
         assert_eq!(&object_store.to_string(), "InMemory")
@@ -457,7 +458,7 @@ mod tests {
     #[test]
     fn explicitly_set_object_store_to_memory() {
         let config =
-            ObjectStoreConfig::try_parse_from(&["server", "--object-store", "memory"]).unwrap();
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
 
         let object_store = make_object_store(&config).unwrap();
         assert_eq!(&object_store.to_string(), "InMemory")
@@ -466,7 +467,7 @@ mod tests {
     #[test]
     #[cfg(feature = "aws")]
     fn valid_s3_config() {
-        let config = ObjectStoreConfig::try_parse_from(&[
+        let config = ObjectStoreConfig::try_parse_from([
             "server",
             "--object-store",
             "s3",
@@ -487,7 +488,7 @@ mod tests {
     #[cfg(feature = "aws")]
     fn s3_config_missing_params() {
         let mut config =
-            ObjectStoreConfig::try_parse_from(&["server", "--object-store", "s3"]).unwrap();
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
 
         // clean out eventual leaks via env variables
         config.bucket = None;
@@ -503,7 +504,7 @@ mod tests {
     #[test]
     #[cfg(feature = "gcp")]
     fn valid_google_config() {
-        let config = ObjectStoreConfig::try_parse_from(&[
+        let config = ObjectStoreConfig::try_parse_from([
             "server",
             "--object-store",
             "google",
@@ -522,7 +523,7 @@ mod tests {
     #[cfg(feature = "gcp")]
     fn google_config_missing_params() {
         let mut config =
-            ObjectStoreConfig::try_parse_from(&["server", "--object-store", "google"]).unwrap();
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "google"]).unwrap();
 
         // clean out eventual leaks via env variables
         config.bucket = None;
@@ -539,7 +540,7 @@ mod tests {
     #[test]
     #[cfg(feature = "azure")]
     fn valid_azure_config() {
-        let config = ObjectStoreConfig::try_parse_from(&[
+        let config = ObjectStoreConfig::try_parse_from([
             "server",
             "--object-store",
             "azure",
@@ -560,7 +561,7 @@ mod tests {
     #[cfg(feature = "azure")]
     fn azure_config_missing_params() {
         let mut config =
-            ObjectStoreConfig::try_parse_from(&["server", "--object-store", "azure"]).unwrap();
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "azure"]).unwrap();
 
         // clean out eventual leaks via env variables
         config.bucket = None;
@@ -579,7 +580,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let root_path = root.path().to_str().unwrap();
 
-        let config = ObjectStoreConfig::try_parse_from(&[
+        let config = ObjectStoreConfig::try_parse_from([
             "server",
             "--object-store",
             "file",
@@ -603,7 +604,7 @@ mod tests {
         // actually present.
         env::remove_var("INFLUXDB_IOX_DB_DIR");
         let config =
-            ObjectStoreConfig::try_parse_from(&["server", "--object-store", "file"]).unwrap();
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "file"]).unwrap();
 
         let err = make_object_store(&config).unwrap_err().to_string();
 

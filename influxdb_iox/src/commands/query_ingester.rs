@@ -32,24 +32,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Config {
     /// The IOx namespace to query
     #[clap(action)]
-    namespace: String,
+    namespace_id: i64,
 
     /// The table for which to retrieve data
     #[clap(action)]
-    table: String,
+    table_id: i64,
 
     /// The columns to request
-    #[clap(
-        long = "--columns",
-        multiple_values = true,
-        use_value_delimiter = true,
-        action
-    )]
+    #[clap(long = "columns", use_value_delimiter = true, action)]
     columns: Vec<String>,
 
     /// Predicate in base64 protobuf encoded form.
     /// (logged on error)
-    #[clap(long = "--predicate-base64", action)]
+    #[clap(long = "predicate-base64", action)]
     predicate_base64: Option<String>,
 
     /// Optional format ('pretty', 'json', or 'csv')
@@ -58,11 +53,11 @@ pub struct Config {
 }
 
 pub async fn command(connection: Connection, config: Config) -> Result<()> {
-    let mut client = flight::low_level::Client::new(connection);
+    let mut client = flight::low_level::Client::new(connection, None);
     let Config {
-        namespace,
+        namespace_id,
         format,
-        table,
+        table_id,
         columns,
         predicate_base64,
     } = config;
@@ -76,10 +71,10 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
     };
 
     let request = flight::generated_types::IngesterQueryRequest {
-        table,
+        table_id,
         columns,
         predicate,
-        namespace,
+        namespace_id,
     };
 
     let mut query_results = client.perform_query(request).await?;

@@ -1,4 +1,4 @@
-use datafusion::logical_plan::{col, lit};
+use datafusion::prelude::{col, lit};
 use iox_query::{
     exec::stringset::{IntoStringSet, StringSetRef},
     frontend::influxrpc::InfluxRpcPlanner,
@@ -26,11 +26,11 @@ async fn run_tag_values_test_case<D>(
         } = scenario;
         println!("Running scenario '{}'", scenario_name);
         println!("Predicate: '{:#?}'", predicate);
-        let planner = InfluxRpcPlanner::default();
         let ctx = db.new_query_context(None);
+        let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
         let plan = planner
-            .tag_values(db.as_query_database(), tag_name, predicate.clone())
+            .tag_values(db.as_query_namespace_arc(), tag_name, predicate.clone())
             .await
             .expect("built plan successfully");
         let names = ctx
@@ -73,32 +73,6 @@ async fn list_tag_values_no_predicate_state_col() {
     let expected_tag_keys = vec!["CA", "MA", "NY"];
     run_tag_values_test_case(
         TwoMeasurementsManyNulls {},
-        tag_name,
-        InfluxRpcPredicate::default(),
-        expected_tag_keys,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn list_tag_values_no_predicate_state_col_with_delete() {
-    let tag_name = "state";
-    let expected_tag_keys = vec!["CA", "MA"];
-    run_tag_values_test_case(
-        OneMeasurementManyNullTagsWithDelete {},
-        tag_name,
-        InfluxRpcPredicate::default(),
-        expected_tag_keys,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn list_tag_values_no_predicate_state_col_with_delete_all() {
-    let tag_name = "state";
-    let expected_tag_keys = vec![];
-    run_tag_values_test_case(
-        OneMeasurementManyNullTagsWithDeleteAll {},
         tag_name,
         InfluxRpcPredicate::default(),
         expected_tag_keys,
@@ -311,13 +285,14 @@ async fn list_tag_values_field_col_on_tag() {
             scenario_name, db, ..
         } = scenario;
         println!("Running scenario '{}'", scenario_name);
-        let planner = InfluxRpcPlanner::default();
+        let ctx = db.new_query_context(None);
+        let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
         // Test: temp is a field, not a tag
         let tag_name = "temp";
         let plan_result = planner
             .tag_values(
-                db.as_query_database(),
+                db.as_query_namespace_arc(),
                 tag_name,
                 InfluxRpcPredicate::default(),
             )
@@ -353,19 +328,29 @@ async fn list_tag_values_field_col_does_not_exist() {
 async fn list_tag_values_field_col_does_exist() {
     let tag_name = "state";
     let predicate = Predicate::default()
-        .with_range(0, 1000) // get all rows
-        // this field does exist (but only for rows with CA and MA, not NY)
-        .with_expr(col("_field").eq(lit("county")));
+        .with_range(0, 1000000) // get all rows
+        // this field does exist, but only for rows MA(not CA)
+        .with_expr(col("_field").eq(lit("moisture")));
     let predicate = InfluxRpcPredicate::new(None, predicate);
-    let expected_tag_keys = vec!["MA", "CA"];
+    let expected_tag_keys = vec!["MA"];
 
     run_tag_values_test_case(
-        TwoMeasurementsManyNulls {},
+        TwoMeasurementsManyFields {},
         tag_name,
         predicate,
         expected_tag_keys,
     )
     .await;
+}
+
+#[tokio::test]
+async fn list_tag_values_with_periods() {
+    let tag_name = "tag.one";
+    let predicate = Predicate::default().with_range(0, 1700000001000000000);
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+    let expected_tag_keys = vec!["value", "value2"];
+
+    run_tag_values_test_case(PeriodsInNames {}, tag_name, predicate, expected_tag_keys).await;
 }
 
 fn to_stringset(v: &[&str]) -> StringSetRef {

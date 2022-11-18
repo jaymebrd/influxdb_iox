@@ -1,9 +1,10 @@
 [package]
 name = "logfmt"
-version = "0.1.0"
-authors = ["Andrew Lamb <andrew@nerdnetworks.org>"]
 description = "tracing_subscriber layer for writing out logfmt formatted events"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies] # In alphabetical order
 observability_deps = { path = "../observability_deps" }
@@ -11,7 +12,7 @@ tracing-subscriber = "0.3"
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies] # In alphabetical order
-once_cell = { version = "1.13.0", features = ["parking_lot"] }
+once_cell = { version = "1.16.0", features = ["parking_lot"] }
 parking_lot = "0.12"
 regex = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

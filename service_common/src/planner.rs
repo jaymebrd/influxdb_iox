@@ -6,7 +6,7 @@ use iox_query::{
     exec::IOxSessionContext,
     frontend::{influxrpc::InfluxRpcPlanner, sql::SqlQueryPlanner},
     plan::{fieldlist::FieldListPlan, seriesset::SeriesSetPlans, stringset::StringSetPlan},
-    Aggregate, QueryDatabase, WindowDuration,
+    Aggregate, QueryNamespace, WindowDuration,
 };
 
 pub use datafusion::error::{DataFusionError as Error, Result};
@@ -31,12 +31,12 @@ impl Planner {
         }
     }
 
-    /// Plan a SQL query against the data in `database`, and return a
+    /// Plan a SQL query against the data in a namespace, and return a
     /// DataFusion physical execution plan.
     pub async fn sql(&self, query: impl Into<String> + Send) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = SqlQueryPlanner::new();
         let query = query.into();
-        let ctx = self.ctx.child_ctx("sql");
+        let ctx = self.ctx.child_ctx("planner sql");
 
         self.ctx
             .run(async move { planner.query(&query, &ctx).await })
@@ -45,166 +45,161 @@ impl Planner {
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::table_names`], on a separate threadpool
-    pub async fn table_names<D>(
+    pub async fn table_names<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::default();
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner table_names"));
 
         self.ctx
             .run(async move {
                 planner
-                    .table_names(database.as_ref(), predicate)
+                    .table_names(namespace, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("table_names error: {}", e)))
+                    .map_err(|e| e.to_df_error("table_names"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::tag_keys`], on a separate threadpool
-    pub async fn tag_keys<D>(
+    pub async fn tag_keys<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner =
-            InfluxRpcPlanner::new().with_execution_context(self.ctx.child_ctx("influxrpc_planner"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_keys"));
 
         self.ctx
             .run(async move {
                 planner
-                    .tag_keys(database.as_ref(), predicate)
+                    .tag_keys(namespace, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("tag_keys error: {}", e)))
+                    .map_err(|e| e.to_df_error("tag_keys"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::tag_values`], on a separate threadpool
-    pub async fn tag_values<D>(
+    pub async fn tag_values<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         tag_name: impl Into<String> + Send,
         predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
         let tag_name = tag_name.into();
-        let planner =
-            InfluxRpcPlanner::new().with_execution_context(self.ctx.child_ctx("influxrpc_planner"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_values"));
 
         self.ctx
             .run(async move {
                 planner
-                    .tag_values(database.as_ref(), &tag_name, predicate)
+                    .tag_values(namespace, &tag_name, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("tag_values error: {}", e)))
+                    .map_err(|e| e.to_df_error("tag_values"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::field_columns`], on a separate threadpool
-    pub async fn field_columns<D>(
+    pub async fn field_columns<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
     ) -> Result<FieldListPlan>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner =
-            InfluxRpcPlanner::new().with_execution_context(self.ctx.child_ctx("influxrpc_planner"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner field_columns"));
 
         self.ctx
             .run(async move {
                 planner
-                    .field_columns(database.as_ref(), predicate)
+                    .field_columns(namespace, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("field_columns error: {}", e)))
+                    .map_err(|e| e.to_df_error("field_columns"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::read_filter`], on a separate threadpool
-    pub async fn read_filter<D>(
+    pub async fn read_filter<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
     ) -> Result<SeriesSetPlans>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner =
-            InfluxRpcPlanner::new().with_execution_context(self.ctx.child_ctx("influxrpc_planner"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_filter"));
 
         self.ctx
             .run(async move {
                 planner
-                    .read_filter(database.as_ref(), predicate)
+                    .read_filter(namespace, predicate)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_filter error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_filter"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::read_group`], on a separate threadpool
-    pub async fn read_group<D>(
+    pub async fn read_group<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
         agg: Aggregate,
         group_columns: Vec<String>,
     ) -> Result<SeriesSetPlans>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner =
-            InfluxRpcPlanner::new().with_execution_context(self.ctx.child_ctx("influxrpc_planner"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_group"));
 
         self.ctx
             .run(async move {
                 planner
-                    .read_group(database.as_ref(), predicate, agg, &group_columns)
+                    .read_group(namespace, predicate, agg, &group_columns)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_group error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_group"))
             })
             .await
     }
 
     /// Creates a plan as described on
     /// [`InfluxRpcPlanner::read_window_aggregate`], on a separate threadpool
-    pub async fn read_window_aggregate<D>(
+    pub async fn read_window_aggregate<N>(
         &self,
-        database: Arc<D>,
+        namespace: Arc<N>,
         predicate: InfluxRpcPredicate,
         agg: Aggregate,
         every: WindowDuration,
         offset: WindowDuration,
     ) -> Result<SeriesSetPlans>
     where
-        D: QueryDatabase + 'static,
+        N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::default();
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_window_aggregate"));
 
         self.ctx
             .run(async move {
                 planner
-                    .read_window_aggregate(database.as_ref(), predicate, agg, every, offset)
+                    .read_window_aggregate(namespace, predicate, agg, every, offset)
                     .await
-                    .map_err(|e| Error::Plan(format!("read_window_aggregate error: {}", e)))
+                    .map_err(|e| e.to_df_error("read_window_aggregate"))
             })
             .await
     }

@@ -5,7 +5,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use observability_deps::tracing::{debug, info};
-use rustyline::{error::ReadlineError, Editor};
+use rustyline::{error::ReadlineError, hint::Hinter, Editor};
 use snafu::{ResultExt, Snafu};
 
 use super::repl_command::ReplCommand;
@@ -43,9 +43,6 @@ pub enum Error {
         source: influxdb_iox_client::flight::Error,
     },
 
-    #[snafu(display("Error running observer query: {}", source))]
-    RunningObserverQuery { source: super::observer::Error },
-
     #[snafu(display("Cannot create REPL: {}", source))]
     ReplCreation { source: ReadlineError },
 }
@@ -53,11 +50,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 enum QueryEngine {
-    /// Run queries against the named database on the remote server
+    /// Run queries against the namespace on the remote server
     Remote(String),
-
-    /// Run queries against a local `Observer` instance
-    Observer(super::observer::Observer),
 }
 
 struct RustylineHelper {
@@ -122,7 +116,7 @@ impl rustyline::highlight::Highlighter for RustylineHelper {
         }
         #[cfg(not(windows))]
         {
-            use ansi_term::Style;
+            use nu_ansi_term::Style;
             Cow::Owned(Style::new().dimmed().paint(hint).to_string())
         }
     }
@@ -142,6 +136,21 @@ impl rustyline::highlight::Highlighter for RustylineHelper {
 
 impl rustyline::completion::Completer for RustylineHelper {
     type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        // If there is a hint, use that as the auto-complete when user hits `tab`
+        if let Some(hint) = self.hinter.hint(line, pos, ctx) {
+            let start_pos = pos;
+            Ok((start_pos, vec![hint]))
+        } else {
+            Ok((0, Vec::with_capacity(0)))
+        }
+    }
 }
 
 /// Captures the state of the repl, gathers commands and executes them
@@ -153,16 +162,13 @@ pub struct Repl {
     /// Current prompt
     prompt: String,
 
-    /// Connection to the server
-    connection: Connection,
-
     /// Client for interacting with IOx namespace API
     namespace_client: influxdb_iox_client::namespace::Client,
 
     /// Client for running sql
     flight_client: influxdb_iox_client::flight::Client,
 
-    /// database name against which SQL commands are run
+    /// namespace name against which SQL commands are run
     query_engine: Option<QueryEngine>,
 
     /// Formatter to use to format query results
@@ -177,7 +183,7 @@ impl Repl {
     /// Create a new Repl instance, connected to the specified URL
     pub fn new(connection: Connection) -> Result<Self> {
         let namespace_client = influxdb_iox_client::namespace::Client::new(connection.clone());
-        let flight_client = influxdb_iox_client::flight::Client::new(connection.clone());
+        let flight_client = influxdb_iox_client::flight::Client::new(connection);
 
         let mut rl = Editor::new().context(ReplCreationSnafu)?;
         rl.set_helper(Some(RustylineHelper::default()));
@@ -194,7 +200,6 @@ impl Repl {
         Ok(Self {
             rl,
             prompt,
-            connection,
             namespace_client,
             flight_client,
             query_engine: None,
@@ -212,20 +217,14 @@ impl Repl {
                 ReplCommand::Help => {
                     self.print_help();
                 }
-                ReplCommand::Observer {} => {
-                    self.use_observer()
-                        .await
-                        .map_err(|e| println!("{}", e))
-                        .ok();
-                }
                 ReplCommand::ShowNamespaces => {
                     self.list_namespaces()
                         .await
                         .map_err(|e| println!("{}", e))
                         .ok();
                 }
-                ReplCommand::UseDatabase { db_name } => {
-                    self.use_database(db_name);
+                ReplCommand::UseNamespace { db_name } => {
+                    self.use_namespace(db_name);
                 }
                 ReplCommand::SqlCommand { sql } => {
                     self.run_sql(sql).await.map_err(|e| println!("{}", e)).ok();
@@ -287,27 +286,20 @@ impl Repl {
         self.print_results(&[record_batch])
     }
 
-    // Run a command against the currently selected remote database
+    // Run a command against the currently selected remote namespace
     async fn run_sql(&mut self, sql: String) -> Result<()> {
         let start = Instant::now();
 
         let batches = match &mut self.query_engine {
             None => {
-                println!("Error: no database selected.");
-                println!("Hint: Run USE DATABASE <dbname> to select database");
+                println!("Error: no namespace selected.");
+                println!("Hint: Run USE NAMESPACE <dbname> to select namespace");
                 return Ok(());
             }
             Some(QueryEngine::Remote(db_name)) => {
-                info!(%db_name, %sql, "Running sql on remote database");
+                info!(%db_name, %sql, "Running sql on remote namespace");
 
                 scrape_query(&mut self.flight_client, db_name, &sql).await?
-            }
-            Some(QueryEngine::Observer(observer)) => {
-                info!("Running sql on local observer");
-                observer
-                    .run_query(&sql)
-                    .await
-                    .context(RunningObserverQuerySnafu)?
             }
         };
 
@@ -334,20 +326,10 @@ impl Repl {
         }
     }
 
-    fn use_database(&mut self, db_name: String) {
-        info!(%db_name, "setting current database");
-        println!("You are now in remote mode, querying database {}", db_name);
+    fn use_namespace(&mut self, db_name: String) {
+        info!(%db_name, "setting current namespace");
+        println!("You are now in remote mode, querying namespace {}", db_name);
         self.set_query_engine(QueryEngine::Remote(db_name));
-    }
-
-    async fn use_observer(&mut self) -> Result<()> {
-        println!("Preparing local views of remote system tables");
-        let observer = super::observer::Observer::try_new(self.connection.clone())
-            .await
-            .context(RunningObserverQuerySnafu)?;
-        println!("{}", observer.help());
-        self.set_query_engine(QueryEngine::Observer(observer));
-        Ok(())
     }
 
     fn set_query_engine(&mut self, query_engine: QueryEngine) {
@@ -355,7 +337,6 @@ impl Repl {
             QueryEngine::Remote(db_name) => {
                 format!("{}> ", db_name)
             }
-            QueryEngine::Observer(_) => "OBSERVER> ".to_string(),
         };
         self.query_engine = Some(query_engine)
     }

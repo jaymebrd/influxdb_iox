@@ -6,9 +6,16 @@ use futures::{
     stream::FuturesUnordered,
     FutureExt, StreamExt, TryFutureExt,
 };
-use influxdb_iox_client::schema::generated_types::schema_service_server::SchemaServiceServer;
+use influxdb_iox_client::{
+    catalog::generated_types::catalog_service_server::CatalogServiceServer,
+    schema::generated_types::schema_service_server::SchemaServiceServer,
+    store::generated_types::object_store_service_server::ObjectStoreServiceServer,
+};
 use iox_catalog::interface::Catalog;
+use object_store::ObjectStore;
 use observability_deps::tracing::warn;
+use service_grpc_catalog::CatalogService;
+use service_grpc_object_store::ObjectStoreService;
 use service_grpc_schema::SchemaService;
 use std::sync::Arc;
 use thiserror::Error;
@@ -24,10 +31,14 @@ pub enum Error {}
 /// The [`QuerierHandler`] does nothing at this point
 #[async_trait]
 pub trait QuerierHandler: Send + Sync {
-    /// Acquire a [`SchemaService`] gRPC service implementation.
-    ///
-    /// [`SchemaService`]: generated_types::influxdata::iox::schema::v1::schema_service_server::SchemaService.
+    /// Acquire a [`SchemaServiceServer`] gRPC service implementation.
     fn schema_service(&self) -> SchemaServiceServer<SchemaService>;
+
+    /// Acquire a [`CatalogServiceServer`] gRPC service implementation.
+    fn catalog_service(&self) -> CatalogServiceServer<CatalogService>;
+
+    /// Acquire an [`ObjectStoreServiceServer`] gRPC service implementation.
+    fn object_store_service(&self) -> ObjectStoreServiceServer<ObjectStoreService>;
 
     /// Wait until the handler finished  to shutdown.
     ///
@@ -56,6 +67,9 @@ pub struct QuerierHandlerImpl {
     /// Database that handles query operation
     database: Arc<QuerierDatabase>,
 
+    /// The object store
+    object_store: Arc<dyn ObjectStore>,
+
     /// Future that resolves when the background worker exits
     join_handles: Vec<(String, SharedJoinHandle)>,
 
@@ -69,7 +83,11 @@ pub struct QuerierHandlerImpl {
 
 impl QuerierHandlerImpl {
     /// Initialize the Querier
-    pub fn new(catalog: Arc<dyn Catalog>, database: Arc<QuerierDatabase>) -> Self {
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        database: Arc<QuerierDatabase>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let poison_cabinet = Arc::new(PoisonCabinet::new());
 
@@ -77,6 +95,7 @@ impl QuerierHandlerImpl {
         Self {
             catalog,
             database,
+            object_store,
             join_handles,
             shutdown,
             poison_cabinet,
@@ -88,6 +107,17 @@ impl QuerierHandlerImpl {
 impl QuerierHandler for QuerierHandlerImpl {
     fn schema_service(&self) -> SchemaServiceServer<SchemaService> {
         SchemaServiceServer::new(SchemaService::new(Arc::clone(&self.catalog)))
+    }
+
+    fn catalog_service(&self) -> CatalogServiceServer<CatalogService> {
+        CatalogServiceServer::new(CatalogService::new(Arc::clone(&self.catalog)))
+    }
+
+    fn object_store_service(&self) -> ObjectStoreServiceServer<ObjectStoreService> {
+        ObjectStoreServiceServer::new(ObjectStoreService::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+        ))
     }
 
     async fn join(&self) {
@@ -130,13 +160,13 @@ impl Drop for QuerierHandlerImpl {
 mod tests {
     use super::*;
     use crate::{cache::CatalogCache, create_ingester_connection_for_testing};
-    use data_types::KafkaPartition;
+    use data_types::ShardIndex;
     use iox_catalog::mem::MemCatalog;
     use iox_query::exec::Executor;
     use iox_time::{MockProvider, Time};
     use object_store::memory::InMemory;
-    use parquet_file::storage::ParquetStorage;
     use std::time::Duration;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_shutdown() {
@@ -163,28 +193,26 @@ mod tests {
         async fn new() -> Self {
             let metric_registry = Arc::new(metric::Registry::new());
             let catalog = Arc::new(MemCatalog::new(Arc::clone(&metric_registry))) as _;
-            let object_store = Arc::new(InMemory::new());
+            let object_store = Arc::new(InMemory::new()) as _;
+
             let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
             let exec = Arc::new(Executor::new(1));
             let catalog_cache = Arc::new(CatalogCache::new_testing(
                 Arc::clone(&catalog),
                 time_provider,
                 Arc::clone(&metric_registry),
-                usize::MAX,
+                Arc::clone(&object_store),
+                &Handle::current(),
             ));
-            // QuerierDatabase::new returns an error if there are no sequencers in the catalog
+            // QuerierDatabase::new returns an error if there are no shards in the catalog
             {
                 let mut repos = catalog.repositories().await;
 
-                let kafka_topic = repos
-                    .kafka_topics()
-                    .create_or_get("kafka_topic")
-                    .await
-                    .unwrap();
-                let kafka_partition = KafkaPartition::new(0);
+                let topic = repos.topics().create_or_get("topic").await.unwrap();
+                let shard_index = ShardIndex::new(0);
                 repos
-                    .sequencers()
-                    .create_or_get(&kafka_topic, kafka_partition)
+                    .shards()
+                    .create_or_get(&topic, shard_index)
                     .await
                     .unwrap();
             }
@@ -193,15 +221,15 @@ mod tests {
                 QuerierDatabase::new(
                     catalog_cache,
                     metric_registry,
-                    ParquetStorage::new(object_store),
                     exec,
                     Some(create_ingester_connection_for_testing()),
                     QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
+                    usize::MAX,
                 )
                 .await
                 .unwrap(),
             );
-            let querier = QuerierHandlerImpl::new(catalog, database);
+            let querier = QuerierHandlerImpl::new(catalog, database, object_store);
 
             Self { querier }
         }

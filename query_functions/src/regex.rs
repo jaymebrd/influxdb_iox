@@ -7,17 +7,17 @@ use arrow::{
 use datafusion::{
     error::DataFusionError,
     logical_expr::{ScalarFunctionImplementation, ScalarUDF, Volatility},
-    logical_plan::create_udf,
     physical_plan::ColumnarValue,
+    prelude::create_udf,
     scalar::ScalarValue,
 };
 use once_cell::sync::Lazy;
 
 /// The name of the regex_match UDF given to DataFusion.
-pub(crate) const REGEX_MATCH_UDF_NAME: &str = "RegexMatch";
+pub const REGEX_MATCH_UDF_NAME: &str = "RegexMatch";
 
 /// The name of the not_regex_match UDF given to DataFusion.
-pub(crate) const REGEX_NOT_MATCH_UDF_NAME: &str = "RegexNotMatch";
+pub const REGEX_NOT_MATCH_UDF_NAME: &str = "RegexNotMatch";
 
 /// Implementation of regexp_match
 pub(crate) static REGEX_MATCH_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
@@ -113,12 +113,10 @@ fn regex_match_expr_impl(matches: bool) -> ScalarFunctionImplementation {
                 let res = row.as_ref().map(|v| pattern.is_match(v) == matches);
                 Ok(ColumnarValue::Scalar(ScalarValue::Boolean(res)))
             }
-            ColumnarValue::Scalar(v) => {
-                return Err(DataFusionError::Internal(format!(
-                    "regex_match({}) expected first argument to be utf8, got ('{}')",
-                    matches, v
-                )))
-            }
+            ColumnarValue::Scalar(v) => Err(DataFusionError::Internal(format!(
+                "regex_match({}) expected first argument to be utf8, got ('{}')",
+                matches, v
+            ))),
         }
     };
 
@@ -208,8 +206,7 @@ mod test {
     };
     use datafusion::{
         error::DataFusionError,
-        logical_plan::{col, Expr},
-        prelude::lit,
+        prelude::{col, lit, Expr},
     };
     use datafusion_util::context_with_table;
     use std::sync::Arc;

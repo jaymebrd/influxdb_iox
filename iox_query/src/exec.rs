@@ -10,18 +10,25 @@ mod schema_pivot;
 pub mod seriesset;
 pub(crate) mod split;
 pub mod stringset;
-pub use context::{DEFAULT_CATALOG, DEFAULT_SCHEMA};
 use executor::DedicatedExecutor;
+use object_store::DynObjectStore;
+use parquet_file::storage::StorageId;
+use trace::span::{SpanExt, SpanRecorder};
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
     self,
-    execution::runtime_env::{RuntimeConfig, RuntimeEnv},
-    logical_plan::{normalize_col, plan::Extension, Expr, LogicalPlan},
+    execution::{
+        context::SessionState,
+        runtime_env::{RuntimeConfig, RuntimeEnv},
+    },
+    logical_expr::{expr_rewriter::normalize_col, Extension},
+    logical_expr::{Expr, LogicalPlan},
+    prelude::SessionContext,
 };
 
-pub use context::{IOxSessionConfig, IOxSessionContext};
+pub use context::{IOxSessionConfig, IOxSessionContext, SessionContextIOxExt};
 use schema_pivot::SchemaPivotNode;
 
 use self::{non_null_checker::NonNullCheckerNode, split::StreamSplitNode};
@@ -34,6 +41,39 @@ pub struct ExecutorConfig {
 
     /// Target parallelism for query execution
     pub target_query_partitions: usize,
+
+    /// Object stores
+    pub object_stores: HashMap<StorageId, Arc<DynObjectStore>>,
+}
+
+#[derive(Debug)]
+pub struct DedicatedExecutors {
+    /// Executor for running user queries
+    query_exec: DedicatedExecutor,
+
+    /// Executor for running system/reorganization tasks such as
+    /// compact
+    reorg_exec: DedicatedExecutor,
+
+    /// Number of threads per thread pool
+    num_threads: usize,
+}
+
+impl DedicatedExecutors {
+    pub fn new(num_threads: usize) -> Self {
+        let query_exec = DedicatedExecutor::new("IOx Query Executor Thread", num_threads);
+        let reorg_exec = DedicatedExecutor::new("IOx Reorg Executor Thread", num_threads);
+
+        Self {
+            query_exec,
+            reorg_exec,
+            num_threads,
+        }
+    }
+
+    pub fn num_threads(&self) -> usize {
+        self.num_threads
+    }
 }
 
 /// Handles executing DataFusion plans, and marshalling the results into rust
@@ -43,12 +83,8 @@ pub struct ExecutorConfig {
 /// running, based on a policy
 #[derive(Debug)]
 pub struct Executor {
-    /// Executor for running user queries
-    query_exec: DedicatedExecutor,
-
-    /// Executor for running system/reorganization tasks such as
-    /// compact
-    reorg_exec: DedicatedExecutor,
+    /// Executors
+    executors: Arc<DedicatedExecutors>,
 
     /// The default configuration options with which to create contexts
     config: ExecutorConfig,
@@ -62,6 +98,7 @@ pub struct Executor {
 pub enum ExecutorType {
     /// Run using the pool for queries
     Query,
+
     /// Run using the pool for system / reorganization tasks
     Reorg,
 }
@@ -73,19 +110,39 @@ impl Executor {
         Self::new_with_config(ExecutorConfig {
             num_threads,
             target_query_partitions: num_threads,
+            object_stores: HashMap::default(),
         })
     }
 
     pub fn new_with_config(config: ExecutorConfig) -> Self {
-        let query_exec = DedicatedExecutor::new("IOx Query Executor Thread", config.num_threads);
-        let reorg_exec = DedicatedExecutor::new("IOx Reorg Executor Thread", config.num_threads);
+        let executors = Arc::new(DedicatedExecutors::new(config.num_threads));
+        Self::new_with_config_and_executors(config, executors)
+    }
+
+    /// Low-level constructor.
+    ///
+    /// This is mostly useful if you wanna keep the executors (because they are quiet expensive to create) but need a fresh IOx runtime.
+    ///
+    /// # Panic
+    /// Panics if the number of threads in `executors` is different from `config`.
+    pub fn new_with_config_and_executors(
+        config: ExecutorConfig,
+        executors: Arc<DedicatedExecutors>,
+    ) -> Self {
+        assert_eq!(config.num_threads, executors.num_threads);
 
         let runtime_config = RuntimeConfig::new();
+
+        for (id, store) in &config.object_stores {
+            runtime_config
+                .object_store_registry
+                .register_store("iox", id, Arc::clone(store));
+        }
+
         let runtime = Arc::new(RuntimeEnv::new(runtime_config).expect("creating runtime"));
 
         Self {
-            query_exec,
-            reorg_exec,
+            executors,
             config,
             runtime,
         }
@@ -100,6 +157,18 @@ impl Executor {
             .with_target_partitions(self.config.target_query_partitions)
     }
 
+    /// Get IOx context from DataFusion state.
+    pub fn new_context_from_df(
+        &self,
+        executor_type: ExecutorType,
+        state: &SessionState,
+    ) -> IOxSessionContext {
+        let inner = SessionContext::with_state(state.clone());
+        let exec = self.executor(executor_type).clone();
+        let recorder = SpanRecorder::new(state.span_ctx().child_span("Query Execution"));
+        IOxSessionContext::new(inner, Some(exec), recorder)
+    }
+
     /// Create a new execution context, suitable for executing a new query or system task
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
@@ -110,15 +179,15 @@ impl Executor {
     /// Return the execution pool  of the specified type
     fn executor(&self, executor_type: ExecutorType) -> &DedicatedExecutor {
         match executor_type {
-            ExecutorType::Query => &self.query_exec,
-            ExecutorType::Reorg => &self.reorg_exec,
+            ExecutorType::Query => &self.executors.query_exec,
+            ExecutorType::Reorg => &self.executors.reorg_exec,
         }
     }
 
     /// Initializes shutdown.
     pub fn shutdown(&self) {
-        self.query_exec.shutdown();
-        self.reorg_exec.shutdown();
+        self.executors.query_exec.shutdown();
+        self.executors.reorg_exec.shutdown();
     }
 
     /// Stops all subsequent task executions, and waits for the worker
@@ -128,8 +197,8 @@ impl Executor {
     /// executing thread to complete. All other calls to join will
     /// complete immediately.
     pub async fn join(&self) {
-        self.query_exec.join().await;
-        self.reorg_exec.join().await;
+        self.executors.query_exec.join().await;
+        self.executors.reorg_exec.join().await;
     }
 }
 
@@ -248,12 +317,12 @@ pub trait ExecutionContextProvider {
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{ArrayRef, Int64Array, StringBuilder},
+        array::{ArrayRef, Int64Array, StringArray},
         datatypes::{DataType, Field, Schema, SchemaRef},
     };
     use datafusion::{
-        datasource::MemTable,
-        logical_plan::{provider_as_source, LogicalPlanBuilder},
+        datasource::{provider_as_source, MemTable},
+        logical_expr::LogicalPlanBuilder,
     };
     use stringset::StringSet;
 
@@ -362,10 +431,8 @@ mod tests {
         // Ensure that nulls in the output set are handled reasonably
         // (error, rather than silently ignored)
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
-        let mut builder = StringBuilder::new(2);
-        builder.append_value("foo").unwrap();
-        builder.append_null().unwrap();
-        let data = Arc::new(builder.finish());
+        let array = StringArray::from_iter(vec![Some("foo"), None]);
+        let data = Arc::new(array);
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![data])
             .expect("created new record batch");
         let scan = make_plan(schema, vec![batch]);
@@ -448,11 +515,8 @@ mod tests {
     }
 
     fn to_string_array(strs: &[&str]) -> ArrayRef {
-        let mut builder = StringBuilder::new(strs.len());
-        for s in strs {
-            builder.append_value(s).expect("appending string");
-        }
-        Arc::new(builder.finish())
+        let array: StringArray = strs.iter().map(|s| Some(*s)).collect();
+        Arc::new(array)
     }
 
     // creates a DataFusion plan that reads the RecordBatches into memory

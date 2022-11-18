@@ -1,15 +1,17 @@
 [package]
 name = "influxdb_storage_client"
-version = "0.1.0"
-authors = ["Raphael Taylor-Davies <r.taylordavies@googlemail.com>"]
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 client_util = { path = "../client_util" }
-generated_types = { path = "../generated_types", default-features=false }
-prost = "0.10"
-tonic = { version = "0.7" }
+generated_types = { path = "../generated_types", default-features=false, features=["data_types"] }
+prost = "0.11"
+tonic = { version = "0.8" }
 futures-util = { version = "0.3" }
+observability_deps = { path = "../observability_deps"}
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]

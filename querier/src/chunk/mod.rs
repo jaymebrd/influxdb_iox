@@ -1,25 +1,20 @@
 //! Querier Chunks
 
+use crate::cache::namespace::CachedTable;
 use crate::cache::CatalogCache;
 use data_types::{
-    ChunkId, ChunkOrder, ColumnId, DeletePredicate, ParquetFile, ParquetFileId, PartitionId,
-    SequenceNumber, SequencerId, TableSummary, TimestampMinMax,
+    ChunkId, ChunkOrder, ColumnId, CompactionLevel, DeletePredicate, ParquetFile, ParquetFileId,
+    PartitionId, SequenceNumber, ShardId, TableSummary,
 };
 use iox_catalog::interface::Catalog;
-use parking_lot::RwLock;
-use parquet_file::{chunk::ParquetChunk, storage::ParquetStorage};
-use read_buffer::RBChunk;
+use iox_query::util::create_basic_summary;
+use parquet_file::chunk::ParquetChunk;
 use schema::{sort::SortKey, Schema};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
+use trace::span::{Span, SpanRecorder};
 use uuid::Uuid;
 
-use self::util::create_basic_summary;
-
 mod query_access;
-pub(crate) mod util;
 
 /// Immutable metadata attached to a [`QuerierChunk`].
 #[derive(Debug)]
@@ -30,26 +25,23 @@ pub struct ChunkMeta {
     /// The ID of the chunk
     chunk_id: ChunkId,
 
-    /// Table name
-    table_name: Arc<str>,
-
     /// Chunk order.
     order: ChunkOrder,
 
     /// Sort key.
     sort_key: Option<SortKey>,
 
-    /// Sequencer that created the data within this chunk.
-    sequencer_id: SequencerId,
+    /// Shard that created the data within this chunk.
+    shard_id: ShardId,
 
     /// Partition ID.
     partition_id: PartitionId,
 
-    /// The minimum sequence number within this chunk.
-    min_sequence_number: SequenceNumber,
-
     /// The maximum sequence number within this chunk.
     max_sequence_number: SequenceNumber,
+
+    /// Compaction level of the parquet file of the chunk
+    compaction_level: CompactionLevel,
 }
 
 impl ChunkMeta {
@@ -68,9 +60,9 @@ impl ChunkMeta {
         self.sort_key.as_ref()
     }
 
-    /// Sequencer that created the data within this chunk.
-    pub fn sequencer_id(&self) -> SequencerId {
-        self.sequencer_id
+    /// Shard that created the data within this chunk.
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Partition ID.
@@ -78,115 +70,15 @@ impl ChunkMeta {
         self.partition_id
     }
 
-    /// The minimum sequence number within this chunk.
-    pub fn min_sequence_number(&self) -> SequenceNumber {
-        self.min_sequence_number
-    }
-
     /// The maximum sequence number within this chunk.
     pub fn max_sequence_number(&self) -> SequenceNumber {
         self.max_sequence_number
     }
-}
 
-/// Internal [`QuerierChunk`] stage, i.e. how the data is loaded/organized.
-#[derive(Debug)]
-enum ChunkStage {
-    ReadBuffer {
-        /// Underlying read buffer chunk
-        rb_chunk: Arc<RBChunk>,
-
-        /// Table summary
-        table_summary: Arc<TableSummary>,
-    },
-    Parquet {
-        /// Chunk of the Parquet file
-        parquet_chunk: Arc<ParquetChunk>,
-
-        /// Table summary
-        table_summary: Arc<TableSummary>,
-    },
-}
-
-impl ChunkStage {
-    /// Get stage-specific table summary.
-    ///
-    /// The table summary may improve if we have more chunk information (e.g. when the actual data was loaded into
-    /// memory).
-    pub fn table_summary(&self) -> &Arc<TableSummary> {
-        match self {
-            Self::Parquet { table_summary, .. } => table_summary,
-            Self::ReadBuffer { table_summary, .. } => table_summary,
-        }
+    /// Compaction level of the parquet file of the chunk
+    pub fn compaction_level(&self) -> CompactionLevel {
+        self.compaction_level
     }
-
-    /// Machine- and human-readable name of the stage.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Parquet { .. } => "parquet",
-            Self::ReadBuffer { .. } => "read_buffer",
-        }
-    }
-
-    pub fn load_to_read_buffer(&mut self, rb_chunk: Arc<RBChunk>) {
-        match self {
-            Self::Parquet { .. } => {
-                let table_summary = Arc::new(rb_chunk.table_summary());
-
-                *self = Self::ReadBuffer {
-                    rb_chunk,
-                    table_summary,
-                };
-            }
-            Self::ReadBuffer { .. } => {
-                // RB already loaded
-            }
-        }
-    }
-}
-
-impl From<Arc<ParquetChunk>> for ChunkStage {
-    fn from(parquet_chunk: Arc<ParquetChunk>) -> Self {
-        let table_summary = Arc::new(create_basic_summary(
-            parquet_chunk.rows() as u64,
-            &parquet_chunk.schema(),
-            parquet_chunk.timestamp_min_max(),
-        ));
-        Self::Parquet {
-            parquet_chunk,
-            table_summary,
-        }
-    }
-}
-
-impl From<Arc<RBChunk>> for ChunkStage {
-    fn from(rb_chunk: Arc<RBChunk>) -> Self {
-        let table_summary = Arc::new(rb_chunk.table_summary());
-        Self::ReadBuffer {
-            rb_chunk,
-            table_summary,
-        }
-    }
-}
-
-/// Controls if/how data for a [`QuerierChunk`] is loaded
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QuerierChunkLoadSetting {
-    /// Only stay in parquet mode and never use read buffer data.
-    ParquetOnly,
-
-    /// Only use read buffer data.
-    ///
-    /// This forces the querier to load the read buffer for this chunk.
-    ReadBufferOnly,
-
-    /// Default "on-demand" handling.
-    ///
-    /// When the chunk is created, it will look up if there is already read buffer data loaded (or loading is already in
-    /// progress) and is that. Otherwise it will parquet. If the actual payload is request (via
-    /// [`QueryChunk::read_filter`](iox_query::QueryChunk::read_filter)) then it will force-load the read buffer.
-    #[default]
-    OnDemand,
 }
 
 #[derive(Debug)]
@@ -197,87 +89,41 @@ pub struct QuerierChunk {
     /// Schema of the chunk
     schema: Arc<Schema>,
 
-    /// min/max time range of this chunk
-    timestamp_min_max: TimestampMinMax,
-
     /// Delete predicates to be combined with the chunk
     delete_predicates: Vec<Arc<DeletePredicate>>,
 
     /// Partition sort key (how does the read buffer use this?)
     partition_sort_key: Arc<Option<SortKey>>,
 
-    /// Cache
-    catalog_cache: Arc<CatalogCache>,
+    /// Chunk of the Parquet file
+    parquet_chunk: Arc<ParquetChunk>,
 
-    /// Object store.
-    ///
-    /// Internally, `ParquetStorage` wraps the actual store implementation in an `Arc`, so
-    /// `ParquetStorage` is cheap to clone.
-    store: ParquetStorage,
-
-    /// Current stage.
-    ///
-    /// Wrapped in an `Arc` so we can move it into a future/stream this is detached from `self`.
-    stage: Arc<RwLock<ChunkStage>>,
-
-    /// Load setting.
-    load_setting: QuerierChunkLoadSetting,
+    /// Table summary
+    table_summary: Arc<TableSummary>,
 }
 
 impl QuerierChunk {
     /// Create new parquet-backed chunk (object store data).
-    pub async fn new(
+    pub fn new(
         parquet_chunk: Arc<ParquetChunk>,
         meta: Arc<ChunkMeta>,
         partition_sort_key: Arc<Option<SortKey>>,
-        catalog_cache: Arc<CatalogCache>,
-        store: ParquetStorage,
-        load_setting: QuerierChunkLoadSetting,
     ) -> Self {
         let schema = parquet_chunk.schema();
-        let timestamp_min_max = parquet_chunk.timestamp_min_max();
 
-        // maybe load read buffer
-        let rb_chunk = match load_setting {
-            QuerierChunkLoadSetting::ParquetOnly => {
-                // never load
-                None
-            }
-            QuerierChunkLoadSetting::OnDemand => {
-                // depends on cache state
-                catalog_cache.read_buffer().peek(meta.parquet_file_id).await
-            }
-            QuerierChunkLoadSetting::ReadBufferOnly => {
-                // force load
-                Some(
-                    catalog_cache
-                        .read_buffer()
-                        .get(
-                            Arc::clone(parquet_chunk.parquet_file()),
-                            Arc::clone(&schema),
-                            store.clone(),
-                        )
-                        .await,
-                )
-            }
-        };
-
-        let stage: ChunkStage = if let Some(rb_chunk) = rb_chunk {
-            rb_chunk.into()
-        } else {
-            parquet_chunk.into()
-        };
+        let table_summary = Arc::new(create_basic_summary(
+            parquet_chunk.rows() as u64,
+            &parquet_chunk.schema(),
+            parquet_chunk.timestamp_min_max(),
+        ));
 
         Self {
             meta,
             delete_predicates: Vec::new(),
             partition_sort_key,
-            catalog_cache,
             schema,
-            timestamp_min_max,
-            stage: Arc::new(RwLock::new(stage)),
-            store,
-            load_setting,
+            parquet_chunk,
+            table_summary,
         }
     }
 
@@ -301,6 +147,14 @@ impl QuerierChunk {
             ..self
         }
     }
+
+    pub fn estimate_size(&self) -> usize {
+        self.parquet_chunk.parquet_file().file_size_bytes as usize
+    }
+
+    pub fn rows(&self) -> usize {
+        self.parquet_chunk.rows()
+    }
 }
 
 /// Adapter that can create chunks.
@@ -309,32 +163,16 @@ pub struct ChunkAdapter {
     /// Cache
     catalog_cache: Arc<CatalogCache>,
 
-    /// Object store.
-    ///
-    /// Internally, `ParquetStorage` wraps the actual store implementation in an `Arc`, so
-    /// `ParquetStorage` is cheap to clone.
-    store: ParquetStorage,
-
     /// Metric registry.
     metric_registry: Arc<metric::Registry>,
-
-    /// Load settings for chunks
-    load_settings: HashMap<ParquetFileId, QuerierChunkLoadSetting>,
 }
 
 impl ChunkAdapter {
     /// Create new adapter with empty cache.
-    pub fn new(
-        catalog_cache: Arc<CatalogCache>,
-        store: ParquetStorage,
-        metric_registry: Arc<metric::Registry>,
-        load_settings: HashMap<ParquetFileId, QuerierChunkLoadSetting>,
-    ) -> Self {
+    pub fn new(catalog_cache: Arc<CatalogCache>, metric_registry: Arc<metric::Registry>) -> Self {
         Self {
             catalog_cache,
-            store,
             metric_registry,
-            load_settings,
         }
     }
 
@@ -355,85 +193,68 @@ impl ChunkAdapter {
 
     pub async fn new_chunk(
         &self,
-        namespace_name: Arc<str>,
+        cached_table: Arc<CachedTable>,
         parquet_file: Arc<ParquetFile>,
+        span: Option<Span>,
     ) -> Option<QuerierChunk> {
+        let span_recorder = SpanRecorder::new(span);
         let parts = self
-            .chunk_parts(namespace_name, Arc::clone(&parquet_file))
+            .chunk_parts(
+                cached_table,
+                Arc::clone(&parquet_file),
+                span_recorder.child_span("chunk_parts"),
+            )
             .await?;
 
         let parquet_chunk = Arc::new(ParquetChunk::new(
             parquet_file,
             parts.schema,
-            self.store.clone(),
+            self.catalog_cache.parquet_store(),
         ));
-        let load_settings = self
-            .load_settings
-            .get(&parts.meta.parquet_file_id)
-            .copied()
-            .unwrap_or_default();
 
-        Some(
-            QuerierChunk::new(
-                parquet_chunk,
-                parts.meta,
-                parts.partition_sort_key,
-                Arc::clone(&self.catalog_cache),
-                self.store.clone(),
-                load_settings,
-            )
-            .await,
-        )
+        Some(QuerierChunk::new(
+            parquet_chunk,
+            parts.meta,
+            parts.partition_sort_key,
+        ))
     }
 
     async fn chunk_parts(
         &self,
-        namespace_name: Arc<str>,
+        cached_table: Arc<CachedTable>,
         parquet_file: Arc<ParquetFile>,
+        span: Option<Span>,
     ) -> Option<ChunkParts> {
-        // gather schema information
-        let file_column_ids: HashSet<ColumnId> = parquet_file.column_set.iter().copied().collect();
-        let table_name = self
-            .catalog_cache
-            .table()
-            .name(parquet_file.table_id)
-            .await?;
-        let namespace_schema = self
-            .catalog_cache
-            .namespace()
-            .schema(namespace_name, &[(&table_name, &file_column_ids)])
-            .await?;
-        let table_schema_catalog = namespace_schema.tables.get(table_name.as_ref())?;
-        let column_id_lookup = table_schema_catalog.column_id_map();
-        let file_columns: HashSet<&str> = file_column_ids
-            .iter()
-            .flat_map(|id| column_id_lookup.get(id).copied())
-            .collect();
-        let table_schema: Schema = table_schema_catalog
-            .clone()
-            .try_into()
-            .expect("Invalid table schema in catalog");
-        let table_columns: HashSet<&str> = table_schema
-            .iter()
-            .map(|(_t, field)| field.name().as_str())
-            .collect();
-        for file_col in &file_columns {
-            assert!(
-                table_columns.contains(*file_col),
-                "Column '{file_col}' occurs in parquet file but is not part of the table schema",
-            )
-        }
+        let span_recorder = SpanRecorder::new(span);
 
-        // gather partition sort key
-        let relevant_pk_columns: HashSet<&str> = table_schema
+        let parquet_file_cols: HashMap<&str, ColumnId> = parquet_file
+            .column_set
+            .iter()
+            .map(|id| {
+                let name = cached_table
+                    .column_id_map
+                    .get(id)
+                    .expect("catalog has all columns")
+                    .as_ref();
+                (name, *id)
+            })
+            .collect();
+
+        // relevant_pk_columns is everything from the primary key for the table, that is actually in this parquet file
+        let relevant_pk_columns: Vec<_> = cached_table
+            .schema
             .primary_key()
             .into_iter()
-            .filter(|c| file_columns.contains(c))
+            .filter(|c| parquet_file_cols.contains_key(*c))
             .collect();
         let partition_sort_key = self
             .catalog_cache
             .partition()
-            .sort_key(parquet_file.partition_id, &relevant_pk_columns)
+            .sort_key(
+                parquet_file.partition_id,
+                &relevant_pk_columns,
+                span_recorder.child_span("cache GET partition sort key"),
+            )
             .await;
         let partition_sort_key_ref = partition_sort_key
             .as_ref()
@@ -449,20 +270,27 @@ impl ChunkAdapter {
         // IMPORTANT: Do NOT use the sort key to list columns because the sort key only contains primary-key columns.
         // NOTE: The schema that we calculate here may have a different column order than the actual parquet file. This
         //       is OK because the IOx parquet reader can deal with that (see #4921).
-        let column_names: Vec<_> = table_schema
+        let column_ids: Vec<_> = cached_table
+            .schema
             .iter()
-            .map(|(_t, field)| field.name().as_str())
-            .filter(|col| file_columns.contains(*col))
+            .filter_map(|(_, field)| {
+                let name = field.name();
+                parquet_file_cols.get(name.as_str()).copied()
+            })
             .collect();
-        let schema = Arc::new(
-            table_schema
-                .select_by_names(&column_names)
-                .expect("Bug in schema projection"),
-        );
+        let schema = self
+            .catalog_cache
+            .projected_schema()
+            .get(
+                cached_table,
+                column_ids,
+                span_recorder.child_span("cache GET projected schema"),
+            )
+            .await;
 
         // calculate sort key
         let pk_cols = schema.primary_key();
-        let sort_key = partition_sort_key_ref.filter_to(&pk_cols);
+        let sort_key = partition_sort_key_ref.filter_to(&pk_cols, parquet_file.partition_id.get());
         assert!(
             !sort_key.is_empty(),
             "Sort key can never be empty because there should at least be a time column",
@@ -475,13 +303,12 @@ impl ChunkAdapter {
         let meta = Arc::new(ChunkMeta {
             parquet_file_id: parquet_file.id,
             chunk_id,
-            table_name,
             order,
             sort_key: Some(sort_key),
-            sequencer_id: parquet_file.sequencer_id,
+            shard_id: parquet_file.shard_id,
             partition_id: parquet_file.partition_id,
-            min_sequence_number: parquet_file.min_sequence_number,
             max_sequence_number: parquet_file.max_sequence_number,
+            compaction_level: parquet_file.compaction_level,
         });
 
         Some(ChunkParts {
@@ -500,63 +327,30 @@ struct ChunkParts {
 
 #[cfg(test)]
 pub mod tests {
+    use crate::cache::namespace::CachedNamespace;
+
     use super::*;
     use arrow::{datatypes::DataType, record_batch::RecordBatch};
     use arrow_util::assert_batches_eq;
-    use data_types::ColumnType;
-    use futures::StreamExt;
-    use iox_query::{exec::IOxSessionContext, QueryChunk, QueryChunkMeta};
+    use data_types::{ColumnType, NamespaceSchema};
+    use iox_query::{
+        exec::{ExecutorType, IOxSessionContext},
+        QueryChunk, QueryChunkMeta,
+    };
     use iox_tests::util::{TestCatalog, TestNamespace, TestParquetFileBuilder};
     use metric::{Attributes, Observation, RawReporter};
-    use schema::{builder::SchemaBuilder, selection::Selection, sort::SortKeyBuilder};
+    use schema::{builder::SchemaBuilder, sort::SortKeyBuilder};
     use test_helpers::maybe_start_logging;
-
-    #[tokio::test]
-    async fn test_new_rb_chunk() {
-        maybe_start_logging();
-        let test_data = TestData::new(QuerierChunkLoadSetting::ReadBufferOnly).await;
-
-        // create chunk
-        let chunk = test_data.chunk().await;
-
-        // check state
-        assert_eq!(chunk.chunk_type(), "read_buffer");
-
-        // measure catalog access
-        let catalog_metrics1 = test_data.get_catalog_access_metrics();
-
-        // check chunk schema
-        assert_schema(&chunk);
-
-        // check sort key
-        assert_sort_key(&chunk);
-
-        // back up table summary
-        let table_summary_1 = chunk.summary().unwrap();
-
-        // check if chunk can be queried
-        assert_content(&chunk).await;
-
-        // check state again
-        assert_eq!(chunk.chunk_type(), "read_buffer");
-
-        // summary has NOT changed
-        let table_summary_2 = chunk.summary().unwrap();
-        assert_eq!(table_summary_1, table_summary_2);
-
-        // retrieving the chunk again should not require any catalog requests
-        test_data.chunk().await;
-        let catalog_metrics2 = test_data.get_catalog_access_metrics();
-        assert_eq!(catalog_metrics1, catalog_metrics2);
-    }
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_new_parquet_chunk() {
         maybe_start_logging();
-        let test_data = TestData::new(QuerierChunkLoadSetting::ParquetOnly).await;
+        let test_data = TestData::new().await;
+        let namespace_schema = Arc::new(test_data.ns.schema().await);
 
         // create chunk
-        let chunk = test_data.chunk().await;
+        let chunk = test_data.chunk(Arc::clone(&namespace_schema)).await;
 
         // check state
         assert_eq!(chunk.chunk_type(), "parquet");
@@ -571,77 +365,33 @@ pub mod tests {
         assert_sort_key(&chunk);
 
         // back up table summary
-        let table_summary_1 = chunk.summary().unwrap();
+        let table_summary_1 = chunk.summary();
 
         // check if chunk can be queried
-        assert_content(&chunk).await;
+        assert_content(&chunk, &test_data).await;
 
         // check state again
         assert_eq!(chunk.chunk_type(), "parquet");
 
         // summary has NOT changed
-        let table_summary_2 = chunk.summary().unwrap();
+        let table_summary_2 = chunk.summary();
         assert_eq!(table_summary_1, table_summary_2);
 
         // retrieving the chunk again should not require any catalog requests
-        test_data.chunk().await;
-        let catalog_metrics2 = test_data.get_catalog_access_metrics();
-        assert_eq!(catalog_metrics1, catalog_metrics2);
-    }
-
-    #[tokio::test]
-    async fn test_new_on_demand_chunk() {
-        maybe_start_logging();
-        let test_data = TestData::new(QuerierChunkLoadSetting::OnDemand).await;
-
-        // create chunk
-        let chunk = test_data.chunk().await;
-
-        // check state
-        assert_eq!(chunk.chunk_type(), "parquet");
-
-        // measure catalog access
-        let catalog_metrics1 = test_data.get_catalog_access_metrics();
-
-        // check chunk schema
-        assert_schema(&chunk);
-
-        // check sort key
-        assert_sort_key(&chunk);
-
-        // back up table summary
-        let table_summary_1 = chunk.summary().unwrap();
-
-        // check if chunk can be queried
-        assert_content(&chunk).await;
-
-        // check state again
-        assert_eq!(chunk.chunk_type(), "read_buffer");
-
-        // summary has changed
-        let table_summary_2 = chunk.summary().unwrap();
-        assert_ne!(table_summary_1, table_summary_2);
-
-        // retrieving the chunk again should not require any catalog requests
-        test_data.chunk().await;
+        test_data.chunk(namespace_schema).await;
         let catalog_metrics2 = test_data.get_catalog_access_metrics();
         assert_eq!(catalog_metrics1, catalog_metrics2);
     }
 
     /// collect data for the given chunk
-    async fn collect_read_filter(chunk: &dyn QueryChunk) -> Vec<RecordBatch> {
+    async fn collect_read_filter(
+        chunk: &dyn QueryChunk,
+        ctx: IOxSessionContext,
+    ) -> Vec<RecordBatch> {
         chunk
-            .read_filter(
-                IOxSessionContext::default(),
-                &Default::default(),
-                Selection::All,
-            )
-            .unwrap()
-            .collect::<Vec<_>>()
+            .data()
+            .read_to_batches(chunk.schema(), ctx.inner())
             .await
-            .into_iter()
-            .map(Result::unwrap)
-            .collect()
     }
 
     struct TestData {
@@ -652,7 +402,7 @@ pub mod tests {
     }
 
     impl TestData {
-        async fn new(load_settings: QuerierChunkLoadSetting) -> Self {
+        async fn new() -> Self {
             let catalog = TestCatalog::new();
 
             let lp = vec![
@@ -661,8 +411,8 @@ pub mod tests {
                 "table,tag1=UT field_int=70i 20000",
             ]
             .join("\n");
-            let ns = catalog.create_namespace("ns").await;
-            let sequencer = ns.create_sequencer(1).await;
+            let ns = catalog.create_namespace_1hr_retention("ns").await;
+            let shard = ns.create_shard(1).await;
             let table = ns.create_table("table").await;
             table.create_column("tag1", ColumnType::Tag).await;
             table.create_column("tag2", ColumnType::Tag).await;
@@ -671,7 +421,7 @@ pub mod tests {
             table.create_column("field_float", ColumnType::F64).await;
             table.create_column("time", ColumnType::Time).await;
             let partition = table
-                .with_sequencer(&sequencer)
+                .with_shard(&shard)
                 .create_partition("part")
                 .await
                 .update_sort_key(SortKey::from_columns(["tag1", "tag2", "tag4", "time"]))
@@ -684,11 +434,10 @@ pub mod tests {
                     catalog.catalog(),
                     catalog.time_provider(),
                     catalog.metric_registry(),
-                    usize::MAX,
+                    catalog.object_store(),
+                    &Handle::current(),
                 )),
-                ParquetStorage::new(catalog.object_store()),
                 catalog.metric_registry(),
-                HashMap::from([(parquet_file.id, load_settings)]),
             );
 
             Self {
@@ -699,11 +448,14 @@ pub mod tests {
             }
         }
 
-        async fn chunk(&self) -> QuerierChunk {
+        async fn chunk(&self, namespace_schema: Arc<NamespaceSchema>) -> QuerierChunk {
+            let cached_namespace: CachedNamespace = namespace_schema.as_ref().clone().into();
+            let cached_table = cached_namespace.tables.get("table").expect("table exists");
             self.adapter
                 .new_chunk(
-                    self.ns.namespace.name.clone().into(),
+                    Arc::clone(cached_table),
                     Arc::clone(&self.parquet_file),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -738,6 +490,7 @@ pub mod tests {
     fn assert_schema(chunk: &QuerierChunk) {
         let expected_schema = SchemaBuilder::new()
             .field("field_int", DataType::Int64)
+            .unwrap()
             .tag("tag1")
             .timestamp()
             .build()
@@ -755,8 +508,16 @@ pub mod tests {
         assert_eq!(actual_sort_key, &expected_sort_key);
     }
 
-    async fn assert_content(chunk: &QuerierChunk) {
-        let batches = collect_read_filter(chunk).await;
+    async fn assert_content(chunk: &QuerierChunk, test_data: &TestData) {
+        let ctx = test_data.catalog.exec.new_context(ExecutorType::Query);
+        let parquet_store = test_data.adapter.catalog_cache.parquet_store();
+        ctx.inner().runtime_env().register_object_store(
+            "iox",
+            parquet_store.id(),
+            Arc::clone(parquet_store.object_store()),
+        );
+
+        let batches = collect_read_filter(chunk, ctx).await;
 
         assert_batches_eq!(
             &[

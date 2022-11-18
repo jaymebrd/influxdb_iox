@@ -15,17 +15,18 @@ mod server_type;
 mod steps;
 mod udp_listener;
 
+pub use addrs::BindAddresses;
 pub use client::*;
 pub use config::TestConfig;
 pub use data_generator::DataGenerator;
 pub use grpc::GrpcRequestBuilder;
 pub use mini_cluster::MiniCluster;
 pub use server_fixture::{ServerFixture, TestServer};
-pub use server_type::ServerType;
+pub use server_type::{AddAddrEnv, ServerType};
 pub use steps::{FCustom, Step, StepTest, StepTestState};
 pub use udp_listener::UdpCapture;
 
-/// Return a random string suitable for use as a database name
+/// Return a random string suitable for use as a namespace name
 pub fn rand_name() -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)
@@ -51,13 +52,63 @@ pub fn rand_id() -> String {
         .collect()
 }
 
+/// Log the [`std::process::Command`] being run in a way that's convenient to copy-paste
+fn log_command(command: &std::process::Command) {
+    use observability_deps::tracing::info;
+
+    let envs_for_printing: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                key.to_str().unwrap(),
+                value.unwrap_or_default().to_str().unwrap()
+            )
+        })
+        .collect();
+    let envs_for_printing = envs_for_printing.join(" ");
+
+    info!("Running command: `{envs_for_printing} {:?}`", command);
+}
+
+/// Dumps the content of the log file to stdout
+fn dump_log_to_stdout(server_type: &str, log_path: &std::path::Path) {
+    use observability_deps::tracing::info;
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(log_path).expect("failed to open log file");
+    let mut buffer = [0_u8; 8 * 1024];
+
+    info!("****************");
+    info!("Start {server_type} Output");
+    info!("****************");
+
+    while let Ok(read) = f.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        if let Ok(str) = std::str::from_utf8(&buffer[..read]) {
+            print!("{}", str);
+        } else {
+            info!(
+                "\n\n-- ERROR IN TRANSFER -- please see {:?} for raw contents ---\n\n",
+                log_path
+            );
+        }
+    }
+
+    info!("****************");
+    info!("End {server_type} Output");
+    info!("****************");
+}
+
 // Helper macro to skip tests if TEST_INTEGRATION and TEST_INFLUXDB_IOX_CATALOG_DSN environment
 // variables are not set.
 #[macro_export]
 macro_rules! maybe_skip_integration {
     () => {{
         use std::env;
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         match (
             env::var("TEST_INTEGRATION").is_ok(),

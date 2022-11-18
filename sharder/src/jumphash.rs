@@ -1,20 +1,12 @@
 use super::Sharder;
-use data_types::{DatabaseName, DeletePredicate};
+use data_types::{DeletePredicate, NamespaceName};
 use mutable_batch::MutableBatch;
 use siphasher::sip::SipHasher13;
-use snafu::{ensure, Snafu};
 use std::{
     fmt::Debug,
     hash::{Hash, Hasher},
     sync::Arc,
 };
-
-#[derive(Snafu, Debug)]
-#[allow(missing_docs)]
-pub enum Error {
-    #[snafu(display("Cannot initialize sharder with no shards"))]
-    NoShards,
-}
 
 /// A [`JumpHash`] maps operations for a given table in a given namespace
 /// consistently to the same shard, irrespective of the operation itself with
@@ -47,7 +39,7 @@ impl<T> JumpHash<T> {
     /// # Panics
     ///
     /// This constructor panics if the number of elements in `shards` is 0.
-    pub fn new(shards: impl IntoIterator<Item = T>) -> Result<Self, Error> {
+    pub fn new(shards: impl IntoIterator<Item = T>) -> Self {
         // A randomly generated static siphash key to ensure all router
         // instances hash the same input to the same u64 sharding key.
         //
@@ -58,12 +50,12 @@ impl<T> JumpHash<T> {
         ];
 
         let shards = shards.into_iter().collect::<Vec<_>>();
-        ensure!(!shards.is_empty(), NoShardsSnafu,);
+        assert!(!shards.is_empty(), "empty shard set given to sharder");
 
-        Ok(Self {
+        Self {
             hasher: SipHasher13::new_with_key(&key),
             shards,
-        })
+        }
     }
 
     /// Return a slice of all the shards this instance is configured with,
@@ -121,10 +113,11 @@ struct HashKey<'a> {
     namespace: &'a str,
 }
 
-/// A [`JumpHash`] sharder mapping a [`MutableBatch`] reference according to
-/// the namespace it is destined for.
-/// This currently doesn't use any information about the payload, just encodes that a MutableBatch
-/// will always be sharded to one `Arc<T>`.
+/// A [`JumpHash`] sharder mapping a [`MutableBatch`] reference according to the
+/// namespace it is destined for.
+///
+/// This currently doesn't use any information about the payload, just encodes
+/// that a MutableBatch will always be sharded to one `Arc<T>`.
 impl<T> Sharder<MutableBatch> for JumpHash<Arc<T>>
 where
     T: Debug + Send + Sync,
@@ -134,10 +127,12 @@ where
     fn shard(
         &self,
         table: &str,
-        namespace: &DatabaseName<'_>,
+        namespace: &NamespaceName<'_>,
         _payload: &MutableBatch,
     ) -> Self::Item {
-        Arc::clone(self.shard_for_query(table, namespace.as_ref()))
+        // Because the MutableBatch is not (currently) used to derive the shard
+        // destination, delegate to the "no payload" sharder.
+        Self::shard(self, table, namespace, &())
     }
 }
 
@@ -154,7 +149,7 @@ where
     fn shard(
         &self,
         table: &str,
-        namespace: &DatabaseName<'_>,
+        namespace: &NamespaceName<'_>,
         _payload: &DeletePredicate,
     ) -> Self::Item {
         // A delete that does not specify a table is mapped to all shards.
@@ -171,20 +166,30 @@ where
     }
 }
 
+impl<T> Sharder<()> for JumpHash<Arc<T>>
+where
+    T: Debug + Send + Sync,
+{
+    type Item = Arc<T>;
+
+    fn shard(&self, table: &str, namespace: &NamespaceName<'_>, _payload: &()) -> Self::Item {
+        Arc::clone(self.shard_for_query(table, namespace.as_ref()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use data_types::TimestampRange;
     use hashbrown::HashMap;
     use std::iter;
-    use test_helpers::assert_error;
 
     #[test]
     fn test_consistent_hashing() {
         const NUM_TESTS: usize = 10_000;
         const NUM_SHARDS: usize = 10;
 
-        let hasher = JumpHash::new(0..NUM_SHARDS).unwrap();
+        let hasher = JumpHash::new(0..NUM_SHARDS);
 
         // Create a HashMap<key, shard> to verify against.
         let mappings = (0..NUM_TESTS)
@@ -203,7 +208,7 @@ mod tests {
             .all(|(&key, &value)| hasher.hash(key) == value));
 
         // Reinitialise the hasher with the same (default) key
-        let hasher = JumpHash::new(0..NUM_SHARDS).unwrap();
+        let hasher = JumpHash::new(0..NUM_SHARDS);
 
         // And assert the mappings are the same
         assert!(mappings
@@ -211,9 +216,7 @@ mod tests {
             .all(|(&key, &value)| hasher.hash(key) == value));
 
         // Reinitialise the hasher with the a different key
-        let hasher = JumpHash::new(0..NUM_SHARDS)
-            .unwrap()
-            .with_seed_key(&[42; 16]);
+        let hasher = JumpHash::new(0..NUM_SHARDS).with_seed_key(&[42; 16]);
 
         // And assert the mappings are the NOT all same (some may be the same)
         assert!(!mappings
@@ -223,28 +226,28 @@ mod tests {
 
     #[test]
     fn test_sharder_impl() {
-        let hasher = JumpHash::new((0..10_000).map(Arc::new)).unwrap();
+        let hasher = JumpHash::new((0..10_000).map(Arc::new));
 
         let a = hasher.shard(
             "table",
-            &DatabaseName::try_from("namespace").unwrap(),
+            &NamespaceName::try_from("namespace").unwrap(),
             &MutableBatch::default(),
         );
         let b = hasher.shard(
             "table",
-            &DatabaseName::try_from("namespace2").unwrap(),
+            &NamespaceName::try_from("namespace2").unwrap(),
             &MutableBatch::default(),
         );
         assert_ne!(a, b);
 
         let a = hasher.shard(
             "table",
-            &DatabaseName::try_from("namespace").unwrap(),
+            &NamespaceName::try_from("namespace").unwrap(),
             &MutableBatch::default(),
         );
         let b = hasher.shard(
             "table2",
-            &DatabaseName::try_from("namespace").unwrap(),
+            &NamespaceName::try_from("namespace").unwrap(),
             &MutableBatch::default(),
         );
         assert_ne!(a, b);
@@ -255,12 +258,12 @@ mod tests {
         // Assert payloads are ignored for this sharder
         let a = hasher.shard(
             "table",
-            &DatabaseName::try_from("namespace").unwrap(),
+            &NamespaceName::try_from("namespace").unwrap(),
             &MutableBatch::default(),
         );
         let b = hasher.shard(
             "table",
-            &DatabaseName::try_from("namespace").unwrap(),
+            &NamespaceName::try_from("namespace").unwrap(),
             &batch,
         );
         assert_eq!(a, b);
@@ -268,15 +271,15 @@ mod tests {
 
     #[test]
     fn test_sharder_prefix_collision() {
-        let hasher = JumpHash::new((0..10_000).map(Arc::new)).unwrap();
+        let hasher = JumpHash::new((0..10_000).map(Arc::new));
         let a = hasher.shard(
             "a",
-            &DatabaseName::try_from("bc").unwrap(),
+            &NamespaceName::try_from("bc").unwrap(),
             &MutableBatch::default(),
         );
         let b = hasher.shard(
             "ab",
-            &DatabaseName::try_from("c").unwrap(),
+            &NamespaceName::try_from("c").unwrap(),
             &MutableBatch::default(),
         );
         assert_ne!(a, b);
@@ -296,8 +299,8 @@ mod tests {
     // strategy would that accounts for this mapping change.
     #[test]
     fn test_key_bucket_fixture() {
-        let hasher = JumpHash::new((0..1_000).map(Arc::new)).unwrap();
-        let namespace = DatabaseName::try_from("bananas").unwrap();
+        let hasher = JumpHash::new((0..1_000).map(Arc::new));
+        let namespace = NamespaceName::try_from("bananas").unwrap();
 
         let mut batches = mutable_batch_lp::lines_to_batches("cpu a=1i", 42).unwrap();
         let batch = batches.remove("cpu").unwrap();
@@ -306,17 +309,20 @@ mod tests {
             *hasher.shard("42", &namespace, &MutableBatch::default()),
             904
         );
+        assert_eq!(*hasher.shard("42", &namespace, &()), 904);
         assert_eq!(
             *hasher.shard("4242", &namespace, &MutableBatch::default()),
             230
         );
+        assert_eq!(*hasher.shard("4242", &namespace, &()), 230);
         assert_eq!(*hasher.shard("bananas", &namespace, &batch), 183);
+        assert_eq!(*hasher.shard("bananas", &namespace, &()), 183);
     }
 
     #[test]
     fn test_distribution() {
-        let hasher = JumpHash::new((0..100).map(Arc::new)).unwrap();
-        let namespace = DatabaseName::try_from("bananas").unwrap();
+        let hasher = JumpHash::new((0..100).map(Arc::new));
+        let namespace = NamespaceName::try_from("bananas").unwrap();
 
         let mut mapping = HashMap::<_, usize>::new();
 
@@ -341,9 +347,9 @@ mod tests {
 
     #[test]
     fn test_delete_with_table() {
-        let namespace = DatabaseName::try_from("bananas").unwrap();
+        let namespace = NamespaceName::try_from("bananas").unwrap();
 
-        let hasher = JumpHash::new((0..10_000).map(Arc::new)).unwrap();
+        let hasher = JumpHash::new((0..10_000).map(Arc::new));
 
         let predicate = DeletePredicate {
             range: TimestampRange::new(1, 2),
@@ -366,10 +372,10 @@ mod tests {
 
     #[test]
     fn test_delete_no_table_shards_to_all() {
-        let namespace = DatabaseName::try_from("bananas").unwrap();
+        let namespace = NamespaceName::try_from("bananas").unwrap();
 
         let shards = (0..10_000).map(Arc::new).collect::<Vec<_>>();
-        let hasher = JumpHash::new(shards.clone()).unwrap();
+        let hasher = JumpHash::new(shards.clone());
 
         let predicate = DeletePredicate {
             range: TimestampRange::new(1, 2),
@@ -382,8 +388,9 @@ mod tests {
     }
 
     #[test]
+    #[should_panic = "empty shard set given to sharder"]
     fn no_shards() {
         let shards: iter::Empty<i32> = iter::empty();
-        assert_error!(JumpHash::new(shards), Error::NoShards,);
+        JumpHash::new(shards);
     }
 }

@@ -1,8 +1,10 @@
+use std::{iter, sync::Arc};
+
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion,
     Throughput,
 };
-use data_types::DatabaseName;
+use data_types::{NamespaceId, NamespaceName};
 use hashbrown::HashMap;
 use iox_catalog::mem::MemCatalog;
 use mutable_batch::MutableBatch;
@@ -11,11 +13,10 @@ use router::{
     dml_handlers::{DmlHandler, SchemaValidator},
     namespace_cache::{MemoryNamespaceCache, ShardedCache},
 };
-use schema::selection::Selection;
-use std::{iter, sync::Arc};
+use schema::Projection;
 use tokio::runtime::Runtime;
 
-static NAMESPACE: Lazy<DatabaseName<'static>> = Lazy::new(|| "bananas".try_into().unwrap());
+static NAMESPACE: Lazy<NamespaceName<'static>> = Lazy::new(|| "bananas".try_into().unwrap());
 
 fn runtime() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -41,27 +42,26 @@ fn bench(group: &mut BenchmarkGroup<WallTime>, tables: usize, columns_per_table:
     let metrics = Arc::new(metric::Registry::default());
 
     let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-    let ns_cache = Arc::new(
-        ShardedCache::new(iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10))
-            .unwrap(),
-    );
-    let validator = SchemaValidator::new(catalog, ns_cache, &*metrics);
+    let ns_cache = Arc::new(ShardedCache::new(
+        iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+    ));
+    let validator = SchemaValidator::new(catalog, ns_cache, &metrics);
 
     for i in 0..65_000 {
         let write = lp_to_writes(format!("{}{}", i + 10_000_000, generate_lp(1, 1)).as_str());
-        let _ = runtime().block_on(validator.write(&*NAMESPACE, write, None));
+        let _ = runtime().block_on(validator.write(&NAMESPACE, NamespaceId::new(42), write, None));
     }
 
     let write = lp_to_writes(&generate_lp(tables, columns_per_table));
     let column_count = write
         .values()
-        .fold(0, |acc, b| acc + b.schema(Selection::All).unwrap().len());
+        .fold(0, |acc, b| acc + b.schema(Projection::All).unwrap().len());
 
     group.throughput(Throughput::Elements(column_count as _));
     group.bench_function(format!("{tables}x{columns_per_table}"), |b| {
         b.to_async(runtime()).iter_batched(
             || write.clone(),
-            |write| validator.write(&*NAMESPACE, write, None),
+            |write| validator.write(&NAMESPACE, NamespaceId::new(42), write, None),
             BatchSize::SmallInput,
         );
     });

@@ -1,20 +1,37 @@
 //! This module contains plumbing to connect InfluxDB IOx extensions to
 //! DataFusion
 
-use async_trait::async_trait;
-use executor::DedicatedExecutor;
-use std::{convert::TryInto, fmt, sync::Arc};
-
+use super::{
+    non_null_checker::NonNullCheckerNode, seriesset::series::Either, split::StreamSplitNode,
+};
+use crate::{
+    exec::{
+        fieldlist::{FieldList, IntoFieldList},
+        non_null_checker::NonNullCheckerExec,
+        query_tracing::TracedStream,
+        schema_pivot::{SchemaPivotExec, SchemaPivotNode},
+        seriesset::{
+            converter::{GroupGenerator, SeriesSetConverter},
+            series::Series,
+        },
+        split::StreamSplitExec,
+        stringset::{IntoStringSet, StringSetRef},
+    },
+    plan::{
+        fieldlist::FieldListPlan,
+        seriesset::{SeriesSetPlan, SeriesSetPlans},
+        stringset::StringSetPlan,
+    },
+};
 use arrow::record_batch::RecordBatch;
-
+use async_trait::async_trait;
 use datafusion::{
     catalog::catalog::CatalogProvider,
-    config::OPT_COALESCE_TARGET_BATCH_SIZE,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
         runtime_env::RuntimeEnv,
     },
-    logical_plan::{LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec,
         displayable,
@@ -23,44 +40,19 @@ use datafusion::{
     },
     prelude::*,
 };
+use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
+use executor::DedicatedExecutor;
 use futures::TryStreamExt;
 use observability_deps::tracing::debug;
+use query_functions::selectors::register_selector_aggregates;
+use std::{convert::TryInto, fmt, sync::Arc};
 use trace::{
     ctx::SpanContext,
-    span::{MetaValue, SpanRecorder},
-};
-
-use crate::exec::{
-    fieldlist::{FieldList, IntoFieldList},
-    non_null_checker::NonNullCheckerExec,
-    query_tracing::TracedStream,
-    schema_pivot::{SchemaPivotExec, SchemaPivotNode},
-    seriesset::{
-        converter::{GroupGenerator, SeriesSetConverter},
-        series::Series,
-    },
-    split::StreamSplitExec,
-    stringset::{IntoStringSet, StringSetRef},
-};
-
-use crate::plan::{
-    fieldlist::FieldListPlan,
-    seriesset::{SeriesSetPlan, SeriesSetPlans},
-    stringset::StringSetPlan,
+    span::{MetaValue, Span, SpanExt, SpanRecorder},
 };
 
 // Reuse DataFusion error and Result types for this module
 pub use datafusion::error::{DataFusionError as Error, Result};
-use trace::span::Span;
-
-use super::{
-    non_null_checker::NonNullCheckerNode, seriesset::series::Either, split::StreamSplitNode,
-};
-
-// The default catalog name - this impacts what SQL queries use if not specified
-pub const DEFAULT_CATALOG: &str = "public";
-// The default schema name - this impacts what SQL queries use if not specified
-pub const DEFAULT_SCHEMA: &str = "iox";
 
 /// This structure implements the DataFusion notion of "query planner"
 /// and is needed to create plans with the IOx extension nodes.
@@ -177,21 +169,9 @@ impl fmt::Debug for IOxSessionConfig {
     }
 }
 
-const BATCH_SIZE: usize = 1000;
-const COALESCE_BATCH_SIZE: usize = 500;
-
 impl IOxSessionConfig {
     pub(super) fn new(exec: DedicatedExecutor, runtime: Arc<RuntimeEnv>) -> Self {
-        let session_config = SessionConfig::new()
-            .with_batch_size(BATCH_SIZE)
-            // TODO add function in SessionCofig
-            .set_u64(
-                OPT_COALESCE_TARGET_BATCH_SIZE,
-                COALESCE_BATCH_SIZE.try_into().unwrap(),
-            )
-            .create_default_catalog_and_schema(true)
-            .with_information_schema(true)
-            .with_default_catalog_and_schema(DEFAULT_CATALOG, DEFAULT_SCHEMA);
+        let session_config = iox_session_config();
 
         Self {
             exec,
@@ -228,19 +208,17 @@ impl IOxSessionConfig {
         let state = SessionState::with_config_rt(self.session_config, self.runtime)
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
 
+        let state = register_selector_aggregates(state);
+
         let inner = SessionContext::with_state(state);
 
         if let Some(default_catalog) = self.default_catalog {
             inner.register_catalog(DEFAULT_CATALOG, default_catalog);
         }
 
-        let maybe_span = self.span_ctx.map(|ctx| ctx.child("Query Execution"));
+        let maybe_span = self.span_ctx.child_span("Query Execution");
 
-        IOxSessionContext {
-            inner,
-            exec: Some(self.exec),
-            recorder: SpanRecorder::new(maybe_span),
-        }
+        IOxSessionContext::new(inner, Some(self.exec), SpanRecorder::new(maybe_span))
     }
 }
 
@@ -256,7 +234,6 @@ impl IOxSessionConfig {
 ///
 /// An IOxSessionContext is created directly from an Executor, or from
 /// an IOxSessionConfig created by an Executor
-#[derive(Default)]
 pub struct IOxSessionContext {
     inner: SessionContext,
 
@@ -281,6 +258,40 @@ impl fmt::Debug for IOxSessionContext {
 }
 
 impl IOxSessionContext {
+    /// Constructor for testing.
+    ///
+    /// This is identical to [`Default::default`] but we do NOT implement [`Default`] to make the creation of untracked
+    /// contexts more explicit.
+    pub fn with_testing() -> Self {
+        Self {
+            inner: SessionContext::default(),
+            exec: None,
+            recorder: SpanRecorder::default(),
+        }
+    }
+
+    /// Private constructor
+    pub(crate) fn new(
+        inner: SessionContext,
+        exec: Option<DedicatedExecutor>,
+        recorder: SpanRecorder,
+    ) -> Self {
+        // attach span to DataFusion session
+        {
+            let mut state = inner.state.write();
+            state.config = state
+                .config
+                .clone()
+                .with_extension(Arc::new(recorder.span().cloned()));
+        }
+
+        Self {
+            inner,
+            exec,
+            recorder,
+        }
+    }
+
     /// returns a reference to the inner datafusion execution context
     pub fn inner(&self) -> &SessionContext {
         &self.inner
@@ -293,6 +304,24 @@ impl IOxSessionContext {
         debug!(text=%sql, "planning SQL query");
         let logical_plan = ctx.inner.create_logical_plan(sql)?;
         debug!(plan=%logical_plan.display_graphviz(), "logical plan");
+
+        // Handle unsupported SQL
+        match &logical_plan {
+            LogicalPlan::CreateMemoryTable(_) => {
+                return Err(Error::NotImplemented("CreateMemoryTable".to_string()));
+            }
+            LogicalPlan::DropTable(_) => {
+                return Err(Error::NotImplemented("DropTable".to_string()));
+            }
+            LogicalPlan::DropView(_) => {
+                return Err(Error::NotImplemented("DropView".to_string()));
+            }
+            LogicalPlan::CreateView(_) => {
+                return Err(Error::NotImplemented("CreateView".to_string()));
+            }
+            _ => (),
+        }
+
         ctx.create_physical_plan(&logical_plan).await
     }
 
@@ -574,11 +603,11 @@ impl IOxSessionContext {
 
     /// Returns a IOxSessionContext with a SpanRecorder that is a child of the current
     pub fn child_ctx(&self, name: &'static str) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            exec: self.exec.clone(),
-            recorder: self.recorder.child(name),
-        }
+        Self::new(
+            self.inner.clone(),
+            self.exec.clone(),
+            self.recorder.child(name),
+        )
     }
 
     /// Record an event on the span recorder
@@ -599,5 +628,28 @@ impl IOxSessionContext {
     /// Number of currently active tasks.
     pub fn tasks(&self) -> usize {
         self.exec.as_ref().map(|e| e.tasks()).unwrap_or_default()
+    }
+}
+
+/// Extension trait to pull IOx spans out of DataFusion contexts.
+pub trait SessionContextIOxExt {
+    /// Get child span of the current context.
+    fn child_span(&self, name: &'static str) -> Option<Span>;
+
+    /// Get span context
+    fn span_ctx(&self) -> Option<SpanContext>;
+}
+
+impl SessionContextIOxExt for SessionState {
+    fn child_span(&self, name: &'static str) -> Option<Span> {
+        self.config
+            .get_extension::<Option<Span>>()
+            .and_then(|span| span.as_ref().as_ref().map(|span| span.child(name)))
+    }
+
+    fn span_ctx(&self) -> Option<SpanContext> {
+        self.config
+            .get_extension::<Option<Span>>()
+            .and_then(|span| span.as_ref().as_ref().map(|span| span.ctx.clone()))
     }
 }

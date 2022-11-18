@@ -1,9 +1,13 @@
-use super::DmlHandler;
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate};
+use data_types::{DeletePredicate, NamespaceId, NamespaceName};
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{DurationHistogram, Metric};
-use trace::{ctx::SpanContext, span::SpanRecorder};
+use trace::{
+    ctx::SpanContext,
+    span::{SpanExt, SpanRecorder},
+};
+
+use super::DmlHandler;
 
 /// An instrumentation decorator recording call latencies for [`DmlHandler`] implementations.
 ///
@@ -63,7 +67,8 @@ where
     /// Call the inner `write` method and record the call latency.
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
@@ -73,7 +78,10 @@ where
         let mut span_recorder =
             SpanRecorder::new(span_ctx.clone().map(|parent| parent.child(self.name)));
 
-        let res = self.inner.write(namespace, input, span_ctx).await;
+        let res = self
+            .inner
+            .write(namespace, namespace_id, input, span_ctx)
+            .await;
 
         // Avoid exploding if time goes backwards - simply drop the measurement
         // if it happens.
@@ -96,7 +104,8 @@ where
     /// Call the inner `delete` method and record the call latency.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
         span_ctx: Option<SpanContext>,
@@ -104,12 +113,11 @@ where
         let t = self.time_provider.now();
 
         // Create a tracing span for this handler.
-        let mut span_recorder =
-            SpanRecorder::new(span_ctx.clone().map(|parent| parent.child(self.name)));
+        let mut span_recorder = SpanRecorder::new(span_ctx.child_span(self.name));
 
         let res = self
             .inner
-            .delete(namespace, table_name, predicate, span_ctx)
+            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
             .await;
 
         // Avoid exploding if time goes backwards - simply drop the measurement
@@ -133,14 +141,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::dml_handlers::{mock::MockDmlHandler, DmlError};
+    use std::sync::Arc;
+
     use assert_matches::assert_matches;
     use data_types::TimestampRange;
     use metric::Attributes;
-    use std::sync::Arc;
     use trace::{span::SpanStatus, RingBufferTraceCollector, TraceCollector};
     use write_summary::WriteSummary;
+
+    use super::*;
+    use crate::dml_handlers::{mock::MockDmlHandler, DmlError};
 
     const HANDLER_NAME: &str = "bananas";
 
@@ -194,14 +204,14 @@ mod tests {
         let traces: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
         let span = SpanContext::new(Arc::clone(&traces));
 
-        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &*metrics, handler);
+        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &metrics, handler);
 
         decorator
-            .write(&ns, (), Some(span))
+            .write(&ns, NamespaceId::new(42), (), Some(span))
             .await
             .expect("inner handler configured to succeed");
 
-        assert_metric_hit(&*metrics, "dml_handler_write_duration", "success");
+        assert_metric_hit(&metrics, "dml_handler_write_duration", "success");
         assert_trace(traces, SpanStatus::Ok);
     }
 
@@ -210,23 +220,23 @@ mod tests {
         let ns = "platanos".try_into().unwrap();
         let handler = Arc::new(
             MockDmlHandler::default()
-                .with_write_return([Err(DmlError::DatabaseNotFound("nope".to_owned()))]),
+                .with_write_return([Err(DmlError::NamespaceNotFound("nope".to_owned()))]),
         );
 
         let metrics = Arc::new(metric::Registry::default());
         let traces: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
         let span = SpanContext::new(Arc::clone(&traces));
 
-        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &*metrics, handler);
+        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &metrics, handler);
 
         let err = decorator
-            .write(&ns, (), Some(span))
+            .write(&ns, NamespaceId::new(42), (), Some(span))
             .await
             .expect_err("inner handler configured to fail");
 
-        assert_matches!(err, DmlError::DatabaseNotFound(_));
+        assert_matches!(err, DmlError::NamespaceNotFound(_));
 
-        assert_metric_hit(&*metrics, "dml_handler_write_duration", "error");
+        assert_metric_hit(&metrics, "dml_handler_write_duration", "error");
         assert_trace(traces, SpanStatus::Err);
     }
 
@@ -239,7 +249,7 @@ mod tests {
         let traces: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
         let span = SpanContext::new(Arc::clone(&traces));
 
-        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &*metrics, handler);
+        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &metrics, handler);
 
         let pred = DeletePredicate {
             range: TimestampRange::new(1, 2),
@@ -247,11 +257,11 @@ mod tests {
         };
 
         decorator
-            .delete(&ns, "a table", &pred, Some(span))
+            .delete(&ns, NamespaceId::new(42), "a table", &pred, Some(span))
             .await
             .expect("inner handler configured to succeed");
 
-        assert_metric_hit(&*metrics, "dml_handler_delete_duration", "success");
+        assert_metric_hit(&metrics, "dml_handler_delete_duration", "success");
         assert_trace(traces, SpanStatus::Ok);
     }
 
@@ -260,14 +270,14 @@ mod tests {
         let ns = "platanos".try_into().unwrap();
         let handler = Arc::new(
             MockDmlHandler::<()>::default()
-                .with_delete_return([Err(DmlError::DatabaseNotFound("nope".to_owned()))]),
+                .with_delete_return([Err(DmlError::NamespaceNotFound("nope".to_owned()))]),
         );
 
         let metrics = Arc::new(metric::Registry::default());
         let traces: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
         let span = SpanContext::new(Arc::clone(&traces));
 
-        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &*metrics, handler);
+        let decorator = InstrumentationDecorator::new(HANDLER_NAME, &metrics, handler);
 
         let pred = DeletePredicate {
             range: TimestampRange::new(1, 2),
@@ -275,11 +285,11 @@ mod tests {
         };
 
         decorator
-            .delete(&ns, "a table", &pred, Some(span))
+            .delete(&ns, NamespaceId::new(42), "a table", &pred, Some(span))
             .await
             .expect_err("inner handler configured to fail");
 
-        assert_metric_hit(&*metrics, "dml_handler_delete_duration", "error");
+        assert_metric_hit(&metrics, "dml_handler_delete_duration", "error");
         assert_trace(traces, SpanStatus::Err);
     }
 }

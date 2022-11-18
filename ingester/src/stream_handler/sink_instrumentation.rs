@@ -1,13 +1,17 @@
 //! Instrumentation for [`DmlSink`] implementations.
 
-use super::DmlSink;
+use std::fmt::Debug;
+
 use async_trait::async_trait;
-use data_types::KafkaPartition;
+use data_types::ShardIndex;
 use dml::DmlOperation;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, DurationHistogram, U64Counter, U64Gauge};
-use std::fmt::Debug;
-use trace::span::SpanRecorder;
+use trace::span::{SpanExt, SpanRecorder};
+
+use crate::data::DmlApplyAction;
+
+use super::DmlSink;
 
 /// A [`WatermarkFetcher`] abstracts a source of the write buffer high watermark
 /// (max known offset).
@@ -15,7 +19,7 @@ use trace::span::SpanRecorder;
 /// # Caching
 ///
 /// Implementations may cache the watermark and return inaccurate values.
-pub trait WatermarkFetcher: Debug + Send + Sync {
+pub(crate) trait WatermarkFetcher: Debug + Send + Sync {
     /// Return a watermark if available.
     fn watermark(&self) -> Option<i64>;
 }
@@ -26,8 +30,8 @@ pub trait WatermarkFetcher: Debug + Send + Sync {
 ///
 /// # Panics
 ///
-/// A [`SinkInstrumentation`] is instantiated for a specific sequencer ID, and
-/// panics if it observes a [`DmlOperation`] from a different sequencer.
+/// A [`SinkInstrumentation`] is instantiated for a specific shard index, and
+/// panics if it observes a [`DmlOperation`] from a different shard.
 ///
 /// # Wall Clocks
 ///
@@ -35,7 +39,7 @@ pub trait WatermarkFetcher: Debug + Send + Sync {
 /// instance is running on, and the routers. If either of these clocks are
 /// incorrect/skewed/drifting the metrics emitted may be incorrect.
 #[derive(Debug)]
-pub struct SinkInstrumentation<F, T, P = SystemProvider> {
+pub(crate) struct SinkInstrumentation<F, T, P = SystemProvider> {
     /// The [`DmlSink`] impl this layer decorates.
     ///
     /// All ops this impl is called with are passed into `inner` for processing.
@@ -47,8 +51,8 @@ pub struct SinkInstrumentation<F, T, P = SystemProvider> {
     /// Used to derive ingest lag - tolerant of caching / old values.
     watermark_fetcher: F,
 
-    /// The sequencer ID this instrumentation is recording op metrics for.
-    sequencer_id: i32,
+    /// The shard index this instrumentation is recording op metrics for.
+    shard_index: ShardIndex,
 
     /// Op application success/failure call latency histograms (which include
     /// counters)
@@ -76,22 +80,22 @@ where
     /// The current high watermark is read from `watermark_fetcher` and used to
     /// derive some metric values (such as lag). This impl is tolerant of
     /// cached/stale watermark values being returned by `watermark_fetcher`.
-    pub fn new(
+    pub(crate) fn new(
         inner: T,
         watermark_fetcher: F,
-        kafka_topic_name: String,
-        kafka_partition: KafkaPartition,
+        topic_name: String,
+        shard_index: ShardIndex,
         metrics: &metric::Registry,
     ) -> Self {
         let attr = Attributes::from([
-            ("kafka_partition", kafka_partition.to_string().into()),
-            ("kafka_topic", kafka_topic_name.into()),
+            ("kafka_partition", shard_index.to_string().into()),
+            ("kafka_topic", topic_name.into()),
         ]);
 
         let write_buffer_bytes_read = metrics
             .register_metric::<U64Counter>(
                 "ingester_write_buffer_read_bytes",
-                "Total number of bytes read from sequencer",
+                "Total number of bytes read from shard",
             )
             .recorder(attr.clone());
         let write_buffer_last_sequence_number = metrics
@@ -100,10 +104,13 @@ where
                 "Last consumed sequence number (e.g. Kafka offset)",
             )
             .recorder(attr.clone());
-        let write_buffer_sequence_number_lag = metrics.register_metric::<U64Gauge>(
-            "ingester_write_buffer_sequence_number_lag",
-            "The difference between the the last sequence number available (e.g. Kafka offset) and (= minus) last consumed sequence number",
-        ).recorder(attr.clone());
+        let write_buffer_sequence_number_lag = metrics
+            .register_metric::<U64Gauge>(
+                "ingester_write_buffer_sequence_number_lag",
+                "The difference between the the last sequence number available (e.g. Kafka \
+                 offset) and (= minus) last consumed sequence number",
+            )
+            .recorder(attr.clone());
         let write_buffer_last_ingest_ts = metrics
             .register_metric::<U64Gauge>(
                 "ingester_write_buffer_last_ingest_ts",
@@ -113,7 +120,7 @@ where
 
         let op_apply = metrics.register_metric::<DurationHistogram>(
             "ingester_op_apply_duration",
-            "The duration of time taken to process an operation read from the sequencer",
+            "The duration of time taken to process an operation read from the shard",
         );
         let op_apply_success = op_apply.recorder({
             let mut attr = attr.clone();
@@ -129,7 +136,7 @@ where
         Self {
             inner,
             watermark_fetcher,
-            sequencer_id: kafka_partition.get(),
+            shard_index,
 
             op_apply_success,
             op_apply_error,
@@ -150,11 +157,11 @@ where
     T: DmlSink,
     P: TimeProvider,
 {
-    async fn apply(&self, op: DmlOperation) -> Result<bool, crate::data::Error> {
+    async fn apply(&self, op: DmlOperation) -> Result<DmlApplyAction, crate::data::Error> {
         let meta = op.meta();
 
         // Immediately increment the "bytes read" metric as it records the
-        // number of bytes read from the sequencer, irrespective of the op
+        // number of bytes read from the shard, irrespective of the op
         // apply call.
         self.write_buffer_bytes_read.inc(
             meta.bytes_read()
@@ -177,9 +184,9 @@ where
             .sequence()
             .expect("entry from write buffer must be sequenced");
         assert_eq!(
-            sequence.sequencer_id as i32, self.sequencer_id,
-            "instrumentation for kafka partition {} saw op from kafka partition {}",
-            self.sequencer_id, sequence.sequencer_id,
+            sequence.shard_index, self.shard_index,
+            "instrumentation for shard index {} saw op from shard index {}",
+            self.shard_index, sequence.shard_index,
         );
 
         // Record the "last read sequence number" write buffer metric.
@@ -198,10 +205,8 @@ where
         }
 
         // Create a tracing span covering the inner DmlSink call.
-        let mut span_recorder = SpanRecorder::new(
-            meta.span_context()
-                .map(|parent| parent.child("DmlSink::apply()")),
-        );
+        let mut span_recorder =
+            SpanRecorder::new(meta.span_context().child_span("DmlSink::apply()"));
 
         // Call into the inner handler to process the op and calculate the call
         // latency.
@@ -231,44 +236,52 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use super::*;
+    use crate::stream_handler::{
+        mock_sink::MockDmlSink, mock_watermark_fetcher::MockWatermarkFetcher,
+    };
     use assert_matches::assert_matches;
-    use data_types::{Sequence, SequenceNumber};
+    use data_types::{NamespaceId, Sequence, SequenceNumber, ShardId, TableId};
     use dml::{DmlMeta, DmlWrite};
     use iox_time::Time;
     use metric::{Metric, MetricObserver, Observation};
     use mutable_batch_lp::lines_to_batches;
     use once_cell::sync::Lazy;
+    use std::sync::Arc;
     use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector, TraceCollector};
 
-    use crate::stream_handler::{
-        mock_sink::MockDmlSink, mock_watermark_fetcher::MockWatermarkFetcher,
-    };
-
-    use super::*;
-
-    /// The sequencer ID the [`SinkInstrumentation`] under test is configured to
+    /// The shard index the [`SinkInstrumentation`] under test is configured to
     /// be observing for.
-    const SEQUENCER_ID: u32 = 42;
+    const SHARD_INDEX: ShardIndex = ShardIndex::new(42);
 
-    static TEST_KAFKA_TOPIC: &str = "kafka_topic_name";
+    static TEST_TOPIC_NAME: &str = "topic_name";
 
     static TEST_TIME: Lazy<Time> = Lazy::new(|| SystemProvider::default().now());
 
     /// The attributes assigned to the metrics emitted by the
-    /// instrumentation when using the above sequencer / kafka topic values.
+    /// instrumentation when using the above shard / topic values.
     static DEFAULT_ATTRS: Lazy<Attributes> = Lazy::new(|| {
         Attributes::from([
-            ("kafka_partition", SEQUENCER_ID.to_string().into()),
-            ("kafka_topic", TEST_KAFKA_TOPIC.into()),
+            ("kafka_partition", SHARD_INDEX.to_string().into()),
+            ("kafka_topic", TEST_TOPIC_NAME.into()),
         ])
     });
 
     /// Return a DmlWrite with the given metadata and a single table.
     fn make_write(meta: DmlMeta) -> DmlWrite {
         let tables = lines_to_batches("bananas level=42 4242", 0).unwrap();
-        DmlWrite::new("bananas", tables, None, meta)
+        let tables_by_ids = tables
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_k, v))| (TableId::new(i as _), v))
+            .collect();
+
+        DmlWrite::new(
+            NamespaceId::new(42),
+            tables_by_ids,
+            "1970-01-01".into(),
+            meta,
+        )
     }
 
     /// Extract the metric with the given name from `metrics`.
@@ -290,16 +303,16 @@ mod tests {
     async fn test(
         op: impl Into<DmlOperation> + Send,
         metrics: &metric::Registry,
-        with_sink_return: Result<bool, crate::data::Error>,
+        with_sink_return: Result<DmlApplyAction, crate::data::Error>,
         with_fetcher_return: Option<i64>,
-    ) -> Result<bool, crate::data::Error> {
+    ) -> Result<DmlApplyAction, crate::data::Error> {
         let op = op.into();
         let inner = MockDmlSink::default().with_apply_return([with_sink_return]);
         let instrumentation = SinkInstrumentation::new(
             inner,
             MockWatermarkFetcher::new(with_fetcher_return),
-            TEST_KAFKA_TOPIC.to_string(),
-            KafkaPartition::new(SEQUENCER_ID as _),
+            TEST_TOPIC_NAME.to_string(),
+            SHARD_INDEX,
             metrics,
         );
 
@@ -332,31 +345,27 @@ mod tests {
         let span = SpanContext::new(Arc::clone(&traces));
 
         let meta = DmlMeta::sequenced(
-            // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
+            // Op is offset 100 for shard 42
+            Sequence::new(SHARD_INDEX, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), Some(12345)).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(
-                &metrics,
-                "ingester_write_buffer_read_bytes",
-                &*DEFAULT_ATTRS
-            ),
+            get_metric::<U64Counter>(&metrics, "ingester_write_buffer_read_bytes", &DEFAULT_ATTRS),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_last_sequence_number",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
         );
@@ -364,13 +373,13 @@ mod tests {
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_sequence_number_lag",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             // 12345 - 100 - 1
             Observation::U64Gauge(12_244)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -401,8 +410,8 @@ mod tests {
         let span = SpanContext::new(Arc::clone(&traces));
 
         let meta = DmlMeta::sequenced(
-            // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
+            // Op is offset 100 for shard 42
+            Sequence::new(SHARD_INDEX, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
@@ -412,26 +421,24 @@ mod tests {
         let got = test(
             op,
             &metrics,
-            Err(crate::data::Error::TableNotPresent),
+            Err(crate::data::Error::ShardNotFound {
+                shard_id: ShardId::new(42),
+            }),
             Some(12345),
         )
         .await;
-        assert_matches!(got, Err(crate::data::Error::TableNotPresent));
+        assert_matches!(got, Err(crate::data::Error::ShardNotFound { .. }));
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(
-                &metrics,
-                "ingester_write_buffer_read_bytes",
-                &*DEFAULT_ATTRS
-            ),
+            get_metric::<U64Counter>(&metrics, "ingester_write_buffer_read_bytes", &DEFAULT_ATTRS),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_last_sequence_number",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
         );
@@ -439,13 +446,13 @@ mod tests {
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_sequence_number_lag",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             // 12345 - 100 - 1
             Observation::U64Gauge(12_244)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -475,31 +482,27 @@ mod tests {
         let span = SpanContext::new(Arc::clone(&traces));
 
         let meta = DmlMeta::sequenced(
-            // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
+            // Op is offset 100 for shard 42
+            Sequence::new(SHARD_INDEX, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), None).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), None).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(
-                &metrics,
-                "ingester_write_buffer_read_bytes",
-                &*DEFAULT_ATTRS
-            ),
+            get_metric::<U64Counter>(&metrics, "ingester_write_buffer_read_bytes", &DEFAULT_ATTRS),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_last_sequence_number",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
         );
@@ -507,13 +510,13 @@ mod tests {
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_sequence_number_lag",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             // No value recorded because no watermark was available
             Observation::U64Gauge(0)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -544,31 +547,27 @@ mod tests {
         let span = SpanContext::new(Arc::clone(&traces));
 
         let meta = DmlMeta::sequenced(
-            // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
+            // Op is offset 100 for shard 42
+            Sequence::new(SHARD_INDEX, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
         );
         let op = make_write(meta);
 
-        let got = test(op, &metrics, Ok(true), Some(1)).await;
-        assert_matches!(got, Ok(true));
+        let got = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(1)).await;
+        assert_matches!(got, Ok(DmlApplyAction::Applied(true)));
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(
-                &metrics,
-                "ingester_write_buffer_read_bytes",
-                &*DEFAULT_ATTRS
-            ),
+            get_metric::<U64Counter>(&metrics, "ingester_write_buffer_read_bytes", &DEFAULT_ATTRS),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_last_sequence_number",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
         );
@@ -576,13 +575,13 @@ mod tests {
             get_metric::<U64Gauge>(
                 &metrics,
                 "ingester_write_buffer_sequence_number_lag",
-                &*DEFAULT_ATTRS
+                &DEFAULT_ATTRS
             ),
             // The current sequence number is not behind the high watermark
             Observation::U64Gauge(0)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -613,25 +612,28 @@ mod tests {
         let meta = DmlMeta::unsequenced(None);
         let op = make_write(meta);
 
-        let _ = test(op, &metrics, Ok(true), Some(12345)).await;
+        let _ = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
     }
 
-    // The instrumentation emits per-sequencer metrics, so upon observing an op
-    // for a different sequencer it should panic.
-    #[should_panic = "instrumentation for kafka partition 42 saw op from kafka partition 52"]
+    // The instrumentation emits per-shard metrics, so upon observing an op
+    // for a different shard it should panic.
+    #[should_panic = "instrumentation for shard index 42 saw op from shard index 52"]
     #[tokio::test]
-    async fn test_op_different_sequencer_id() {
+    async fn test_op_different_shard_index() {
         let metrics = metric::Registry::default();
         let meta = DmlMeta::sequenced(
-            // A different kafka partition ID from what the handler is configured to
+            // A different shard index from what the handler is configured to
             // be instrumenting
-            Sequence::new(SEQUENCER_ID + 10, SequenceNumber::new(100)),
+            Sequence::new(
+                ShardIndex::new(SHARD_INDEX.get() + 10),
+                SequenceNumber::new(100),
+            ),
             *TEST_TIME,
             None,
             4242,
         );
         let op = make_write(meta);
 
-        let _ = test(op, &metrics, Ok(true), Some(12345)).await;
+        let _ = test(op, &metrics, Ok(DmlApplyAction::Applied(true)), Some(12345)).await;
     }
 }

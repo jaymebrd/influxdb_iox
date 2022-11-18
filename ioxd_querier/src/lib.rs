@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use clap_blocks::querier::{IngesterAddresses, QuerierConfig};
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
-use iox_query::exec::Executor;
+use iox_query::exec::{Executor, ExecutorType};
 use iox_time::TimeProvider;
 use ioxd_common::{
     add_service,
@@ -14,16 +14,16 @@ use ioxd_common::{
 };
 use metric::Registry;
 use object_store::DynObjectStore;
-use parquet_file::storage::ParquetStorage;
 use querier::{
-    create_ingester_connection, create_ingester_connections_by_sequencer, QuerierCatalogCache,
-    QuerierDatabase, QuerierHandler, QuerierHandlerImpl, QuerierServer,
+    create_ingester_connections_by_shard, QuerierCatalogCache, QuerierDatabase, QuerierHandler,
+    QuerierHandlerImpl, QuerierServer,
 };
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
 use thiserror::Error;
+use tokio::runtime::Handle;
 use trace::TraceCollector;
 
 mod rpc;
@@ -74,7 +74,7 @@ impl<C: QuerierHandler + std::fmt::Debug + 'static> ServerType for QuerierServer
         Err(Box::new(IoxHttpError::NotFound))
     }
 
-    /// Provide a placeholder gRPC service.
+    /// Configure the gRPC services.
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
         add_service!(
@@ -94,6 +94,9 @@ impl<C: QuerierHandler + std::fmt::Debug + 'static> ServerType for QuerierServer
             rpc::write_info::write_info_service(Arc::clone(&self.database))
         );
         add_service!(builder, self.server.handler().schema_service());
+        add_service!(builder, self.server.handler().catalog_service());
+        add_service!(builder, self.server.handler().object_store_service());
+
         serve_builder!(builder);
 
         Ok(())
@@ -151,12 +154,6 @@ pub struct QuerierServerTypeArgs<'a> {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("failed to initialise write buffer connection: {0}")]
-    WriteBuffer(#[from] write_buffer::core::WriteBufferError),
-
-    #[error("failed to create KafkaPartition from id: {0}")]
-    InvalidData(#[from] std::num::TryFromIntError),
-
     #[error("querier error: {0}")]
     Querier(#[from] querier::QuerierDatabaseError),
 }
@@ -169,17 +166,32 @@ pub async fn create_querier_server_type(
         Arc::clone(&args.catalog),
         args.time_provider,
         Arc::clone(&args.metric_registry),
-        args.querier_config.ram_pool_bytes(),
+        Arc::clone(&args.object_store),
+        args.querier_config.ram_pool_metadata_bytes(),
+        args.querier_config.ram_pool_data_bytes(),
+        &Handle::current(),
     ));
 
+    // register cached object store with the execution context
+    let parquet_store = catalog_cache.parquet_store();
+    let existing = args
+        .exec
+        .new_context(ExecutorType::Query)
+        .inner()
+        .runtime_env()
+        .register_object_store(
+            "iox",
+            parquet_store.id(),
+            Arc::clone(parquet_store.object_store()),
+        );
+    assert!(existing.is_none());
+
     let ingester_connection = match args.ingester_addresses {
-        IngesterAddresses::List(list) => {
-            Some(create_ingester_connection(list, Arc::clone(&catalog_cache)))
-        }
         IngesterAddresses::None => None,
-        IngesterAddresses::BySequencer(map) => Some(create_ingester_connections_by_sequencer(
+        IngesterAddresses::ByShardIndex(map) => Some(create_ingester_connections_by_shard(
             map,
             Arc::clone(&catalog_cache),
+            args.querier_config.ingester_circuit_breaker_threshold,
         )),
     };
 
@@ -187,14 +199,18 @@ pub async fn create_querier_server_type(
         QuerierDatabase::new(
             catalog_cache,
             Arc::clone(&args.metric_registry),
-            ParquetStorage::new(args.object_store),
             args.exec,
             ingester_connection,
             args.querier_config.max_concurrent_queries(),
+            args.querier_config.max_table_query_bytes(),
         )
         .await?,
     );
-    let querier_handler = Arc::new(QuerierHandlerImpl::new(args.catalog, Arc::clone(&database)));
+    let querier_handler = Arc::new(QuerierHandlerImpl::new(
+        args.catalog,
+        Arc::clone(&database),
+        Arc::clone(&args.object_store),
+    ));
 
     let querier = QuerierServer::new(args.metric_registry, querier_handler);
     Ok(Arc::new(QuerierServerType::new(

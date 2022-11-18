@@ -4,21 +4,20 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::scenarios::{
     DbScenario, DbSetup, EndToEndTest, TwoMeasurements, TwoMeasurementsManyFields,
-    TwoMeasurementsWithDelete, TwoMeasurementsWithDeleteAll,
 };
 use crate::{
     db::AbstractDb,
     influxrpc::util::run_series_set_plan_maybe_error,
     scenarios::{
-        MeasurementStatusCode, MeasurementsForDefect2845, MeasurementsSortableTags,
-        MeasurementsSortableTagsWithDelete, TwoMeasurementsMultiSeries,
-        TwoMeasurementsMultiSeriesWithDelete, TwoMeasurementsMultiSeriesWithDeleteAll,
+        MeasurementStatusCode, MeasurementsForDefect2845, MeasurementsSortableTags, PeriodsInNames,
+        TwoMeasurementsMultiSeries,
     },
 };
 use datafusion::{
-    logical_plan::{col, lit},
+    prelude::{col, lit},
     scalar::ScalarValue,
 };
+use datafusion_util::AsExpr;
 use iox_query::frontend::influxrpc::InfluxRpcPlanner;
 use predicate::rpc_predicate::InfluxRpcPredicate;
 use predicate::Predicate;
@@ -61,14 +60,14 @@ async fn run_read_filter(
     predicate: InfluxRpcPredicate,
     db: Arc<dyn AbstractDb>,
 ) -> Result<Vec<String>, String> {
-    let planner = InfluxRpcPlanner::default();
+    let ctx = db.new_query_context(None);
+    let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
     let plan = planner
-        .read_filter(db.as_query_database(), predicate)
+        .read_filter(db.as_query_namespace_arc(), predicate)
         .await
         .map_err(|e| e.to_string())?;
 
-    let ctx = db.new_query_context(None);
     run_series_set_plan_maybe_error(&ctx, plan)
         .await
         .map_err(|e| e.to_string())
@@ -101,10 +100,10 @@ async fn run_read_filter_error_case<D>(
 #[tokio::test]
 async fn test_read_filter_data_no_pred() {
     let expected_results = vec![
-    "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [70.4, 72.4]",
-    "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [200, 350], values: [90.0, 90.0]",
-    "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-    "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
+    "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [100, 250], values: [70.4, 72.4]",
+    "Series tags={_field=temp, _measurement=h2o, city=LA, state=CA}\n  FloatPoints timestamps: [200, 350], values: [90.0, 90.0]",
+    "Series tags={_field=reading, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
+    "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
     ];
 
     run_read_filter_test_case(
@@ -136,7 +135,7 @@ async fn test_read_filter_data_inclusive_predicate() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [350], values: [90.0]",
+        "Series tags={_field=temp, _measurement=h2o, city=LA, state=CA}\n  FloatPoints timestamps: [350], values: [90.0]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsMultiSeries {}, predicate, expected_results).await;
@@ -150,9 +149,9 @@ async fn test_read_filter_data_exact_predicate() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [72.4]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [250], values: [51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [53.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [72.4]",
+        "Series tags={_field=reading, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [51.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [53.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsMultiSeries {}, predicate, expected_results).await;
@@ -167,8 +166,8 @@ async fn test_read_filter_data_tag_predicate() {
 
     // expect both series to be returned
     let expected_results = vec![
-        "Series tags={_measurement=cpu, region=west, _field=user}\n  FloatPoints timestamps: [100, 150], values: [23.2, 21.0]",
-        "Series tags={_measurement=disk, region=east, _field=bytes}\n  IntegerPoints timestamps: [200], values: [99]",
+        "Series tags={_field=user, _measurement=cpu, region=west}\n  FloatPoints timestamps: [100, 150], values: [23.2, 21.0]",
+        "Series tags={_field=bytes, _measurement=disk, region=east}\n  IntegerPoints timestamps: [200], values: [99]",
     ];
 
     run_read_filter_test_case(TwoMeasurements {}, predicate, expected_results).await;
@@ -205,12 +204,12 @@ async fn test_read_filter_invalid_predicate_case() {
 #[tokio::test]
 async fn test_read_filter_unknown_column_in_predicate() {
     let predicate = Predicate::new()
-        // mystery_region is not a real column, so this predicate is
+        // mystery_region and bar are not real columns, so this predicate is
         // invalid but IOx should be able to handle it (and produce no results)
         .with_expr(
-            col("baz")
-                .eq(lit(4i32))
-                .or(col("bar").and(col("mystery_region").gt(lit(5i32)))),
+            col("baz").eq(lit(4i32)).or(col("bar")
+                .eq(lit("baz"))
+                .and(col("mystery_region").gt(lit(5i32)))),
         );
 
     let predicate = InfluxRpcPredicate::new(None, predicate);
@@ -218,39 +217,6 @@ async fn test_read_filter_unknown_column_in_predicate() {
     let expected_results = vec![];
 
     run_read_filter_test_case(TwoMeasurements {}, predicate, expected_results).await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_no_pred_with_delete() {
-    let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100], values: [70.4]",
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [350], values: [90.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
-    ];
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        InfluxRpcPredicate::default(),
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_no_pred_with_delete_all() {
-    // nothing from h2o table because all rows were deleted
-    let expected_results = vec![
-    "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-    "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
-    ];
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDeleteAll {},
-        InfluxRpcPredicate::default(),
-        expected_results,
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -262,7 +228,7 @@ async fn test_read_filter_data_filter() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [200], values: [90.0]",
+        "Series tags={_field=temp, _measurement=h2o, city=LA, state=CA}\n  FloatPoints timestamps: [200], values: [90.0]",
     ];
 
     run_read_filter_test_case(
@@ -282,58 +248,6 @@ async fn test_read_filter_data_filter() {
 }
 
 #[tokio::test]
-async fn test_read_filter_data_filter_with_delete() {
-    // filter out one row in h20 but the leftover row was deleted to nothing will be returned
-    let predicate = Predicate::default()
-        .with_range(200, 300)
-        .with_expr(col("state").eq(lit("CA"))); // state=CA
-
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_results = vec![];
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate,
-        expected_results.clone(),
-    )
-    .await;
-
-    // Same results via a != predicate.
-    let predicate = Predicate::default()
-        .with_range(200, 300)
-        .with_expr(col("state").not_eq(lit("MA"))); // state=CA
-
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate,
-        expected_results,
-    )
-    .await;
-
-    // Use different predicate to have data returned
-    let predicate = Predicate::default()
-        .with_range(100, 300)
-        .with_expr(col("state").eq(lit("MA"))) // state=MA
-        .with_expr(col("_measurement").eq(lit("h2o")));
-
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100], values: [70.4]",
-    ];
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate,
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn test_read_filter_data_filter_fields() {
     // filter out one row in h20
     let predicate = Predicate::default()
@@ -344,13 +258,11 @@ async fn test_read_filter_data_filter_fields() {
 
     // Only expect other_temp in this location
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=CA, _field=other_temp}\n  FloatPoints timestamps: [350], values: [72.4]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=CA}\n  FloatPoints timestamps: [350], values: [72.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
 }
-
-// NGA todo: add delete tests here after we have delete scenarios for 2 chunks for 1 table
 
 #[tokio::test]
 async fn test_read_filter_data_filter_measurement_pred() {
@@ -362,7 +274,7 @@ async fn test_read_filter_data_filter_measurement_pred() {
 
     // Only expect other_temp in this location
     let expected_results = vec![
-        "Series tags={_measurement=o2, state=CA, _field=temp}\n  FloatPoints timestamps: [300], values: [79.0]",
+        "Series tags={_field=temp, _measurement=o2, state=CA}\n  FloatPoints timestamps: [300], values: [79.0]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
@@ -379,80 +291,17 @@ async fn test_read_filter_data_pred_refers_to_non_existent_column() {
 }
 
 #[tokio::test]
-async fn test_read_filter_data_pred_refers_to_non_existent_column_with_delete() {
-    let predicate = Predicate::default().with_expr(col("tag_not_in_h20").eq(lit("foo")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_results = vec![] as Vec<&str>;
-
-    run_read_filter_test_case(TwoMeasurementsWithDelete {}, predicate, expected_results).await;
-}
-
-#[tokio::test]
 async fn test_read_filter_data_pred_no_columns() {
     // predicate with no columns,
     let predicate = Predicate::default().with_expr(lit("foo").eq(lit("foo")));
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=cpu, region=west, _field=user}\n  FloatPoints timestamps: [100, 150], values: [23.2, 21.0]",
-        "Series tags={_measurement=disk, region=east, _field=bytes}\n  IntegerPoints timestamps: [200], values: [99]",
+        "Series tags={_field=user, _measurement=cpu, region=west}\n  FloatPoints timestamps: [100, 150], values: [23.2, 21.0]",
+        "Series tags={_field=bytes, _measurement=disk, region=east}\n  IntegerPoints timestamps: [200], values: [99]",
     ];
 
     run_read_filter_test_case(TwoMeasurements {}, predicate, expected_results).await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_pred_no_columns_with_delete() {
-    // predicate with no columns,
-    let predicate = Predicate::default().with_expr(lit("foo").eq(lit("foo")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_results = vec![
-        "Series tags={_measurement=cpu, region=west, _field=user}\n  FloatPoints timestamps: [100], values: [23.2]",
-        "Series tags={_measurement=disk, region=east, _field=bytes}\n  IntegerPoints timestamps: [200], values: [99]",
-    ];
-
-    run_read_filter_test_case(TwoMeasurementsWithDelete {}, predicate, expected_results).await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_pred_no_columns_with_delete_all() {
-    // predicate with no columns,
-    let predicate = Predicate::default().with_expr(lit("foo").eq(lit("foo")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    // Only table disk has no deleted data
-    let expected_results = vec![
-    "Series tags={_measurement=disk, region=east, _field=bytes}\n  IntegerPoints timestamps: [200], values: [99]",
-    ];
-
-    run_read_filter_test_case(TwoMeasurementsWithDeleteAll {}, predicate, expected_results).await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_pred_refers_to_good_and_non_existent_columns() {
-    // predicate with both a column that does and does not appear
-    let predicate = Predicate::default()
-        .with_expr(col("state").eq(lit("MA")))
-        .with_expr(col("tag_not_in_h20").eq(lit("foo")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    let expected_results = vec![] as Vec<&str>;
-
-    run_read_filter_test_case(
-        TwoMeasurements {},
-        predicate.clone(),
-        expected_results.clone(),
-    )
-    .await;
-    run_read_filter_test_case(
-        TwoMeasurementsWithDelete {},
-        predicate.clone(),
-        expected_results.clone(),
-    )
-    .await;
-    run_read_filter_test_case(TwoMeasurementsWithDeleteAll {}, predicate, expected_results).await;
 }
 
 #[tokio::test]
@@ -464,54 +313,27 @@ async fn test_read_filter_data_pred_using_regex_match() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [200], values: [90.0]",
+        "Series tags={_field=temp, _measurement=h2o, city=LA, state=CA}\n  FloatPoints timestamps: [200], values: [90.0]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsMultiSeries {}, predicate, expected_results).await;
 }
 
 #[tokio::test]
-async fn test_read_filter_data_pred_using_regex_match_with_delete() {
-    let predicate = Predicate::default()
-        .with_range(200, 300)
-        // will match CA state
-        .with_regex_match_expr("state", "C.*");
+async fn test_read_filter_data_pred_using_regex_match_on_field() {
+    let predicate = Predicate::default().with_regex_match_expr("_field", "temp");
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
-    // the selected row was soft deleted
-    let expected_results = vec![];
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate,
-        expected_results,
-    )
-    .await;
-
-    // Different predicate to have data returned
-    let predicate = Predicate::default()
-        .with_range(200, 400)
-        // will match CA state
-        .with_regex_match_expr("state", "C.*");
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
+    // Should see results for temp and other_temp (but not reading)
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [350], values: [90.0]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=CA}\n  FloatPoints timestamps: [350], values: [72.4]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [70.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
+        "Series tags={_field=temp, _measurement=o2, state=CA}\n  FloatPoints timestamps: [300], values: [79.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [50], values: [53.4]",
     ];
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate.clone(),
-        expected_results,
-    )
-    .await;
 
-    // Try same predicate but on delete_all data
-    let expected_results = vec![];
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDeleteAll {},
-        predicate,
-        expected_results,
-    )
-    .await;
+    run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
 }
 
 #[tokio::test]
@@ -523,9 +345,9 @@ async fn test_read_filter_data_pred_using_regex_not_match() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [72.4]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [250], values: [51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [53.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [72.4]",
+        "Series tags={_field=reading, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [51.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [53.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsMultiSeries {}, predicate, expected_results).await;
@@ -540,7 +362,7 @@ async fn test_read_filter_data_pred_regex_escape() {
 
     // expect one series with influxdb.com
     let expected_results = vec![
-        "Series tags={_measurement=status_code, url=https://influxdb.com, _field=value}\n  FloatPoints timestamps: [1527018816000000000], values: [418.0]",
+        "Series tags={_field=value, _measurement=status_code, url=https://influxdb.com}\n  FloatPoints timestamps: [1527018816000000000], values: [418.0]",
     ];
 
     run_read_filter_test_case(MeasurementStatusCode {}, predicate, expected_results).await;
@@ -555,7 +377,7 @@ async fn test_read_filter_data_pred_not_match_regex_escape() {
 
     // expect one series with influxdb.com
     let expected_results = vec![
-        "Series tags={_measurement=status_code, url=http://www.example.com, _field=value}\n  FloatPoints timestamps: [1527018806000000000], values: [404.0]",
+        "Series tags={_field=value, _measurement=status_code, url=http://www.example.com}\n  FloatPoints timestamps: [1527018806000000000], values: [404.0]",
     ];
 
     run_read_filter_test_case(MeasurementStatusCode {}, predicate, expected_results).await;
@@ -575,86 +397,28 @@ async fn test_read_filter_data_pred_unsupported_in_scan() {
 
     // Note these results include data from both o2 and h2o
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [200, 350], values: [90.0, 90.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=LA, state=CA}\n  FloatPoints timestamps: [200, 350], values: [90.0, 90.0]",
+        "Series tags={_field=reading, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsMultiSeries {}, predicate, expected_results).await;
 }
 
 #[tokio::test]
-async fn test_read_filter_data_pred_unsupported_in_scan_with_delete() {
-    test_helpers::maybe_start_logging();
-
-    // These predicates can't be pushed down into chunks, but they can
-    // be evaluated by the general purpose DataFusion plan
-
-    // (STATE = 'CA') OR (READING > 0)
-    let predicate =
-        Predicate::default().with_expr(col("state").eq(lit("CA")).or(col("reading").gt(lit(0))));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-
-    // Note these results include data from both o2 and h2o
-    let expected_results = vec![
-        "Series tags={_measurement=h2o, city=LA, state=CA, _field=temp}\n  FloatPoints timestamps: [350], values: [90.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
-    ];
-
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDelete {},
-        predicate.clone(),
-        expected_results,
-    )
-    .await;
-
-    // With delete all from h2o, no rows from h2p should be returned
-    let expected_results = vec![
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [100, 250], values: [50.0, 51.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [100, 250], values: [50.4, 53.4]",
-    ];
-    run_read_filter_test_case(
-        TwoMeasurementsMultiSeriesWithDeleteAll {},
-        predicate,
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn test_read_filter_data_plan_order() {
     test_helpers::maybe_start_logging();
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=CA, _field=temp}\n  FloatPoints timestamps: [250], values: [70.3]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=other}\n  FloatPoints timestamps: [250], values: [5.0]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [70.5]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, zz_tag=A, _field=temp}\n  FloatPoints timestamps: [1000], values: [70.4]",
-        "Series tags={_measurement=h2o, city=Kingston, state=MA, zz_tag=A, _field=temp}\n  FloatPoints timestamps: [800], values: [70.1]",
-        "Series tags={_measurement=h2o, city=Kingston, state=MA, zz_tag=B, _field=temp}\n  FloatPoints timestamps: [100], values: [70.2]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=CA}\n  FloatPoints timestamps: [250], values: [70.3]",
+        "Series tags={_field=other, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [5.0]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [70.5]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA, zz_tag=A}\n  FloatPoints timestamps: [1000], values: [70.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Kingston, state=MA, zz_tag=A}\n  FloatPoints timestamps: [800], values: [70.1]",
+        "Series tags={_field=temp, _measurement=h2o, city=Kingston, state=MA, zz_tag=B}\n  FloatPoints timestamps: [100], values: [70.2]",
     ];
 
     run_read_filter_test_case(
         MeasurementsSortableTags {},
-        InfluxRpcPredicate::default(),
-        expected_results,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_read_filter_data_plan_order_with_delete() {
-    test_helpers::maybe_start_logging();
-    let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=other}\n  FloatPoints timestamps: [250], values: [5.0]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [250], values: [70.5]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, zz_tag=A, _field=temp}\n  FloatPoints timestamps: [1000], values: [70.4]",
-        "Series tags={_measurement=h2o, city=Kingston, state=MA, zz_tag=A, _field=temp}\n  FloatPoints timestamps: [800], values: [70.1]",
-        "Series tags={_measurement=h2o, city=Kingston, state=MA, zz_tag=B, _field=temp}\n  FloatPoints timestamps: [100], values: [70.2]",
-    ];
-
-    run_read_filter_test_case(
-        MeasurementsSortableTagsWithDelete {},
         InfluxRpcPredicate::default(),
         expected_results,
     )
@@ -671,7 +435,7 @@ async fn test_read_filter_filter_on_value() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=system, host=host.local, _field=load4}\n  FloatPoints timestamps: [1527018806000000000, 1527018826000000000], values: [1.77, 1.77]",
+        "Series tags={_field=load4, _measurement=system, host=host.local}\n  FloatPoints timestamps: [1527018806000000000, 1527018826000000000], values: [1.77, 1.77]",
     ];
 
     run_read_filter_test_case(MeasurementsForDefect2845 {}, predicate, expected_results).await;
@@ -688,9 +452,9 @@ async fn test_read_filter_on_field() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
-        "Series tags={_measurement=o2, state=CA, _field=temp}\n  FloatPoints timestamps: [300], values: [79.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [50], values: [53.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
+        "Series tags={_field=temp, _measurement=o2, state=CA}\n  FloatPoints timestamps: [300], values: [79.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [50], values: [53.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
@@ -707,24 +471,30 @@ async fn test_read_filter_on_not_field() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=CA, _field=other_temp}\n  FloatPoints timestamps: [350], values: [72.4]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=moisture}\n  FloatPoints timestamps: [100000], values: [43.0]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=other_temp}\n  FloatPoints timestamps: [250], values: [70.4]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=reading}\n  FloatPoints timestamps: [50], values: [51.0]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=CA}\n  FloatPoints timestamps: [350], values: [72.4]",
+        "Series tags={_field=moisture, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [100000], values: [43.0]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [70.4]",
+        "Series tags={_field=reading, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [50], values: [51.0]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
 }
 
 #[tokio::test]
-async fn test_read_filter_unsupported_predicate() {
+async fn test_read_filter_unsupported_field_predicate() {
     test_helpers::maybe_start_logging();
 
-    // Predicate should pick up all fields other than 'temp' from h2o
-    // (_field != 'temp')
+    // Can not evaluate the following predicate as it refers to both
+    // _field and the values in the "tag" column, so we can't figure
+    // out which columns ("_field" prediate) at planning time -- we
+    // have to do it at runtime somehow
+    //
+    // https://github.com/influxdata/influxdb_iox/issues/5310
+
+    // (_field != 'temp') OR (city = "Boston")
     let p1 = col("_field")
         .not_eq(lit("temp"))
-        .or(col("_field").eq(lit("other_temp")));
+        .or(col("city").eq(lit("Boston")));
     let predicate = Predicate::default().with_expr(p1);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
@@ -746,7 +516,7 @@ async fn test_read_filter_on_field_single_measurement() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
+        "Series tags={_field=temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
@@ -763,13 +533,13 @@ async fn test_read_filter_multi_negation() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let expected_results = vec![
-        "Series tags={_measurement=attributes, _field=color}\n  StringPoints timestamps: [8000], values: [\"blue\"]",
-        "Series tags={_measurement=cpu_load_short, host=server01, _field=value}\n  FloatPoints timestamps: [1000], values: [27.99]",
-        "Series tags={_measurement=cpu_load_short, host=server01, region=us-east, _field=value}\n  FloatPoints timestamps: [3000], values: [1234567.891011]",
-        "Series tags={_measurement=cpu_load_short, host=server01, region=us-west, _field=value}\n  FloatPoints timestamps: [0, 4000], values: [0.64, 3e-6]",
-        "Series tags={_measurement=status, _field=active}\n  BooleanPoints timestamps: [7000], values: [true]",
-        "Series tags={_measurement=swap, host=server01, name=disk0, _field=in}\n  FloatPoints timestamps: [6000], values: [3.0]",
-        "Series tags={_measurement=swap, host=server01, name=disk0, _field=out}\n  FloatPoints timestamps: [6000], values: [4.0]",
+        "Series tags={_field=color, _measurement=attributes}\n  StringPoints timestamps: [8000], values: [\"blue\"]",
+        "Series tags={_field=value, _measurement=cpu_load_short, host=server01}\n  FloatPoints timestamps: [1000], values: [27.99]",
+        "Series tags={_field=value, _measurement=cpu_load_short, host=server01, region=us-east}\n  FloatPoints timestamps: [3000], values: [1234567.891011]",
+        "Series tags={_field=value, _measurement=cpu_load_short, host=server01, region=us-west}\n  FloatPoints timestamps: [0, 4000], values: [0.64, 3e-6]",
+        "Series tags={_field=active, _measurement=status}\n  BooleanPoints timestamps: [7000], values: [true]",
+        "Series tags={_field=in, _measurement=swap, host=server01, name=disk0}\n  FloatPoints timestamps: [6000], values: [3.0]",
+        "Series tags={_field=out, _measurement=swap, host=server01, name=disk0}\n  FloatPoints timestamps: [6000], values: [4.0]",
     ];
 
     run_read_filter_test_case(EndToEndTest {}, predicate, expected_results).await;
@@ -793,14 +563,48 @@ async fn test_read_filter_on_field_multi_measurement() {
 
     // SHOULD NOT contain temp from h2o
     let expected_results = vec![
-        "Series tags={_measurement=h2o, city=Boston, state=CA, _field=other_temp}\n  FloatPoints timestamps: [350], values: [72.4]",
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=other_temp}\n  FloatPoints timestamps: [250], values: [70.4]",
-        // This series should not be here (_field = temp)
-        // WRONG ANSWER, tracked by: https://github.com/influxdata/influxdb_iox/issues/3428
-        "Series tags={_measurement=h2o, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [50, 100000], values: [70.4, 70.4]",
-        "Series tags={_measurement=o2, state=CA, _field=temp}\n  FloatPoints timestamps: [300], values: [79.0]",
-        "Series tags={_measurement=o2, city=Boston, state=MA, _field=temp}\n  FloatPoints timestamps: [50], values: [53.4]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=CA}\n  FloatPoints timestamps: [350], values: [72.4]",
+        "Series tags={_field=other_temp, _measurement=h2o, city=Boston, state=MA}\n  FloatPoints timestamps: [250], values: [70.4]",
+        "Series tags={_field=temp, _measurement=o2, state=CA}\n  FloatPoints timestamps: [300], values: [79.0]",
+        "Series tags={_field=temp, _measurement=o2, city=Boston, state=MA}\n  FloatPoints timestamps: [50], values: [53.4]",
     ];
 
     run_read_filter_test_case(TwoMeasurementsManyFields {}, predicate, expected_results).await;
+}
+
+#[tokio::test]
+async fn test_read_filter_with_periods() {
+    test_helpers::maybe_start_logging();
+
+    let predicate = Predicate::default().with_range(0, 1700000001000000000);
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+
+    // Should return both series
+    let expected_results = vec![
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value, tag.two=other}\n  FloatPoints timestamps: [1609459201000000001], values: [1.0]",
+        "Series tags={_field=field.two, _measurement=measurement.one, tag.one=value, tag.two=other}\n  BooleanPoints timestamps: [1609459201000000001], values: [true]",
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value2, tag.two=other2}\n  FloatPoints timestamps: [1609459201000000002], values: [1.0]",
+        "Series tags={_field=field.two, _measurement=measurement.one, tag.one=value2, tag.two=other2}\n  BooleanPoints timestamps: [1609459201000000002], values: [false]",
+    ];
+
+    run_read_filter_test_case(PeriodsInNames {}, predicate, expected_results).await;
+}
+
+#[tokio::test]
+async fn test_read_filter_with_periods_predicates() {
+    test_helpers::maybe_start_logging();
+
+    let predicate = Predicate::default()
+        .with_range(0, 1700000001000000000)
+        // tag.one = "value"
+        .with_expr("tag.one".as_expr().eq(lit("value")));
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+
+    // Should return both series
+    let expected_results = vec![
+        "Series tags={_field=field.one, _measurement=measurement.one, tag.one=value, tag.two=other}\n  FloatPoints timestamps: [1609459201000000001], values: [1.0]",
+        "Series tags={_field=field.two, _measurement=measurement.one, tag.one=value, tag.two=other}\n  BooleanPoints timestamps: [1609459201000000001], values: [true]",
+    ];
+
+    run_read_filter_test_case(PeriodsInNames {}, predicate, expected_results).await;
 }

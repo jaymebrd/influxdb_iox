@@ -1,3 +1,4 @@
+//! Catalog-DSN-related configs.
 use iox_catalog::{
     create_or_get_default_records,
     interface::Catalog,
@@ -9,6 +10,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use std::{ops::DerefMut, sync::Arc, time::Duration};
 
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 pub enum Error {
     #[snafu(display("A Postgres connection string in --catalog-dsn is required."))]
     ConnectionStringRequired,
@@ -46,8 +48,8 @@ fn default_hotswap_poll_interval_timeout() -> &'static str {
 pub struct CatalogDsnConfig {
     /// The type of catalog to use. "memory" is only useful for testing purposes.
     #[clap(
-        arg_enum,
-        long = "--catalog",
+        value_enum,
+        long = "catalog",
         env = "INFLUXDB_IOX_CATALOG_TYPE",
         default_value = "postgres",
         action
@@ -55,12 +57,12 @@ pub struct CatalogDsnConfig {
     pub(crate) catalog_type_: CatalogType,
 
     /// Postgres connection string. Required if catalog is set to postgres.
-    #[clap(long = "--catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN", action)]
+    #[clap(long = "catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN", action)]
     pub dsn: Option<String>,
 
     /// Maximum number of connections allowed to the catalog at any one time.
     #[clap(
-        long = "--catalog-max-connections",
+        long = "catalog-max-connections",
         env = "INFLUXDB_IOX_CATALOG_MAX_CONNECTIONS",
         default_value = default_max_connections(),
         action,
@@ -69,7 +71,7 @@ pub struct CatalogDsnConfig {
 
     /// Schema name for PostgreSQL-based catalogs.
     #[clap(
-        long = "--catalog-postgres-schema-name",
+        long = "catalog-postgres-schema-name",
         env = "INFLUXDB_IOX_CATALOG_POSTGRES_SCHEMA_NAME",
         default_value = PostgresConnectionOptions::DEFAULT_SCHEMA_NAME,
         action,
@@ -78,7 +80,7 @@ pub struct CatalogDsnConfig {
 
     /// Set the amount of time to attempt connecting to the database.
     #[clap(
-        long = "--catalog-connect-timeout",
+        long = "catalog-connect-timeout",
         env = "INFLUXDB_IOX_CATALOG_CONNECT_TIMEOUT",
         default_value = default_connect_timeout(),
         value_parser = humantime::parse_duration,
@@ -87,7 +89,7 @@ pub struct CatalogDsnConfig {
 
     /// Set a maximum idle duration for individual connections.
     #[clap(
-        long = "--catalog-idle-timeout",
+        long = "catalog-idle-timeout",
         env = "INFLUXDB_IOX_CATALOG_IDLE_TIMEOUT",
         default_value = default_idle_timeout(),
         value_parser = humantime::parse_duration,
@@ -99,7 +101,7 @@ pub struct CatalogDsnConfig {
     ///
     /// If an update is encountered, the underlying connection pool will be hot-swapped.
     #[clap(
-        long = "--catalog-hotswap-poll-interval",
+        long = "catalog-hotswap-poll-interval",
         env = "INFLUXDB_IOX_CATALOG_HOTSWAP_POLL_INTERVAL",
         default_value = default_hotswap_poll_interval_timeout(),
         value_parser = humantime::parse_duration,
@@ -107,9 +109,13 @@ pub struct CatalogDsnConfig {
     pub hotswap_poll_interval: Duration,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ArgEnum)]
+/// Catalog type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum CatalogType {
+    /// PostgreSQL.
     Postgres,
+
+    /// In-memory.
     Memory,
 }
 
@@ -145,6 +151,7 @@ impl CatalogDsnConfig {
         }
     }
 
+    /// Get config-dependent catalog.
     pub async fn get_catalog(
         &self,
         app_name: &'static str,

@@ -11,7 +11,7 @@ pub enum CommonServerStateError {
     Tracing { source: trace_exporters::Error },
 }
 
-/// Common state used by all server types (e.g. `Database` and `Router`)
+/// Common state used by all server types
 #[derive(Debug, Clone)]
 pub struct CommonServerState {
     run_config: RunConfig,
@@ -32,7 +32,7 @@ impl CommonServerState {
         use clap::Parser;
 
         Self::from_config(
-            RunConfig::try_parse_from(&["not_used"]).expect("default parsing should work"),
+            RunConfig::try_parse_from(["not_used"]).expect("default parsing should work"),
         )
         .expect("default configs should work")
     }

@@ -4,13 +4,21 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use chrono::{DateTime, TimeZone, Timelike, Utc};
-use parking_lot::RwLock;
-use std::ops::{Add, Sub};
-use std::time::Duration;
+use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
+use std::{
+    future::Future,
+    ops::{Add, Sub},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
 /// A UTC Timestamp returned by a [`TimeProvider`]
 ///
@@ -67,8 +75,8 @@ impl std::fmt::Display for Time {
 }
 
 impl Time {
-    pub const MAX: Self = Self(chrono::MAX_DATETIME);
-    pub const MIN: Self = Self(chrono::MIN_DATETIME);
+    pub const MAX: Self = Self(DateTime::<Utc>::MAX_UTC);
+    pub const MIN: Self = Self(DateTime::<Utc>::MIN_UTC);
 
     /// Makes a new `Time` from the number of non-leap nanoseconds
     /// since January 1, 1970 0:00:00 UTC (aka "UNIX timestamp").
@@ -78,15 +86,15 @@ impl Time {
 
     /// Makes a new `DateTime` from the number of non-leap milliseconds
     /// since January 1, 1970 0:00:00 UTC (aka "UNIX timestamp").
-    pub fn from_timestamp_millis(millis: i64) -> Self {
-        Self(Utc.timestamp_millis(millis))
+    pub fn from_timestamp_millis(millis: i64) -> Option<Self> {
+        Utc.timestamp_millis_opt(millis).single().map(Self)
     }
 
     /// Makes a new `Time` from the number of non-leap seconds
     /// since January 1, 1970 0:00:00 UTC (aka "UNIX timestamp")
     /// and the number of nanoseconds since the last whole non-leap second.
-    pub fn from_timestamp(secs: i64, nanos: u32) -> Self {
-        Self(Utc.timestamp(secs, nanos))
+    pub fn from_timestamp(secs: i64, nanos: u32) -> Option<Self> {
+        Utc.timestamp_opt(secs, nanos).single().map(Self)
     }
 
     /// Makes a new `Time` from the provided [`DateTime<Utc>`]
@@ -176,6 +184,26 @@ impl Time {
 pub trait TimeProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Returns the current `Time`. No guarantees are made about monotonicity
     fn now(&self) -> Time;
+
+    /// Sleep for the given duration.
+    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.sleep_until(self.now() + d)
+    }
+
+    /// Sleep until given time.
+    fn sleep_until(&self, t: Time) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    /// Return a time that is the specified number of minutes in the past relative to this
+    /// provider's `now`.
+    fn minutes_ago(&self, minutes_ago: u64) -> Time {
+        self.now() - Duration::from_secs(60 * minutes_ago)
+    }
+
+    /// Return a time that is the specified number of hours in the past relative to this provider's
+    /// `now`.
+    fn hours_ago(&self, hours_ago: u64) -> Time {
+        self.now() - Duration::from_secs(60 * 60 * hours_ago)
+    }
 }
 
 /// A [`TimeProvider`] that uses [`Utc::now`] as a clock source
@@ -192,35 +220,106 @@ impl TimeProvider for SystemProvider {
     fn now(&self) -> Time {
         Time(Utc::now())
     }
+
+    fn sleep_until(&self, t: Time) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let d = t.checked_duration_since(self.now());
+
+        Box::pin(async move {
+            if let Some(d) = d {
+                tokio::time::sleep(d).await;
+            }
+        })
+    }
+}
+
+/// Internal state fo [`MockProvider`]
+#[derive(Debug)]
+struct MockProviderInner {
+    now: Time,
+    waiting: Vec<Waker>,
 }
 
 /// A [`TimeProvider`] that returns a fixed `Time` that can be set by [`MockProvider::set`]
 #[derive(Debug)]
 pub struct MockProvider {
-    now: RwLock<Time>,
+    inner: Arc<RwLock<MockProviderInner>>,
 }
 
 impl MockProvider {
     pub fn new(start: Time) -> Self {
         Self {
-            now: RwLock::new(start),
+            inner: Arc::new(RwLock::new(MockProviderInner {
+                now: start,
+                waiting: vec![],
+            })),
         }
     }
 
     pub fn set(&self, time: Time) {
-        *self.now.write() = time
+        let mut inner = self.inner.write();
+        inner.now = time;
+        for waiter in inner.waiting.drain(..) {
+            waiter.wake()
+        }
     }
 
     pub fn inc(&self, duration: Duration) -> Time {
-        let mut now = self.now.write();
-        *now = *now + duration;
-        *now
+        let mut inner = self.inner.write();
+        inner.now = inner.now + duration;
+        for waiter in inner.waiting.drain(..) {
+            waiter.wake()
+        }
+        inner.now
     }
 }
 
 impl TimeProvider for MockProvider {
     fn now(&self) -> Time {
-        *self.now.read()
+        self.inner.read().now
+    }
+
+    fn sleep_until(&self, t: Time) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(MockSleep {
+            inner: Arc::clone(&self.inner),
+            deadline: t,
+        })
+    }
+}
+
+struct MockSleep {
+    inner: Arc<RwLock<MockProviderInner>>,
+    deadline: Time,
+}
+
+impl Future for MockSleep {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.inner.upgradable_read();
+        if inner.now >= self.deadline {
+            Poll::Ready(())
+        } else {
+            let mut inner = RwLockUpgradableReadGuard::upgrade(inner);
+            inner.waiting.push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> TimeProvider for Arc<T>
+where
+    T: TimeProvider,
+{
+    fn now(&self) -> Time {
+        (**self).now()
+    }
+
+    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        (**self).sleep(d)
+    }
+
+    fn sleep_until(&self, t: Time) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        (**self).sleep_until(t)
     }
 }
 
@@ -229,7 +328,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_instant_provider() {
+    fn test_system_provider_now() {
         let provider = SystemProvider::new();
         let a = provider.now();
         std::thread::sleep(Duration::from_secs(1));
@@ -242,8 +341,34 @@ mod test {
         assert!(b <= c);
     }
 
+    #[tokio::test]
+    async fn test_system_provider_sleep() {
+        let provider = SystemProvider::new();
+
+        let a = provider.now();
+        provider.sleep(Duration::from_secs(1)).await;
+        let b = provider.now();
+
+        let delta = b - a;
+        assert!(delta > Duration::from_millis(500));
+        assert!(delta < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_system_provider_sleep_until() {
+        let provider = SystemProvider::new();
+
+        let a = provider.now();
+        provider.sleep_until(a + Duration::from_secs(1)).await;
+        let b = provider.now();
+
+        let delta = b - a;
+        assert!(delta > Duration::from_millis(500));
+        assert!(delta < Duration::from_secs(5));
+    }
+
     #[test]
-    fn test_mock_provider() {
+    fn test_mock_provider_now() {
         let provider = MockProvider::new(Time::from_timestamp_nanos(0));
         assert_eq!(provider.now().timestamp_nanos(), 0);
         assert_eq!(provider.now().timestamp_nanos(), 0);
@@ -251,6 +376,142 @@ mod test {
         provider.set(Time::from_timestamp_nanos(12));
         assert_eq!(provider.now().timestamp_nanos(), 12);
         assert_eq!(provider.now().timestamp_nanos(), 12);
+    }
+
+    #[tokio::test]
+    async fn test_mock_provider_sleep() {
+        let provider = MockProvider::new(Time::from_timestamp_nanos(0));
+
+        // not sleeping finishes instantly
+        provider.sleep(Duration::from_secs(0)).await;
+
+        // ==== sleep with `inc` ====
+        let fut = provider.sleep(Duration::from_millis(100));
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+
+        // does not finish immediately
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when not incremented enough
+        provider.inc(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // finishes once incremented at least to the duration
+        provider.inc(Duration::from_millis(50));
+        handle.await.unwrap();
+
+        // finishes also when "overshooting" the duration
+        let fut = provider.sleep(Duration::from_millis(100));
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+        provider.inc(Duration::from_millis(101));
+        handle.await.unwrap();
+
+        // ==== sleep with `set` ====
+        provider.set(Time::from_timestamp_millis(100).unwrap());
+        let fut = provider.sleep(Duration::from_millis(100));
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+
+        // does not finish immediately
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when time goes backwards
+        provider.set(Time::from_timestamp_millis(0).unwrap());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when time goes forward but not enough
+        provider.set(Time::from_timestamp_millis(150).unwrap());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // finishes when time is set at least to the wait duration
+        provider.set(Time::from_timestamp_millis(200).unwrap());
+        handle.await.unwrap();
+
+        // also finishes when "overshooting"
+        let fut = provider.sleep(Duration::from_millis(100));
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+        provider.set(Time::from_timestamp_millis(301).unwrap());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mock_provider_sleep_until() {
+        let provider = MockProvider::new(Time::from_timestamp_nanos(0));
+
+        // not sleeping finishes instantly
+        provider.sleep(Duration::from_secs(0)).await;
+
+        // ==== sleep with `inc` ====
+        let fut = provider.sleep_until(Time::from_timestamp_millis(100).unwrap());
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+
+        // does not finish immediately
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when not incremented enough
+        provider.inc(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // finishes once incremented at least to the duration
+        provider.inc(Duration::from_millis(50));
+        handle.await.unwrap();
+
+        // finishes also when "overshooting" the duration
+        let fut = provider.sleep_until(Time::from_timestamp_millis(200).unwrap());
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+        provider.inc(Duration::from_millis(101));
+        handle.await.unwrap();
+
+        // ==== sleep with `set` ====
+        provider.set(Time::from_timestamp_millis(100).unwrap());
+        let fut = provider.sleep_until(Time::from_timestamp_millis(200).unwrap());
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+
+        // does not finish immediately
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when time goes backwards
+        provider.set(Time::from_timestamp_millis(0).unwrap());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // does not finish when time goes forward but not enough
+        provider.set(Time::from_timestamp_millis(150).unwrap());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        // finishes when time is set at least to the wait duration
+        provider.set(Time::from_timestamp_millis(200).unwrap());
+        handle.await.unwrap();
+
+        // also finishes when "overshooting"
+        let fut = provider.sleep_until(Time::from_timestamp_millis(300).unwrap());
+        let handle = tokio::task::spawn(async move {
+            fut.await;
+        });
+        provider.set(Time::from_timestamp_millis(301).unwrap());
+        handle.await.unwrap();
     }
 
     #[test]
@@ -266,14 +527,18 @@ mod test {
             assert_eq!(
                 time,
                 Time::from_timestamp(date_time.timestamp(), date_time.timestamp_subsec_nanos())
+                    .unwrap(),
             );
             assert_eq!(
                 time,
                 Time::from_timestamp_nanos(date_time.timestamp_nanos())
             );
             assert_eq!(
-                Time::from_timestamp_millis(date_time.timestamp_millis()),
-                Time::from_date_time(Utc.timestamp_millis(date_time.timestamp_millis()))
+                Time::from_timestamp_millis(date_time.timestamp_millis()).unwrap(),
+                Time::from_date_time(
+                    Utc.timestamp_millis_opt(date_time.timestamp_millis())
+                        .unwrap()
+                )
             );
 
             assert_eq!(time.timestamp_nanos(), date_time.timestamp_nanos());
@@ -332,5 +597,29 @@ mod test {
         assert!(Time::from_timestamp_nanos(505)
             .checked_duration_since(Time::from_timestamp_nanos(506))
             .is_none());
+    }
+
+    #[test]
+    fn test_minutes_ago() {
+        let now = "2022-07-07T00:00:00+00:00";
+        let ago = "2022-07-06T22:38:00+00:00";
+
+        let provider = MockProvider::new(Time::from_rfc3339(now).unwrap());
+
+        let min_ago = provider.minutes_ago(82);
+        assert_eq!(min_ago, Time::from_timestamp_nanos(1657147080000000000));
+        assert_eq!(min_ago.to_rfc3339(), ago);
+    }
+
+    #[test]
+    fn test_hours_ago() {
+        let now = "2022-07-07T00:00:00+00:00";
+        let ago = "2022-07-03T14:00:00+00:00";
+
+        let provider = MockProvider::new(Time::from_rfc3339(now).unwrap());
+
+        let hrs_ago = provider.hours_ago(82);
+        assert_eq!(hrs_ago, Time::from_timestamp_nanos(1656856800000000000));
+        assert_eq!(hrs_ago.to_rfc3339(), ago);
     }
 }

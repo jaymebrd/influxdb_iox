@@ -1,36 +1,28 @@
-use super::QuerierTable;
+use super::{PruneMetrics, QuerierTable, QuerierTableArgs};
 use crate::{
     cache::CatalogCache, chunk::ChunkAdapter, create_ingester_connection_for_testing,
-    IngesterPartition, QuerierChunkLoadSetting,
+    IngesterPartition,
 };
 use arrow::record_batch::RecordBatch;
-use data_types::{ChunkId, KafkaPartition, ParquetFileId, SequenceNumber};
+use data_types::{ChunkId, SequenceNumber, ShardIndex};
 use iox_catalog::interface::get_schema_by_name;
-use iox_tests::util::{TestCatalog, TestPartition, TestSequencer, TestTable};
+use iox_tests::util::{TestCatalog, TestPartition, TestShard, TestTable};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
-use parquet_file::storage::ParquetStorage;
-use schema::{selection::Selection, sort::SortKey, Schema};
+use schema::{sort::SortKey, Projection, Schema};
 use sharder::JumpHash;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+use tokio::runtime::Handle;
 
 /// Create a [`QuerierTable`] for testing.
-pub async fn querier_table(
-    catalog: &Arc<TestCatalog>,
-    table: &Arc<TestTable>,
-    load_settings: HashMap<ParquetFileId, QuerierChunkLoadSetting>,
-) -> QuerierTable {
+pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -> QuerierTable {
     let catalog_cache = Arc::new(CatalogCache::new_testing(
         catalog.catalog(),
         catalog.time_provider(),
         catalog.metric_registry(),
-        usize::MAX,
+        catalog.object_store(),
+        &Handle::current(),
     ));
-    let chunk_adapter = Arc::new(ChunkAdapter::new(
-        catalog_cache,
-        ParquetStorage::new(catalog.object_store()),
-        catalog.metric_registry(),
-        load_settings,
-    ));
+    let chunk_adapter = Arc::new(ChunkAdapter::new(catalog_cache, catalog.metric_registry()));
 
     let mut repos = catalog.catalog.repositories().await;
     let mut catalog_schema = get_schema_by_name(&table.namespace.namespace.name, repos.as_mut())
@@ -41,28 +33,31 @@ pub async fn querier_table(
 
     let namespace_name = Arc::from(table.namespace.namespace.name.as_str());
 
-    QuerierTable::new(
-        Arc::new(JumpHash::new((0..1).map(KafkaPartition::new).map(Arc::new)).unwrap()),
+    QuerierTable::new(QuerierTableArgs {
+        sharder: Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new))),
+        namespace_id: table.namespace.namespace.id,
         namespace_name,
-        table.table.id,
-        table.table.name.clone().into(),
+        table_id: table.table.id,
+        table_name: table.table.name.clone().into(),
         schema,
-        Some(create_ingester_connection_for_testing()),
+        ingester_connection: Some(create_ingester_connection_for_testing()),
         chunk_adapter,
-    )
+        exec: catalog.exec(),
+        max_query_bytes: usize::MAX,
+        prune_metrics: Arc::new(PruneMetrics::new(&catalog.metric_registry())),
+    })
 }
 
 /// Convert the line protocol in `lp `to a RecordBatch
 pub(crate) fn lp_to_record_batch(lp: &str) -> RecordBatch {
-    lp_to_mutable_batch(lp).1.to_arrow(Selection::All).unwrap()
+    lp_to_mutable_batch(lp).1.to_arrow(Projection::All).unwrap()
 }
 
 /// Helper for creating IngesterPartitions
 #[derive(Debug, Clone)]
 pub(crate) struct IngesterPartitionBuilder {
-    table: Arc<TestTable>,
     schema: Arc<Schema>,
-    sequencer: Arc<TestSequencer>,
+    shard: Arc<TestShard>,
     partition: Arc<TestPartition>,
     ingester_name: Arc<str>,
     ingester_chunk_id: u128,
@@ -75,15 +70,13 @@ pub(crate) struct IngesterPartitionBuilder {
 
 impl IngesterPartitionBuilder {
     pub(crate) fn new(
-        table: &Arc<TestTable>,
         schema: &Arc<Schema>,
-        sequencer: &Arc<TestSequencer>,
+        shard: &Arc<TestShard>,
         partition: &Arc<TestPartition>,
     ) -> Self {
         Self {
-            table: Arc::clone(table),
             schema: Arc::clone(schema),
-            sequencer: Arc::clone(sequencer),
+            shard: Arc::clone(shard),
             partition: Arc::clone(partition),
             ingester_name: Arc::from("ingester1"),
             partition_sort_key: Arc::new(None),
@@ -125,9 +118,8 @@ impl IngesterPartitionBuilder {
 
         IngesterPartition::new(
             Arc::clone(&self.ingester_name),
-            Arc::from(self.table.table.name.as_str()),
             self.partition.partition.id,
-            self.sequencer.sequencer.id,
+            self.shard.shard.id,
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
             Arc::clone(&self.partition_sort_key),

@@ -8,7 +8,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
@@ -21,7 +23,7 @@ use snafu::{ResultExt, Snafu};
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
 pub enum Error {
-    #[snafu(display("error parsing line {}: {}", line, source))]
+    #[snafu(display("error parsing line {} (1-based): {}", line, source))]
     LineProtocol {
         source: influxdb_line_protocol::Error,
         line: usize,
@@ -325,7 +327,7 @@ mod tests {
     use super::*;
     use arrow_util::assert_batches_eq;
     use assert_matches::assert_matches;
-    use schema::selection::Selection;
+    use schema::Projection;
 
     #[test]
     fn test_basic() {
@@ -351,7 +353,7 @@ mod tests {
                 "| 2    | v1   | v2   | 1970-01-01T00:00:00.000000005Z |     |",
                 "+------+------+------+--------------------------------+-----+",
             ],
-            &[batches["cpu"].to_arrow(Selection::All).unwrap()]
+            &[batches["cpu"].to_arrow(Projection::All).unwrap()]
         );
 
         assert_batches_eq!(
@@ -363,7 +365,7 @@ mod tests {
                 "| 2    | v5   | 1970-01-01T00:00:00.000000001Z |",
                 "+------+------+--------------------------------+",
             ],
-            &[batches["mem"].to_arrow(Selection::All).unwrap()]
+            &[batches["mem"].to_arrow(Projection::All).unwrap()]
         );
     }
 
@@ -376,7 +378,7 @@ m f1=10i 1639612800000000000
         let batches = lines_to_batches(lp, 5).unwrap();
         assert_eq!(batches.len(), 1);
 
-        let batch = batches["m"].to_arrow(Selection::All).unwrap();
+        let batch = batches["m"].to_arrow(Projection::All).unwrap();
         assert_batches_eq!(
             &[
                 "+-----+----+----------------------+",
@@ -410,7 +412,7 @@ m b=t 1639612800000000000
         let batches = lines_to_batches(lp, 5).unwrap();
         assert_eq!(batches.len(), 1);
 
-        let batch = batches["m"].to_arrow(Selection::All).unwrap();
+        let batch = batches["m"].to_arrow(Projection::All).unwrap();
         assert_batches_eq!(
             &[
                 "+------+---+----------------------+---+",
@@ -462,7 +464,7 @@ m b=t 1639612800000000000
                     "| 1970-01-01T00:00:00Z | 2   |",
                     "+----------------------+-----+",
                 ],
-                &[batches["m1"].to_arrow(Selection::All).unwrap()]
+                &[batches["m1"].to_arrow(Projection::All).unwrap()]
             );
         }
 
@@ -482,7 +484,7 @@ m b=t 1639612800000000000
                     "| 1970-01-01T00:00:00Z | 2   |",
                     "+----------------------+-----+",
                 ],
-                &[batches["m1"].to_arrow(Selection::All).unwrap()]
+                &[batches["m1"].to_arrow(Projection::All).unwrap()]
             );
         }
 

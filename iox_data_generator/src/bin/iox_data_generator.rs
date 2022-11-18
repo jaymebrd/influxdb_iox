@@ -13,8 +13,10 @@
 use chrono::prelude::*;
 use chrono_english::{parse_date_string, Dialect};
 use iox_data_generator::{specification::DataSpec, write::PointsWriterBuilder};
-use std::fs::File;
-use std::io::{self, BufRead};
+use std::{
+    fs::File,
+    io::{self, BufRead},
+};
 use tracing::info;
 
 #[derive(clap::Parser)]
@@ -46,7 +48,15 @@ Logging:
     RUST_LOG=iox_data_generator=info iox_data_generator -s spec.toml -o lp
 "#,
     author,
-    version
+    version,
+    disable_help_flag = true,
+    arg(
+        clap::Arg::new("help")
+            .long("help")
+            .help("Print help information")
+            .action(clap::ArgAction::Help)
+            .global(true)
+    ),
 )]
 struct Config {
     /// Path to the specification TOML file describing the data generation
@@ -57,13 +67,18 @@ struct Config {
     #[clap(long, action)]
     print: bool,
 
-    /// Runs the generation with agents writing to a sink. Useful for quick stress test to see how much resources the generator will take
+    /// Runs the generation with agents writing to a sink. Useful for quick stress test to see how
+    /// much resources the generator will take
     #[clap(long, action)]
     noop: bool,
 
-    /// The filename to write line protocol
+    /// The directory to write line protocol to
     #[clap(long, short, action)]
     output: Option<String>,
+
+    /// The directory to write Parquet files to
+    #[clap(long, short, action)]
+    parquet: Option<String>,
 
     /// The host name part of the API endpoint to write to
     #[clap(long, short, action)]
@@ -105,7 +120,8 @@ struct Config {
     #[clap(long = "continue", action)]
     do_continue: bool,
 
-    /// Generate this many samplings to batch into a single API call. Good for sending a bunch of historical data in quickly if paired with a start time from long ago.
+    /// Generate this many samplings to batch into a single API call. Good for sending a bunch of
+    /// historical data in quickly if paired with a start time from long ago.
     #[clap(long, action, default_value = "1")]
     batch_size: usize,
 
@@ -142,11 +158,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_spec = DataSpec::from_file(&config.specification)?;
 
-    // TODO: parquet output
-
     let mut points_writer_builder = if let Some(line_protocol_filename) = config.output {
         PointsWriterBuilder::new_file(line_protocol_filename)?
-    } else if let Some(host) = config.host {
+    } else if let Some(parquet_directory) = config.parquet {
+        PointsWriterBuilder::new_parquet(parquet_directory)?
+    } else if let Some(ref host) = config.host {
         let token = config.token.expect("--token must be specified");
 
         PointsWriterBuilder::new_api(host, token, config.jaeger_debug_header.as_deref()).await?
@@ -158,19 +174,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("One of --print or --output or --host must be provided.");
     };
 
-    let buckets = match (config.org, config.bucket, config.database_list) {
-        (Some(org), Some(bucket), None) => {
-            vec![format!("{}_{}", org, bucket)]
-        }
-        (None, None, Some(bucket_list)) => {
-            let f = File::open(bucket_list).expect("unable to open database_list file");
+    let buckets = if config.host.is_some() {
+        // Buckets are only relevant if we're writing to the API
+        match (config.org, config.bucket, config.database_list) {
+            (Some(org), Some(bucket), None) => {
+                vec![format!("{}_{}", org, bucket)]
+            }
+            (None, None, Some(bucket_list)) => {
+                let f = File::open(bucket_list).expect("unable to open database_list file");
 
-            io::BufReader::new(f)
-                .lines()
-                .map(|l| l.expect("unable to read database from database_list file"))
-                .collect::<Vec<_>>()
+                io::BufReader::new(f)
+                    .lines()
+                    .map(|l| l.expect("unable to read database from database_list file"))
+                    .collect::<Vec<_>>()
+            }
+            _ => panic!("must specify either --org AND --bucket OR --database_list"),
         }
-        _ => panic!("must specify either --org AND --bucket OR --database_list"),
+    } else {
+        // But we need at least one database or nothing will be written anywhere
+        vec![String::from("org_bucket")]
     };
 
     let result = iox_data_generator::generate(

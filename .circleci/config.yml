@@ -15,9 +15,33 @@
 # On main if all these checks pass it will then additionally compile in "release" mode and
 # publish a docker image to quay.io/influxdb/iox:$COMMIT_SHA
 #
-# Manual CI Image:
+# Manually trigger build and push of container image for a branch:
 #
-# It is possible to manually trigger a rebuild of the image used in CI. To do this, navigate to
+# Navigate to https://app.circleci.com/pipelines/github/influxdata/influxdb_iox?branch=<branch-name> (<- change this!)
+# Then:
+#
+# - Click "Run Pipeline" in the top-right
+# - Expand "Add Parameters"
+# - Add a "boolean" parameter called "release_branch" with the value true
+# - Click "Run Pipeline"
+#
+# You can also do this using the CircleCI API:
+#
+# Using `xh`:
+#
+#   # e.g. using 'xh' (https://github.com/ducaale/xh)
+#   $ xh -a '<your personal circleCI token>:' POST \
+#       https://circleci.com/api/v2/project/github/influxdata/influxdb_iox/pipeline \
+#       parameters:='{"release_branch": true}' branch=chore/ci-tidy-up
+#
+# ...or equivalent with `curl`:
+#   $ curl -XPOST -H "Content-Type: application/json" -H "Circle-Token: <your personal circleCI token>" \
+#       -d '{"parameters": {"release_branch": true}, "branch": "chore/ci-tidy-up"}' \
+#       https://circleci.com/api/v2/project/github/influxdata/influxdb_iox/pipeline
+#
+# Manual CI Base Image:
+#
+# It is possible to manually trigger a rebuild of the base image used in CI. To do this, navigate to
 # https://app.circleci.com/pipelines/github/influxdata/influxdb_iox?branch=main (overriding the
 # branch name if desired). Then:
 # - Click "Run Pipeline" in the top-right
@@ -133,7 +157,7 @@ jobs:
       - cache_restore
       - run:
           name: Install cargo-deny
-          command: cargo install --force cargo-deny
+          command: cargo install cargo-deny
       - run:
           name: cargo-deny Checks
           command: cargo deny check -s
@@ -158,8 +182,7 @@ jobs:
       - cache_restore
       - run:
           name: Cargo doc
-          # excluding datafusion because it's effectively a dependency masqueraded as workspace crate.
-          command: cargo doc --document-private-items --no-deps --workspace --exclude datafusion
+          command: cargo doc --document-private-items --no-deps --workspace
       - cache_save
       - run:
           name: Compress Docs
@@ -206,12 +229,12 @@ jobs:
     # setup multiple docker images (see https://circleci.com/docs/2.0/configuration-reference/#docker)
     docker:
       - image: quay.io/influxdb/rust:ci
-      - image: vectorized/redpanda:v21.9.2
+      - image: vectorized/redpanda:v22.1.5
         command: redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M
       - image: postgres
         environment:
           POSTGRES_HOST_AUTH_METHOD: trust
-    resource_class: 2xlarge # use of a smaller executor tends crashes on link
+    resource_class: 2xlarge+ # use of a smaller executor tends crashes on link
     environment:
       # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
       CARGO_INCREMENTAL: "0"
@@ -228,8 +251,8 @@ jobs:
       POSTGRES_USER: postgres
       TEST_INFLUXDB_IOX_CATALOG_DSN: "postgres://postgres@localhost/iox_shared"
       # When removing this, also remove the ignore on the test in trogging/src/cli.rs
-      RUST_LOG: debug
-      LOG_FILTER: debug
+      RUST_LOG: debug,,hyper::proto::h1=info,h2=info
+      LOG_FILTER: debug,,hyper::proto::h1=info,h2=info
     steps:
       - checkout
       - rust_components
@@ -273,9 +296,10 @@ jobs:
     environment:
       # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
       CARGO_INCREMENTAL: "0"
-      # Disable full debug symbol generation to speed up CI build
-      # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      # - Disable full debug symbol generation to speed up CI build
+      #   "1" means line tables only, which is useful for panic tracebacks.
+      # - Enable tokio-console
+      RUSTFLAGS: "-C debuginfo=1 --cfg tokio_unstable"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # The `2xlarge` resource class that we use has 32GB RAM but also 16 CPUs. This means we have 2GB RAM per core on
@@ -292,8 +316,8 @@ jobs:
           name: Check benches compile
           command: cargo check --workspace --benches
       - run:
-          name: Check object store + exporter support + HEAP profiling compiles
-          command: cargo check --no-default-features --features="aws,gcp,azure,heappy,pprof"
+          name: Check extra features (like prod image)
+          command: cargo check --no-default-features --features="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,pprof"
       - run:
           # Validate that the data generator compiles (in the same way as it does in release builds)
           name: Check iox_data_generator compiles
@@ -357,12 +381,8 @@ jobs:
     environment:
       # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
       CARGO_INCREMENTAL: "0"
-      # We keep the debug symbols (Enabled in Cargo.toml as debug = true)
-      # workaround dynamic CPU detection bug in croaring
-      # https://github.com/influxdata/influxdb_iox/pull/2119
-      ROARING_ARCH: "haswell"
-      # Use avx512 instructions to take full advantage of the CPUs instruction set
-      RUSTFLAGS: "-C target-feature=+avx2 -C link-arg=-fuse-ld=lld --cfg tokio_unstable"
+      # Enable tokio-console
+      RUSTFLAGS: "--cfg tokio_unstable"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -512,9 +532,8 @@ parameters:
     description: "Trigger build of CI image"
     type: boolean
     default: false
-  build_perf:
-    # see comments below in build_perf job for usage
-    description: "Trigger build of perf image"
+  release_branch:
+    description: "Build and push container image for non-main branch"
     type: boolean
     default: false
 
@@ -526,7 +545,7 @@ workflows:
     when:
       and:
         - not: << pipeline.parameters.ci_image >>
-        - not: << pipeline.parameters.build_perf >>
+        - not: << pipeline.parameters.release_branch >>
     jobs:
       - fmt
       - lint
@@ -564,20 +583,10 @@ workflows:
     jobs:
       - ci_image
 
-  # Manual build of release image for a branch.
-  # Trigger using the CircleCI API, like so:
-  #
-  #   # e.g. using 'xh' (https://github.com/ducaale/xh)
-  #   $ xh -a '<your personal circleCI token>:' POST \
-  #       https://circleci.com/api/v2/project/github/influxdata/influxdb_iox/pipeline \
-  #       parameters:='{"build_perf": true}' branch=chore/ci-tidy-up
-  #
-  # ...or equivalent with `curl`:
-  #   $ curl -XPOST -H "Content-Type: application/json" -H "Circle-Token: <your personal circleCI token>" \
-  #       -d '{"parameters": {"build_perf": true}, "branch": "chore/ci-tidy-up"}' \
-  #       https://circleci.com/api/v2/project/github/influxdata/influxdb_iox/pipeline
-  build_perf:
-    when: << pipeline.parameters.build_perf >>
+  # Force build and push of container image for non-main branch.
+  # See instructions at the top of this file
+  release_branch:
+    when: << pipeline.parameters.release_branch >>
     jobs:
       - build_release
       - deploy_release:

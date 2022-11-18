@@ -1,8 +1,8 @@
 use arrow_util::assert_batches_eq;
-use data_types::{PartitionTemplate, TemplatePart};
+use data_types::{PartitionKey, PartitionTemplate, TemplatePart};
 use mutable_batch::{writer::Writer, MutableBatch, PartitionWrite, WritePayload};
 use mutable_batch_pb::{decode::write_table_batch, encode::encode_batch};
-use schema::selection::Selection;
+use schema::Projection;
 
 #[test]
 fn test_encode_decode() {
@@ -28,14 +28,15 @@ fn test_encode_decode() {
         "+-------+------+-------+-----+------+--------------------------------+-----+",
     ];
 
-    assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
-    let encoded = encode_batch("foo", &batch);
+    let encoded = encode_batch(42, &batch);
+    assert_eq!(encoded.table_id, 42);
 
     let mut batch = MutableBatch::new();
     write_table_batch(&mut batch, &encoded).unwrap();
 
-    assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 }
 
 // This test asserts columns containing no values do not prevent an encoded
@@ -134,12 +135,14 @@ fn test_encode_decode_null_columns_issue_4272() {
     // Round-trip the "1970-01-01" partition
     let mut got = MutableBatch::default();
     partitions
-        .remove(&"1970-01-01".into())
+        .remove::<PartitionKey>(&"1970-01-01".into())
         .expect("partition not found")
         .write_to_batch(&mut got)
         .expect("should write");
 
-    let encoded = encode_batch("bananas", &got);
+    let encoded = encode_batch(24, &got);
+    assert_eq!(encoded.table_id, 24);
+
     let mut batch = MutableBatch::new();
     // Without the fix for #4272 this deserialisation call would fail.
     write_table_batch(&mut batch, &encoded).unwrap();
@@ -151,17 +154,19 @@ fn test_encode_decode_null_columns_issue_4272() {
         "| 1 | 1970-01-01T00:00:00.000000160Z |",
         "+---+--------------------------------+",
     ];
-    assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 
     // And finally assert the "1970-07-05" round-trip
     let mut got = MutableBatch::default();
     partitions
-        .remove(&"1970-07-05".into())
+        .remove::<PartitionKey>(&"1970-07-05".into())
         .expect("partition not found")
         .write_to_batch(&mut got)
         .expect("should write");
 
-    let encoded = encode_batch("bananas", &got);
+    let encoded = encode_batch(42, &got);
+    assert_eq!(encoded.table_id, 42);
+
     let mut batch = MutableBatch::new();
     // Without the fix for #4272 this deserialisation call would fail.
     write_table_batch(&mut batch, &encoded).unwrap();
@@ -173,5 +178,5 @@ fn test_encode_decode_null_columns_issue_4272() {
         "| 1 | 1970-07-05T06:32:41.568756160Z |",
         "+---+--------------------------------+",
     ];
-    assert_batches_eq!(expected, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
 }

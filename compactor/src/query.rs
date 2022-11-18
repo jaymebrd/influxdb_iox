@@ -1,84 +1,80 @@
 //! Queryable Compactor Data
 
 use data_types::{
-    ChunkId, ChunkOrder, DeletePredicate, PartitionId, SequenceNumber, TableSummary, Timestamp,
-    TimestampMinMax, Tombstone,
+    ChunkId, ChunkOrder, CompactionLevel, DeletePredicate, PartitionId, SequenceNumber,
+    TableSummary, Timestamp, Tombstone,
 };
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::error::DataFusionError;
 use iox_query::{
     exec::{stringset::StringSet, IOxSessionContext},
-    QueryChunk, QueryChunkError, QueryChunkMeta,
+    util::create_basic_summary,
+    QueryChunk, QueryChunkData, QueryChunkMeta,
 };
-use observability_deps::tracing::trace;
 use parquet_file::chunk::ParquetChunk;
 use predicate::{delete_predicate::tombstones_to_delete_predicates, Predicate};
-use schema::{merge::SchemaMerger, selection::Selection, sort::SortKey, Schema};
-use snafu::{ResultExt, Snafu};
-use std::sync::Arc;
+use schema::{merge::SchemaMerger, sort::SortKey, Projection, Schema};
+use std::{any::Any, sync::Arc};
 use uuid::Uuid;
-
-#[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
-pub enum Error {
-    #[snafu(display("Failed to read parquet: {}", source))]
-    ReadParquet {
-        source: parquet_file::storage::ReadError,
-    },
-
-    #[snafu(display(
-        "Error reading IOx Metadata from Parquet IoxParquetMetadata: {}",
-        source
-    ))]
-    ReadParquetMeta {
-        source: parquet_file::storage::ReadError,
-    },
-}
-
-/// A specialized `Error` for Compactor's query errors
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// QueryableParquetChunk that implements QueryChunk and QueryMetaChunk for building query plan
 #[derive(Debug, Clone)]
 pub struct QueryableParquetChunk {
     data: Arc<ParquetChunk>,                      // data of the parquet file
     delete_predicates: Vec<Arc<DeletePredicate>>, // converted from tombstones
-    table_name: String,                           // needed to build query plan
     partition_id: PartitionId,
-    min_sequence_number: SequenceNumber,
     max_sequence_number: SequenceNumber,
     min_time: Timestamp,
     max_time: Timestamp,
     sort_key: Option<SortKey>,
     partition_sort_key: Option<SortKey>,
+    compaction_level: CompactionLevel,
+    /// The compaction level that this operation will be when finished. Chunks from files that have
+    /// the same level as this should get chunk order 0 so that files at a lower compaction level
+    /// (and thus created later) should have priority in deduplication.
+    ///
+    /// That is:
+    ///
+    /// * When compacting L0 + L1, the target level is L1. L0 files should have priority, so all L1
+    ///   files should have chunk order 0 to be sorted first.
+    /// * When compacting L1 + L2, the target level is L2. L1 files should have priority, so all L2
+    ///   files should have chunk order 0 to be sorted first.
+    target_level: CompactionLevel,
+    summary: Arc<TableSummary>,
 }
 
 impl QueryableParquetChunk {
     /// Initialize a QueryableParquetChunk
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        table_name: impl Into<String>,
         partition_id: PartitionId,
         data: Arc<ParquetChunk>,
         deletes: &[Tombstone],
-        min_sequence_number: SequenceNumber,
         max_sequence_number: SequenceNumber,
         min_time: Timestamp,
         max_time: Timestamp,
         sort_key: Option<SortKey>,
         partition_sort_key: Option<SortKey>,
+        compaction_level: CompactionLevel,
+        target_level: CompactionLevel,
     ) -> Self {
         let delete_predicates = tombstones_to_delete_predicates(deletes);
+        let summary = Arc::new(create_basic_summary(
+            data.rows() as u64,
+            &data.schema(),
+            data.timestamp_min_max(),
+        ));
         Self {
             data,
             delete_predicates,
-            table_name: table_name.into(),
             partition_id,
-            min_sequence_number,
             max_sequence_number,
             min_time,
             max_time,
             sort_key,
             partition_sort_key,
+            compaction_level,
+            target_level,
+            summary,
         }
     }
 
@@ -88,12 +84,7 @@ impl QueryableParquetChunk {
         for chunk in chunks {
             merger = merger.merge(&chunk.schema()).expect("schemas compatible");
         }
-        Arc::new(merger.build())
-    }
-
-    /// Return min sequence number
-    pub fn min_sequence_number(&self) -> SequenceNumber {
-        self.min_sequence_number
+        merger.build()
     }
 
     /// Return max sequence number
@@ -118,8 +109,8 @@ impl QueryableParquetChunk {
 }
 
 impl QueryChunkMeta for QueryableParquetChunk {
-    fn summary(&self) -> Option<Arc<TableSummary>> {
-        None
+    fn summary(&self) -> Arc<TableSummary> {
+        Arc::clone(&self.summary)
     }
 
     fn schema(&self) -> Arc<Schema> {
@@ -130,8 +121,8 @@ impl QueryChunkMeta for QueryableParquetChunk {
         self.partition_sort_key.as_ref()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
-        Some(self.partition_id)
+    fn partition_id(&self) -> PartitionId {
+        self.partition_id
     }
 
     fn sort_key(&self) -> Option<&SortKey> {
@@ -140,13 +131,6 @@ impl QueryChunkMeta for QueryableParquetChunk {
 
     fn delete_predicates(&self) -> &[Arc<DeletePredicate>] {
         self.delete_predicates.as_ref()
-    }
-
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax> {
-        Some(TimestampMinMax {
-            min: self.min_time(),
-            max: self.max_time(),
-        })
     }
 }
 
@@ -165,11 +149,6 @@ impl QueryChunk for QueryableParquetChunk {
         self.object_store_id().into()
     }
 
-    /// Returns the name of the table stored in this chunk
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
     /// Returns true if the chunk may contain a duplicate "primary
     /// key" within itself
     fn may_contain_pk_duplicates(&self) -> bool {
@@ -185,8 +164,8 @@ impl QueryChunk for QueryableParquetChunk {
         &self,
         _ctx: IOxSessionContext,
         _predicate: &Predicate,
-        _columns: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+        _columns: Projection<'_>,
+    ) -> Result<Option<StringSet>, DataFusionError> {
         Ok(None)
     }
 
@@ -200,37 +179,12 @@ impl QueryChunk for QueryableParquetChunk {
         _ctx: IOxSessionContext,
         _column_name: &str,
         _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         Ok(None)
     }
 
-    /// Provides access to raw `QueryChunk` data as an
-    /// asynchronous stream of `RecordBatch`es filtered by a *required*
-    /// predicate. Note that not all chunks can evaluate all types of
-    /// predicates and this function will return an error
-    /// if requested to evaluate with a predicate that is not supported
-    ///
-    /// This is the analog of the `TableProvider` in DataFusion
-    ///
-    /// The reason we can't simply use the `TableProvider` trait
-    /// directly is that the data for a particular Table lives in
-    /// several chunks within a partition, so there needs to be an
-    /// implementation of `TableProvider` that stitches together the
-    /// streams from several different `QueryChunk`s.
-    fn read_filter(
-        &self,
-        mut ctx: IOxSessionContext,
-        predicate: &Predicate,
-        selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, QueryChunkError> {
-        ctx.set_metadata("storage", "compactor");
-        ctx.set_metadata("projection", format!("{}", selection));
-        trace!(?selection, "selection");
-
-        self.data
-            .read_filter(predicate, selection)
-            .context(ReadParquetSnafu)
-            .map_err(|e| Box::new(e) as _)
+    fn data(&self) -> QueryChunkData {
+        QueryChunkData::Parquet(self.data.parquet_exec_input())
     }
 
     /// Returns chunk type
@@ -238,9 +192,131 @@ impl QueryChunk for QueryableParquetChunk {
         "QueryableParquetChunk"
     }
 
-    // Order of the chunk so they can be deduplicate correctly
+    // Order of the chunk so they can be deduplicated correctly
     fn order(&self) -> ChunkOrder {
-        let seq_num = self.max_sequence_number.get();
-        ChunkOrder::new(seq_num)
+        use CompactionLevel::*;
+        match (self.target_level, self.compaction_level) {
+            // Files of the same level as what they're being compacting into were created earlier,
+            // so they should be sorted first so that files created later that haven't yet been
+            // compacted to this level will have priority when resolving duplicates.
+            (FileNonOverlapped, FileNonOverlapped) => ChunkOrder::new(0),
+            (Final, Final) => ChunkOrder::new(0),
+
+            // Files that haven't yet been compacted to the target level were created later and
+            // should be sorted based on their max sequence number.
+            (FileNonOverlapped, Initial) => ChunkOrder::new(self.max_sequence_number.get()),
+            (Final, FileNonOverlapped) => ChunkOrder::new(self.max_sequence_number.get()),
+
+            // These combinations of target compaction level and file compaction level are
+            // invalid in this context given the current compaction algorithm.
+            (Initial, _) => panic!("Can't compact into CompactionLevel::Initial"),
+            (FileNonOverlapped, Final) => panic!(
+                "Can't compact CompactionLevel::Final into CompactionLevel::FileNonOverlapped"
+            ),
+            (Final, Initial) => {
+                panic!("Can't compact CompactionLevel::Initial into CompactionLevel::Final")
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data_types::ColumnType;
+    use iox_tests::util::{TestCatalog, TestParquetFileBuilder};
+    use parquet_file::storage::{ParquetStorage, StorageId};
+
+    async fn test_setup(
+        compaction_level: CompactionLevel,
+        target_level: CompactionLevel,
+        max_sequence_number: i64,
+    ) -> QueryableParquetChunk {
+        let catalog = TestCatalog::new();
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
+        let shard = ns.create_shard(1).await;
+        let table = ns.create_table("table").await;
+        table.create_column("field_int", ColumnType::I64).await;
+        table.create_column("tag1", ColumnType::Tag).await;
+        table.create_column("time", ColumnType::Time).await;
+
+        let partition = table
+            .with_shard(&shard)
+            .create_partition("2022-07-13")
+            .await;
+
+        let lp = vec!["table,tag1=WA field_int=1000i 8000"].join("\n");
+        let builder = TestParquetFileBuilder::default()
+            .with_line_protocol(&lp)
+            .with_compaction_level(compaction_level)
+            .with_max_seq(max_sequence_number);
+        let file = partition.create_parquet_file(builder).await;
+        let parquet_file = Arc::new(file.parquet_file);
+
+        let parquet_chunk = Arc::new(ParquetChunk::new(
+            Arc::clone(&parquet_file),
+            Arc::new(table.schema().await),
+            ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
+        ));
+
+        QueryableParquetChunk::new(
+            partition.partition.id,
+            parquet_chunk,
+            &[],
+            parquet_file.max_sequence_number,
+            parquet_file.min_time,
+            parquet_file.max_time,
+            None,
+            None,
+            parquet_file.compaction_level,
+            target_level,
+        )
+    }
+
+    #[tokio::test]
+    async fn chunk_order_is_max_seq_when_compaction_level_0_and_target_level_1() {
+        let chunk = test_setup(
+            CompactionLevel::Initial,
+            CompactionLevel::FileNonOverlapped,
+            2,
+        )
+        .await;
+
+        assert_eq!(chunk.order(), ChunkOrder::new(2));
+    }
+
+    #[tokio::test]
+    async fn chunk_order_is_0_when_compaction_level_1_and_target_level_1() {
+        let chunk = test_setup(
+            CompactionLevel::FileNonOverlapped,
+            CompactionLevel::FileNonOverlapped,
+            2,
+        )
+        .await;
+
+        assert_eq!(chunk.order(), ChunkOrder::new(0));
+    }
+
+    #[tokio::test]
+    async fn chunk_order_is_max_seq_when_compaction_level_1_and_target_level_2() {
+        let chunk = test_setup(
+            CompactionLevel::FileNonOverlapped,
+            CompactionLevel::Final,
+            2,
+        )
+        .await;
+
+        assert_eq!(chunk.order(), ChunkOrder::new(2));
+    }
+
+    #[tokio::test]
+    async fn chunk_order_is_0_when_compaction_level_2_and_target_level_2() {
+        let chunk = test_setup(CompactionLevel::Final, CompactionLevel::Final, 2).await;
+
+        assert_eq!(chunk.order(), ChunkOrder::new(0));
     }
 }

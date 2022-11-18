@@ -21,11 +21,11 @@ async fn test_cases_basic_sql() {
 }
 
 #[tokio::test]
-// Tests from "delete_all.sql",
-async fn test_cases_delete_all_sql() {
+// Tests from "dedup_and_predicates_parquet.sql",
+async fn test_cases_dedup_and_predicates_parquet_sql() {
     test_helpers::maybe_start_logging();
 
-    let input_path = Path::new("cases").join("in").join("delete_all.sql");
+    let input_path = Path::new("cases").join("in").join("dedup_and_predicates_parquet.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)
@@ -37,11 +37,11 @@ async fn test_cases_delete_all_sql() {
 }
 
 #[tokio::test]
-// Tests from "delete_multi_expr_one_chunk.sql",
-async fn test_cases_delete_multi_expr_one_chunk_sql() {
+// Tests from "dedup_and_predicates_parquet_ingester.sql",
+async fn test_cases_dedup_and_predicates_parquet_ingester_sql() {
     test_helpers::maybe_start_logging();
 
-    let input_path = Path::new("cases").join("in").join("delete_multi_expr_one_chunk.sql");
+    let input_path = Path::new("cases").join("in").join("dedup_and_predicates_parquet_ingester.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)
@@ -53,11 +53,11 @@ async fn test_cases_delete_multi_expr_one_chunk_sql() {
 }
 
 #[tokio::test]
-// Tests from "delete_simple_pred_one_chunk.sql",
-async fn test_cases_delete_simple_pred_one_chunk_sql() {
+// Tests from "duplicates_ingester.sql",
+async fn test_cases_duplicates_ingester_sql() {
     test_helpers::maybe_start_logging();
 
-    let input_path = Path::new("cases").join("in").join("delete_simple_pred_one_chunk.sql");
+    let input_path = Path::new("cases").join("in").join("duplicates_ingester.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)
@@ -69,11 +69,11 @@ async fn test_cases_delete_simple_pred_one_chunk_sql() {
 }
 
 #[tokio::test]
-// Tests from "delete_three_delete_three_chunks.sql",
-async fn test_cases_delete_three_delete_three_chunks_sql() {
+// Tests from "duplicates_parquet.sql",
+async fn test_cases_duplicates_parquet_sql() {
     test_helpers::maybe_start_logging();
 
-    let input_path = Path::new("cases").join("in").join("delete_three_delete_three_chunks.sql");
+    let input_path = Path::new("cases").join("in").join("duplicates_parquet.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)
@@ -85,27 +85,11 @@ async fn test_cases_delete_three_delete_three_chunks_sql() {
 }
 
 #[tokio::test]
-// Tests from "delete_two_del_multi_expr_one_chunk.sql",
-async fn test_cases_delete_two_del_multi_expr_one_chunk_sql() {
+// Tests from "duplicates_parquet_many.sql",
+async fn test_cases_duplicates_parquet_many_sql() {
     test_helpers::maybe_start_logging();
 
-    let input_path = Path::new("cases").join("in").join("delete_two_del_multi_expr_one_chunk.sql");
-    let mut runner = Runner::new();
-    runner
-        .run(input_path)
-        .await
-        .expect("test failed");
-    runner
-        .flush()
-        .expect("flush worked");
-}
-
-#[tokio::test]
-// Tests from "duplicates.sql",
-async fn test_cases_duplicates_sql() {
-    test_helpers::maybe_start_logging();
-
-    let input_path = Path::new("cases").join("in").join("duplicates.sql");
+    let input_path = Path::new("cases").join("in").join("duplicates_parquet_many.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)
@@ -138,6 +122,22 @@ async fn test_cases_pushdown_sql() {
     test_helpers::maybe_start_logging();
 
     let input_path = Path::new("cases").join("in").join("pushdown.sql");
+    let mut runner = Runner::new();
+    runner
+        .run(input_path)
+        .await
+        .expect("test failed");
+    runner
+        .flush()
+        .expect("flush worked");
+}
+
+#[tokio::test]
+// Tests from "selectors.sql",
+async fn test_cases_selectors_sql() {
+    test_helpers::maybe_start_logging();
+
+    let input_path = Path::new("cases").join("in").join("selectors.sql");
     let mut runner = Runner::new();
     runner
         .run(input_path)

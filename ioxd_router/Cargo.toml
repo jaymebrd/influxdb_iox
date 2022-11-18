@@ -1,7 +1,9 @@
 [package]
 name = "ioxd_router"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # Workspace dependencies, in alphabetical order
@@ -11,7 +13,7 @@ iox_catalog = { path = "../iox_catalog" }
 ioxd_common = { path = "../ioxd_common" }
 metric = { path = "../metric" }
 mutable_batch = { path = "../mutable_batch" }
-object_store = "0.3.0"
+object_store = "0.5.1"
 observability_deps = { path = "../observability_deps" }
 router = { path = "../router" }
 sharder = { path = "../sharder" }
@@ -21,9 +23,9 @@ write_summary = { path = "../write_summary" }
 
 # Crates.io dependencies, in alphabetical order
 async-trait = "0.1"
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 hyper = "0.14"
-thiserror = "1.0.31"
-tokio = { version = "1.20", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.3" }
+thiserror = "1.0.37"
+tokio = { version = "1.21", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.4" }
 workspace-hack = { path = "../workspace-hack"}

@@ -1,27 +1,38 @@
 //! Writing generated points
 
 use crate::measurement::LineToGenerate;
+use bytes::Bytes;
+use datafusion_util::MemoryStream;
 use futures::stream;
 use influxdb2_client::models::WriteDataPoint;
+use mutable_batch_lp::lines_to_batches;
+use parquet_file::{metadata::IoxMetadata, serialize};
+use schema::Projection;
 use snafu::{ensure, ResultExt, Snafu};
 #[cfg(test)]
+use std::{collections::BTreeMap, sync::Arc};
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
-use std::{
-    fs,
-    fs::{File, OpenOptions},
-    io::BufWriter,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 /// Errors that may happen while writing points.
 #[derive(Snafu, Debug)]
 pub enum Error {
     /// Error that may happen when writing line protocol to a file
-    #[snafu(display("Could open line protocol file {}: {}", filename.display(), source))]
+    #[snafu(display("Couldn't open line protocol file {}: {}", filename.display(), source))]
     CantOpenLineProtocolFile {
+        /// The location of the file we tried to open
+        filename: PathBuf,
+        /// Underlying IO error that caused this problem
+        source: std::io::Error,
+    },
+
+    /// Error that may happen when writing Parquet to a file
+    #[snafu(display("Couldn't open Parquet file {}: {}", filename.display(), source))]
+    CantOpenParquetFile {
         /// The location of the file we tried to open
         filename: PathBuf,
         /// Underlying IO error that caused this problem
@@ -40,6 +51,34 @@ pub enum Error {
     CantWriteToLineProtocolFile {
         /// Underlying IO error that caused this problem
         source: std::io::Error,
+    },
+
+    /// Error that may happen when writing line protocol to a Vec of bytes
+    #[snafu(display("Could not write to vec: {}", source))]
+    WriteToVec {
+        /// Underlying IO error that caused this problem
+        source: std::io::Error,
+    },
+
+    /// Error that may happen when writing Parquet to a file
+    #[snafu(display("Could not write Parquet: {}", source))]
+    WriteToParquetFile {
+        /// Underlying IO error that caused this problem
+        source: std::io::Error,
+    },
+
+    /// Error that may happen when converting line protocol to a mutable batch
+    #[snafu(display("Could not convert to a mutable batch: {}", source))]
+    ConvertToMutableBatch {
+        /// Underlying mutable_batch_lp error that caused this problem
+        source: mutable_batch_lp::Error,
+    },
+
+    /// Error that may happen when converting a mutable batch to an Arrow RecordBatch
+    #[snafu(display("Could not convert to a record batch: {}", source))]
+    ConvertToArrow {
+        /// Underlying mutable_batch error that caused this problem
+        source: mutable_batch::Error,
     },
 
     /// Error that may happen when creating a directory to store files to write
@@ -81,6 +120,13 @@ pub enum Error {
     /// specifying the org ID
     #[snafu(display("Could not create a bucket without an `org_id`"))]
     OrgIdRequiredToCreateBucket,
+
+    /// Error that may happen when serializing to Parquet
+    #[snafu(display("Could not serialize to Parquet"))]
+    ParquetSerialization {
+        /// Underlying `parquet_file` error that caused this problem
+        source: parquet_file::serialize::CodecError,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -96,6 +142,7 @@ pub struct PointsWriterBuilder {
 enum PointsWriterConfig {
     Api(influxdb2_client::Client),
     Directory(PathBuf),
+    ParquetFile(PathBuf),
     NoOp {
         perform_write: bool,
     },
@@ -144,6 +191,17 @@ impl PointsWriterBuilder {
         })
     }
 
+    /// Write points to a Parquet file in the directory specified.
+    pub fn new_parquet<P: AsRef<Path>>(path: P) -> Result<Self> {
+        fs::create_dir_all(&path).context(CantCreateDirectorySnafu)?;
+        let metadata = fs::metadata(&path).context(CantGetMetadataSnafu)?;
+        ensure!(metadata.is_dir(), MustBeDirectorySnafu);
+
+        Ok(Self {
+            config: PointsWriterConfig::ParquetFile(PathBuf::from(path.as_ref())),
+        })
+    }
+
     /// Write points to stdout
     pub fn new_std_out() -> Self {
         Self {
@@ -183,10 +241,16 @@ impl PointsWriterBuilder {
                     .open(&filename)
                     .context(CantOpenLineProtocolFileSnafu { filename })?;
 
-                let file = BufWriter::new(file);
+                let file = Mutex::new(BufWriter::new(file));
 
                 InnerPointsWriter::File { file }
             }
+
+            PointsWriterConfig::ParquetFile(dir_path) => InnerPointsWriter::ParquetFile {
+                dir_path: dir_path.clone(),
+                agent_name: name.into(),
+            },
+
             PointsWriterConfig::NoOp { perform_write } => InnerPointsWriter::NoOp {
                 perform_write: *perform_write,
             },
@@ -213,7 +277,7 @@ pub struct PointsWriter {
 impl PointsWriter {
     /// Write these points
     pub async fn write_points(
-        &mut self,
+        &self,
         points: impl Iterator<Item = LineToGenerate> + Send + Sync + 'static,
     ) -> Result<()> {
         self.inner_writer.write_points(points).await
@@ -228,7 +292,11 @@ enum InnerPointsWriter {
         bucket: String,
     },
     File {
-        file: BufWriter<File>,
+        file: Mutex<BufWriter<File>>,
+    },
+    ParquetFile {
+        dir_path: PathBuf,
+        agent_name: String,
     },
     NoOp {
         perform_write: bool,
@@ -240,7 +308,7 @@ enum InnerPointsWriter {
 
 impl InnerPointsWriter {
     async fn write_points(
-        &mut self,
+        &self,
         points: impl Iterator<Item = LineToGenerate> + Send + Sync + 'static,
     ) -> Result<()> {
         match self {
@@ -256,11 +324,58 @@ impl InnerPointsWriter {
             }
             Self::File { file } => {
                 for point in points {
+                    let mut file = file.lock().expect("Should be able to get lock");
                     point
                         .write_data_point_to(&mut *file)
                         .context(CantWriteToLineProtocolFileSnafu)?;
                 }
             }
+
+            Self::ParquetFile {
+                dir_path,
+                agent_name,
+            } => {
+                let mut raw_line_protocol = Vec::new();
+                for point in points {
+                    point
+                        .write_data_point_to(&mut raw_line_protocol)
+                        .context(WriteToVecSnafu)?;
+                }
+                let line_protocol = String::from_utf8(raw_line_protocol)
+                    .expect("Generator should be creating valid UTF-8");
+
+                let batches_by_measurement =
+                    lines_to_batches(&line_protocol, 0).context(ConvertToMutableBatchSnafu)?;
+
+                for (measurement, batch) in batches_by_measurement {
+                    let record_batch = batch
+                        .to_arrow(Projection::All)
+                        .context(ConvertToArrowSnafu)?;
+                    let stream = Box::pin(MemoryStream::new(vec![record_batch]));
+
+                    let meta = IoxMetadata::external(crate::now_ns(), &*measurement);
+
+                    let (data, _parquet_file_meta) = serialize::to_parquet_bytes(stream, &meta)
+                        .await
+                        .context(ParquetSerializationSnafu)?;
+                    let data = Bytes::from(data);
+
+                    let mut filename = dir_path.clone();
+                    filename.push(format!("{agent_name}_{measurement}"));
+                    filename.set_extension("parquet");
+
+                    let file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&filename)
+                        .context(CantOpenParquetFileSnafu { filename })?;
+
+                    let mut file = BufWriter::new(file);
+
+                    file.write_all(&data).context(WriteToParquetFileSnafu)?;
+                }
+            }
+
             Self::NoOp { perform_write } => {
                 if *perform_write {
                     let mut sink = std::io::sink();
@@ -273,7 +388,7 @@ impl InnerPointsWriter {
                 }
             }
             #[cfg(test)]
-            Self::Vec(ref mut vec) => {
+            Self::Vec(vec) => {
                 let vec_ref = Arc::clone(vec);
                 let mut vec = vec_ref.lock().expect("Should be able to get lock");
                 for point in points {

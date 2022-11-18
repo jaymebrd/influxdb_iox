@@ -53,6 +53,9 @@ pub fn get_all_setups() -> &'static HashMap<String, Arc<dyn DbSetup>> {
             register_setup!(TwoMeasurementsPredicatePushDown),
             register_setup!(TwoMeasurementsManyFieldsOneChunk),
             register_setup!(OneMeasurementFourChunksWithDuplicates),
+            register_setup!(OneMeasurementFourChunksWithDuplicatesParquetOnly),
+            register_setup!(OneMeasurementFourChunksWithDuplicatesWithIngester),
+            register_setup!(TwentySortedParquetFiles),
             register_setup!(ThreeDeleteThreeChunks),
             register_setup!(OneDeleteSimpleExprOneChunkDeleteAll),
             register_setup!(OneDeleteSimpleExprOneChunk),
@@ -62,6 +65,9 @@ pub fn get_all_setups() -> &'static HashMap<String, Arc<dyn DbSetup>> {
             register_setup!(TwoMeasurementsManyFieldsTwoChunks),
             register_setup!(ManyFieldsSeveralChunks),
             register_setup!(TwoChunksMissingColumns),
+            register_setup!(AllTypes),
+            register_setup!(TwoChunksDedupWeirdnessParquet),
+            register_setup!(TwoChunksDedupWeirdnessParquetIngester),
         ]
         .into_iter()
         .map(|(name, setup)| (name.to_string(), setup as Arc<dyn DbSetup>))

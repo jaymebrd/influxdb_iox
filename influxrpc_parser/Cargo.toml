@@ -1,11 +1,13 @@
 [package]
 name = "influxrpc_parser"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-sqlparser = "0.18.0"
-snafu = "0.7.1"
+sqlparser = "0.27.0"
+snafu = "0.7.3"
 
 generated_types = { path = "../generated_types" }
 workspace-hack = { path = "../workspace-hack"}

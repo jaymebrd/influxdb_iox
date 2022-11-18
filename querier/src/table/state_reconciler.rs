@@ -2,7 +2,7 @@
 
 mod interface;
 
-use data_types::{PartitionId, SequencerId, Tombstone, TombstoneId};
+use data_types::{CompactionLevel, PartitionId, ShardId, Tombstone, TombstoneId};
 use iox_query::QueryChunk;
 use observability_deps::tracing::debug;
 use schema::sort::SortKey;
@@ -11,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+use trace::span::{Span, SpanRecorder};
 
 use crate::{
     chunk::{ChunkAdapter, QuerierChunk},
@@ -22,6 +23,7 @@ use crate::{
 use self::interface::{IngesterPartitionInfo, ParquetFileInfo, TombstoneInfo};
 
 #[derive(Snafu, Debug)]
+#[allow(missing_copy_implementations)]
 pub enum ReconcileError {
     #[snafu(display("Compactor processed file that the querier would need to split apart which is not yet implemented"))]
     CompactorConflict,
@@ -55,14 +57,23 @@ impl Reconciler {
         ingester_partitions: Vec<IngesterPartition>,
         tombstones: Vec<Arc<Tombstone>>,
         parquet_files: Vec<QuerierChunk>,
+        span: Option<Span>,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, ReconcileError> {
+        let span_recorder = SpanRecorder::new(span);
         let mut chunks = self
-            .build_chunks_from_parquet(&ingester_partitions, tombstones, parquet_files)
+            .build_chunks_from_parquet(
+                &ingester_partitions,
+                tombstones,
+                parquet_files,
+                span_recorder.child_span("build_chunks_from_parquet"),
+            )
             .await?;
         chunks.extend(self.build_ingester_chunks(ingester_partitions));
         debug!(num_chunks=%chunks.len(), "Final chunk count after reconcilation");
 
-        let chunks = self.sync_partition_sort_keys(chunks).await;
+        let chunks = self
+            .sync_partition_sort_keys(chunks, span_recorder.child_span("sync_partition_sort_key"))
+            .await;
 
         let chunks: Vec<Arc<dyn QueryChunk>> = chunks
             .into_iter()
@@ -77,7 +88,9 @@ impl Reconciler {
         ingester_partitions: &[IngesterPartition],
         tombstones: Vec<Arc<Tombstone>>,
         parquet_files: Vec<QuerierChunk>,
+        span: Option<Span>,
     ) -> Result<Vec<Box<dyn UpdatableQuerierChunk>>, ReconcileError> {
+        let span_recorder = SpanRecorder::new(span);
         debug!(
             namespace=%self.namespace_name(),
             table_name=%self.table_name(),
@@ -92,12 +105,11 @@ impl Reconciler {
             tombstones.into_iter().map(QuerierTombstone::from).collect();
 
         // match chunks and tombstones
-        let mut tombstones_by_sequencer: HashMap<SequencerId, Vec<QuerierTombstone>> =
-            HashMap::new();
+        let mut tombstones_by_shard: HashMap<ShardId, Vec<QuerierTombstone>> = HashMap::new();
 
         for tombstone in querier_tombstones {
-            tombstones_by_sequencer
-                .entry(tombstone.sequencer_id())
+            tombstones_by_shard
+                .entry(tombstone.shard_id())
                 .or_default()
                 .push(tombstone);
         }
@@ -117,8 +129,7 @@ impl Reconciler {
             Vec::with_capacity(parquet_files.len() + ingester_partitions.len());
 
         for chunk in parquet_files.into_iter() {
-            let chunk = if let Some(tombstones) =
-                tombstones_by_sequencer.get(&chunk.meta().sequencer_id())
+            let chunk = if let Some(tombstones) = tombstones_by_shard.get(&chunk.meta().shard_id())
             {
                 let mut delete_predicates = Vec::with_capacity(tombstones.len());
                 for tombstone in tombstones {
@@ -136,12 +147,12 @@ impl Reconciler {
                     // parquet file. There
                     // are the following cases here:
                     //
-                    // 1. Tombstone comes before chunk min sequencer number:
+                    // 1. Tombstone comes before chunk min sequence number:
                     //    There is no way the tombstone can affect the chunk.
-                    // 2. Tombstone comes after chunk max sequencer number:
+                    // 2. Tombstone comes after chunk max sequence number:
                     //    Tombstone affects whole chunk (it might be marked as processed though,
                     //    we'll check that further down).
-                    // 3. Tombstone is in the min-max sequencer number range of the chunk:
+                    // 3. Tombstone is in the min-max sequence number range of the chunk:
                     //    Technically the querier has NO way to determine the rows that are
                     //    affected by the tombstone since we have no row-level sequence numbers.
                     //    Such a file can be created by two sources -- the ingester and the
@@ -163,7 +174,11 @@ impl Reconciler {
                         .chunk_adapter
                         .catalog_cache()
                         .processed_tombstones()
-                        .exists(chunk.meta().parquet_file_id(), tombstone.tombstone_id())
+                        .exists(
+                            chunk.meta().parquet_file_id(),
+                            tombstone.tombstone_id(),
+                            span_recorder.child_span("cache GET exists processed_tombstone"),
+                        )
                         .await
                     {
                         continue;
@@ -199,13 +214,16 @@ impl Reconciler {
     async fn sync_partition_sort_keys(
         &self,
         chunks: Vec<Box<dyn UpdatableQuerierChunk>>,
+        span: Option<Span>,
     ) -> Vec<Box<dyn UpdatableQuerierChunk>> {
+        let span_recorder = SpanRecorder::new(span);
+
         // collect columns
         let chunk_schemas: Vec<_> = chunks
             .iter()
-            .filter_map(|c| c.partition_id().map(|id| (id, c.schema())))
+            .map(|c| (c.partition_id(), c.schema()))
             .collect();
-        let mut all_columns: HashMap<PartitionId, HashSet<&str>> = HashMap::new();
+        let mut all_columns: HashMap<PartitionId, Vec<&str>> = HashMap::new();
         for (partition_id, schema) in &chunk_schemas {
             // columns for this partition MUST include the primary key of this chunk
             all_columns
@@ -219,7 +237,13 @@ impl Reconciler {
         let mut sort_keys: HashMap<PartitionId, Arc<Option<SortKey>>> =
             HashMap::with_capacity(all_columns.len());
         for (partition_id, columns) in all_columns.into_iter() {
-            let sort_key = partition_cache.sort_key(partition_id, &columns).await;
+            let sort_key = partition_cache
+                .sort_key(
+                    partition_id,
+                    &columns,
+                    span_recorder.child_span("cache GET partition sort key"),
+                )
+                .await;
             sort_keys.insert(partition_id, sort_key);
         }
 
@@ -227,14 +251,11 @@ impl Reconciler {
         chunks
             .into_iter()
             .map(|chunk| {
-                if let Some(partition_id) = chunk.partition_id() {
-                    let sort_key = sort_keys
-                        .get(&partition_id)
-                        .expect("sort key for this partition should be fetched by now");
-                    chunk.update_partition_sort_key(Arc::clone(sort_key))
-                } else {
-                    chunk
-                }
+                let partition_id = chunk.partition_id();
+                let sort_key = sort_keys
+                    .get(&partition_id)
+                    .expect("sort key for this partition should be fetched by now");
+                chunk.update_partition_sort_key(Arc::clone(sort_key))
             })
             .collect()
     }
@@ -308,8 +329,8 @@ where
 {
     // Build partition-based lookup table.
     //
-    // Note that we don't need to take the sequencer ID into account here because each partition is
-    // not only bound to a table but also to a sequencer.
+    // Note that we don't need to take the shard ID into account here because each partition is
+    // not only bound to a table but also to a shard.
     let lookup_table: HashMap<PartitionId, &I> = ingester_partitions
         .iter()
         .map(|i| (i.partition_id(), i))
@@ -324,12 +345,15 @@ where
                 debug!(
                     file_partition_id=%file.partition_id(),
                     file_max_seq_num=%file.max_sequence_number().get(),
-                    file_min_seq_num=%file.min_sequence_number().get(),
                     persisted_max=%persisted_max.get(),
                     "Comparing parquet file and ingester parquet max"
                 );
-                if (file.max_sequence_number() > persisted_max)
-                    && (file.min_sequence_number() <= persisted_max)
+
+                // This is the result of the compactor compacting files persisted by the ingester after persisted_max
+                // The compacted result may include data of before and after persisted_max which prevents
+                // this query to return correct result because it only needs data before persist_max
+                if file.compaction_level() != CompactionLevel::Initial
+                    && file.max_sequence_number() > persisted_max
                 {
                     return Err(ReconcileError::CompactorConflict);
                 }
@@ -341,7 +365,6 @@ where
                 debug!(
                     file_partition_id=%file.partition_id(),
                     file_max_seq_num=%file.max_sequence_number().get(),
-                    file_min_seq_num=%file.min_sequence_number().get(),
                     "ingester thinks it doesn't have data persisted yet"
                 );
                 // ingester thinks it doesn't have any data persisted yet => can safely ignore file
@@ -351,7 +374,6 @@ where
             debug!(
                 file_partition_id=%file.partition_id(),
                 file_max_seq_num=%file.max_sequence_number().get(),
-                file_min_seq_num=%file.min_sequence_number().get(),
                 "partition was not flagged by the ingester as unpersisted"
             );
             // partition was not flagged by the ingester as "unpersisted", so we can keep the
@@ -366,8 +388,8 @@ where
 
 /// Generates "exclude" filter for tombstones.
 ///
-/// Since tombstones are sequencer-wide but data persistence is partition-based (which are
-/// sub-units of sequencers), we cannot just remove tombstones entirely but need to decide on a
+/// Since tombstones are shard-wide but data persistence is partition-based (which are
+/// sub-units of shards), we cannot just remove tombstones entirely but need to decide on a
 /// per-partition basis. This function generates a lookup table of partition-tombstone tuples that
 /// later need to be EXCLUDED/IGNORED when pairing tombstones with chunks.
 fn tombstone_exclude_list<I, T>(
@@ -378,18 +400,18 @@ where
     I: IngesterPartitionInfo,
     T: TombstoneInfo,
 {
-    // Build sequencer-based lookup table.
-    let mut lookup_table: HashMap<SequencerId, Vec<&I>> = HashMap::default();
+    // Build shard-based lookup table.
+    let mut lookup_table: HashMap<ShardId, Vec<&I>> = HashMap::default();
     for partition in ingester_partitions {
         lookup_table
-            .entry(partition.sequencer_id())
+            .entry(partition.shard_id())
             .or_default()
             .push(partition);
     }
 
     let mut exclude = HashSet::new();
     for t in tombstones {
-        if let Some(partitions) = lookup_table.get(&t.sequencer_id()) {
+        if let Some(partitions) = lookup_table.get(&t.shard_id()) {
             for p in partitions {
                 if let Some(persisted_max) = p.tombstone_max_sequence_number() {
                     if t.sequence_number() > persisted_max {
@@ -414,7 +436,7 @@ where
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use data_types::SequenceNumber;
+    use data_types::{CompactionLevel, SequenceNumber};
 
     #[test]
     fn test_filter_parquet_files_empty() {
@@ -428,14 +450,14 @@ mod tests {
     fn test_filter_parquet_files_compactor_conflict() {
         let ingester_partitions = &[MockIngesterPartitionInfo {
             partition_id: PartitionId::new(1),
-            sequencer_id: SequencerId::new(1),
+            shard_id: ShardId::new(1),
             parquet_max_sequence_number: Some(SequenceNumber::new(10)),
             tombstone_max_sequence_number: None,
         }];
         let parquet_files = vec![MockParquetFileInfo {
             partition_id: PartitionId::new(1),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(11),
+            compaction_level: CompactionLevel::FileNonOverlapped,
         }];
         let err = filter_parquet_files(ingester_partitions, parquet_files).unwrap_err();
         assert_matches!(err, ReconcileError::CompactorConflict);
@@ -446,60 +468,60 @@ mod tests {
         let ingester_partitions = &[
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(1),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: Some(SequenceNumber::new(10)),
                 tombstone_max_sequence_number: None,
             },
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(2),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: None,
                 tombstone_max_sequence_number: None,
             },
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(3),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: Some(SequenceNumber::new(3)),
                 tombstone_max_sequence_number: None,
             },
         ];
         let pf11 = MockParquetFileInfo {
             partition_id: PartitionId::new(1),
-            min_sequence_number: SequenceNumber::new(3),
             max_sequence_number: SequenceNumber::new(9),
+            compaction_level: CompactionLevel::Initial,
         };
         let pf12 = MockParquetFileInfo {
             partition_id: PartitionId::new(1),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(10),
+            compaction_level: CompactionLevel::Initial,
         };
         // filtered because it was persisted after ingester sent response (11 > 10)
         let pf13 = MockParquetFileInfo {
             partition_id: PartitionId::new(1),
-            min_sequence_number: SequenceNumber::new(11),
             max_sequence_number: SequenceNumber::new(20),
+            compaction_level: CompactionLevel::Initial,
         };
         let pf2 = MockParquetFileInfo {
             partition_id: PartitionId::new(2),
-            min_sequence_number: SequenceNumber::new(0),
             max_sequence_number: SequenceNumber::new(0),
+            compaction_level: CompactionLevel::Initial,
         };
         let pf31 = MockParquetFileInfo {
             partition_id: PartitionId::new(3),
-            min_sequence_number: SequenceNumber::new(1),
             max_sequence_number: SequenceNumber::new(3),
+            compaction_level: CompactionLevel::Initial,
         };
         // filtered because it was persisted after ingester sent response (4 > 3)
         let pf32 = MockParquetFileInfo {
             partition_id: PartitionId::new(3),
-            min_sequence_number: SequenceNumber::new(4),
             max_sequence_number: SequenceNumber::new(5),
+            compaction_level: CompactionLevel::Initial,
         };
         // passed because it came from a partition (4) the ingester didn't know about
         let pf4 = MockParquetFileInfo {
             partition_id: PartitionId::new(4),
-            min_sequence_number: SequenceNumber::new(0),
             max_sequence_number: SequenceNumber::new(0),
+            compaction_level: CompactionLevel::Initial,
         };
         let parquet_files = vec![
             pf11.clone(),
@@ -527,25 +549,25 @@ mod tests {
         let ingester_partitions = &[
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(1),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: None,
                 tombstone_max_sequence_number: Some(SequenceNumber::new(10)),
             },
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(2),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: None,
                 tombstone_max_sequence_number: None,
             },
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(3),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 parquet_max_sequence_number: None,
                 tombstone_max_sequence_number: Some(SequenceNumber::new(3)),
             },
             MockIngesterPartitionInfo {
                 partition_id: PartitionId::new(4),
-                sequencer_id: SequencerId::new(2),
+                shard_id: ShardId::new(2),
                 parquet_max_sequence_number: None,
                 tombstone_max_sequence_number: Some(SequenceNumber::new(7)),
             },
@@ -553,52 +575,52 @@ mod tests {
         let tombstones = &[
             MockTombstoneInfo {
                 id: TombstoneId::new(1),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(2),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(2),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(3),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(3),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(4),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(4),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(9),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(5),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(10),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(6),
-                sequencer_id: SequencerId::new(1),
+                shard_id: ShardId::new(1),
                 sequence_number: SequenceNumber::new(11),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(7),
-                sequencer_id: SequencerId::new(2),
+                shard_id: ShardId::new(2),
                 sequence_number: SequenceNumber::new(6),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(8),
-                sequencer_id: SequencerId::new(2),
+                shard_id: ShardId::new(2),
                 sequence_number: SequenceNumber::new(7),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(9),
-                sequencer_id: SequencerId::new(2),
+                shard_id: ShardId::new(2),
                 sequence_number: SequenceNumber::new(8),
             },
             MockTombstoneInfo {
                 id: TombstoneId::new(10),
-                sequencer_id: SequencerId::new(3),
+                shard_id: ShardId::new(3),
                 sequence_number: SequenceNumber::new(10),
             },
         ];
@@ -624,7 +646,7 @@ mod tests {
     #[derive(Debug)]
     struct MockIngesterPartitionInfo {
         partition_id: PartitionId,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         parquet_max_sequence_number: Option<SequenceNumber>,
         tombstone_max_sequence_number: Option<SequenceNumber>,
     }
@@ -634,8 +656,8 @@ mod tests {
             self.partition_id
         }
 
-        fn sequencer_id(&self) -> SequencerId {
-            self.sequencer_id
+        fn shard_id(&self) -> ShardId {
+            self.shard_id
         }
 
         fn parquet_max_sequence_number(&self) -> Option<SequenceNumber> {
@@ -650,8 +672,8 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct MockParquetFileInfo {
         partition_id: PartitionId,
-        min_sequence_number: SequenceNumber,
         max_sequence_number: SequenceNumber,
+        compaction_level: CompactionLevel,
     }
 
     impl ParquetFileInfo for MockParquetFileInfo {
@@ -659,19 +681,19 @@ mod tests {
             self.partition_id
         }
 
-        fn min_sequence_number(&self) -> SequenceNumber {
-            self.min_sequence_number
-        }
-
         fn max_sequence_number(&self) -> SequenceNumber {
             self.max_sequence_number
+        }
+
+        fn compaction_level(&self) -> CompactionLevel {
+            self.compaction_level
         }
     }
 
     #[derive(Debug)]
     struct MockTombstoneInfo {
         id: TombstoneId,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         sequence_number: SequenceNumber,
     }
 
@@ -680,8 +702,8 @@ mod tests {
             self.id
         }
 
-        fn sequencer_id(&self) -> SequencerId {
-            self.sequencer_id
+        fn shard_id(&self) -> ShardId {
+            self.shard_id
         }
 
         fn sequence_number(&self) -> SequenceNumber {

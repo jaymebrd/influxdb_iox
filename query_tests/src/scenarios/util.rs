@@ -3,8 +3,8 @@ use super::DbScenario;
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use data_types::{
-    DeletePredicate, IngesterMapping, KafkaPartition, NonEmptyString, ParquetFileId, PartitionId,
-    PartitionKey, Sequence, SequenceNumber, SequencerId, TombstoneId,
+    DeletePredicate, IngesterMapping, NonEmptyString, ParquetFileId, PartitionId, PartitionKey,
+    Sequence, SequenceNumber, ShardIndex, TombstoneId,
 };
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
 use futures::StreamExt;
@@ -14,37 +14,40 @@ use generated_types::{
 };
 use influxdb_iox_client::flight::{low_level::LowLevelMessage, Error as FlightError};
 use ingester::{
-    data::{
-        FlatIngesterQueryResponse, IngesterData, IngesterQueryResponse, Persister, SequencerData,
-    },
-    lifecycle::LifecycleHandle,
-    querier_handler::prepare_data_to_querier,
+    data::{DmlApplyAction, IngesterData, Persister},
+    lifecycle::mock_handle::MockLifecycleHandle,
+    querier_handler::{prepare_data_to_querier, FlatIngesterQueryResponse, IngesterQueryResponse},
 };
 use iox_catalog::interface::get_schema_by_name;
-use iox_query::exec::{Executor, ExecutorConfig};
-use iox_tests::util::{TestCatalog, TestNamespace, TestSequencer};
+use iox_query::exec::{DedicatedExecutors, ExecutorType};
+use iox_tests::util::{TestCatalog, TestNamespace, TestShard};
 use itertools::Itertools;
 use mutable_batch_lp::LinesConverter;
 use once_cell::sync::Lazy;
-use parquet_file::storage::ParquetStorage;
 use querier::{
     IngesterConnectionImpl, IngesterFlightClient, IngesterFlightClientError,
-    IngesterFlightClientQueryData, QuerierCatalogCache, QuerierChunkLoadSetting, QuerierNamespace,
+    IngesterFlightClientQueryData, QuerierCatalogCache, QuerierNamespace,
 };
-use schema::selection::Selection;
+use schema::Projection;
 use sharder::JumpHash;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
     fmt::Write,
     sync::Arc,
+    time::Duration,
+};
+use tokio::runtime::Handle;
+use trace::{
+    ctx::SpanContext,
+    span::{SpanExt, SpanRecorder},
 };
 
 // Structs, enums, and functions used to exhaust all test scenarios of chunk lifecycle
 // & when delete predicates are applied
 
-// STRUCTs & ENUMs
+/// Describes a Chunk that should be created for a test
 #[derive(Debug, Clone, Default)]
 pub struct ChunkData<'a, 'b> {
     /// Line protocol data of this chunk
@@ -101,12 +104,6 @@ pub enum ChunkStage {
     /// In parquet file, persisted by the ingester. Now managed by the querier.
     Parquet,
 
-    /// In parquet file, persisted by the ingester. Loaded into memory by querier.
-    ReadBuffer,
-
-    /// In parquet file, persisted by the ingester. Loaded from file into memory by querier on-demand.
-    OnDemand,
-
     /// In ingester.
     Ingester,
 }
@@ -115,8 +112,6 @@ impl Display for ChunkStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parquet => write!(f, "Parquet"),
-            Self::ReadBuffer => write!(f, "ReadBuffer"),
-            Self::OnDemand => write!(f, "OnDemand"),
             Self::Ingester => write!(f, "Ingester"),
         }
     }
@@ -127,19 +122,12 @@ impl PartialOrd for ChunkStage {
         match (self, other) {
             // allow multiple parquet chunks (for the same partition). sequence numbers will be
             // used for ordering.
-            (
-                Self::Parquet | Self::ReadBuffer | Self::OnDemand,
-                Self::Parquet | Self::ReadBuffer | Self::OnDemand,
-            ) => Some(Ordering::Equal),
+            (Self::Parquet, Self::Parquet) => Some(Ordering::Equal),
 
             // "parquet" chunks are older (i.e. come earlier) than chunks that still life in the
             // ingester
-            (Self::Parquet | Self::ReadBuffer | Self::OnDemand, Self::Ingester) => {
-                Some(Ordering::Less)
-            }
-            (Self::Ingester, Self::Parquet | Self::ReadBuffer | Self::OnDemand) => {
-                Some(Ordering::Greater)
-            }
+            (Self::Parquet, Self::Ingester) => Some(Ordering::Less),
+            (Self::Ingester, Self::Parquet) => Some(Ordering::Greater),
 
             // it's impossible for two chunks (for the same partition) to be in the ingester stage
             (Self::Ingester, Self::Ingester) => None,
@@ -150,12 +138,7 @@ impl PartialOrd for ChunkStage {
 impl ChunkStage {
     /// return the list of all chunk types
     pub fn all() -> Vec<Self> {
-        vec![
-            Self::Parquet,
-            Self::ReadBuffer,
-            Self::OnDemand,
-            Self::Ingester,
-        ]
+        vec![Self::Parquet, Self::Ingester]
     }
 }
 
@@ -194,7 +177,7 @@ impl<'a> Pred<'a> {
 /// payload / LP data resists in the ingester and is not yet available as a parquet file, the
 /// latest tombstones apply to parquet files and were (past tense!) NOT applied while the LP data
 /// was in the ingester.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteTime {
     /// Special delete time which marks the first time that could be used from deletion.
     ///
@@ -228,7 +211,7 @@ impl DeleteTime {
     /// Return all DeleteTime at and after the given chunk stage
     pub fn all_from_and_before(chunk_stage: ChunkStage) -> Vec<DeleteTime> {
         match chunk_stage {
-            ChunkStage::Parquet | ChunkStage::ReadBuffer | ChunkStage::OnDemand => vec![
+            ChunkStage::Parquet => vec![
                 Self::Ingester {
                     also_in_catalog: true,
                 },
@@ -269,7 +252,7 @@ impl DeleteTime {
             ChunkStage::Ingester => Self::Ingester {
                 also_in_catalog: true,
             },
-            ChunkStage::Parquet | ChunkStage::ReadBuffer | ChunkStage::OnDemand => Self::Parquet,
+            ChunkStage::Parquet => Self::Parquet,
         }
     }
 }
@@ -321,14 +304,14 @@ pub async fn all_scenarios_for_one_chunk(
         // Make delete predicates that happen when all chunks in their final stages
         let end_preds: Vec<Pred> = at_end_preds
             .iter()
-            .map(|p| Pred::new(*p, DeleteTime::end_for(chunk_stage)))
+            .map(|p| Pred::new(p, DeleteTime::end_for(chunk_stage)))
             .collect();
 
         for delete_time in delete_times {
             // make delete predicate with time it happens
             let mut preds: Vec<Pred> = chunk_stage_preds
                 .iter()
-                .map(|p| Pred::new(*p, delete_time))
+                .map(|p| Pred::new(p, delete_time))
                 .collect();
             // extend at-end predicates
             preds.extend(end_preds.clone());
@@ -509,7 +492,7 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                 }
             }
         }
-        ChunkStage::Parquet | ChunkStage::ReadBuffer | ChunkStage::OnDemand => {
+        ChunkStage::Parquet => {
             // process write
             let (op, partition_ids) = mock_ingester
                 .simulate_write_routing(&chunk.lp_lines, chunk.partition_key)
@@ -554,18 +537,7 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                 }
             }
 
-            let parquet_files = mock_ingester.persist(&partition_ids).await;
-
-            // set up load setting for querier
-            for id in parquet_files {
-                let load_setting = match chunk_stage {
-                    ChunkStage::Parquet => QuerierChunkLoadSetting::ParquetOnly,
-                    ChunkStage::ReadBuffer => QuerierChunkLoadSetting::ReadBufferOnly,
-                    ChunkStage::OnDemand => QuerierChunkLoadSetting::OnDemand,
-                    ChunkStage::Ingester => unreachable!("ingester chunks should not end up here"),
-                };
-                mock_ingester.register_load_setting(id, load_setting);
-            }
+            mock_ingester.persist(&partition_ids).await;
 
             // model post-persist delete predicates
             if let Some(delete_table_name) = chunk.delete_table_name {
@@ -651,8 +623,8 @@ struct MockIngester {
     /// Namespace used for testing.
     ns: Arc<TestNamespace>,
 
-    /// Sequencer used for testing.
-    sequencer: Arc<TestSequencer>,
+    /// Shard used for testing.
+    shard: Arc<TestShard>,
 
     /// Memory of partition keys for certain sequence numbers.
     ///
@@ -669,51 +641,41 @@ struct MockIngester {
     ///
     /// This is kinda a poor-mans write buffer.
     sequence_counter: i64,
-
-    /// Load settings for to-be-created querier.
-    querier_load_settings: HashMap<ParquetFileId, QuerierChunkLoadSetting>,
 }
 
 /// Query-test specific executor with static properties that may be relevant for the query optimizer and therefore may
 /// change `EXPLAIN` plans.
-static GLOBAL_EXEC: Lazy<Arc<Executor>> = Lazy::new(|| {
-    Arc::new(Executor::new_with_config(ExecutorConfig {
-        num_threads: 1,
-        target_query_partitions: 4,
-    }))
-});
+static GLOBAL_EXEC: Lazy<Arc<DedicatedExecutors>> =
+    Lazy::new(|| Arc::new(DedicatedExecutors::new(1)));
 
 impl MockIngester {
     /// Create new empty ingester.
     async fn new() -> Self {
         let exec = Arc::clone(&GLOBAL_EXEC);
-        let catalog = TestCatalog::with_exec(exec);
-        let ns = catalog.create_namespace("test_db").await;
-        let sequencer = ns.create_sequencer(1).await;
+        let catalog = TestCatalog::with_execs(exec, 4);
+        let ns = catalog.create_namespace_1hr_retention("test_db").await;
+        let shard = ns.create_shard(1).await;
 
-        let sequencers = BTreeMap::from([(
-            sequencer.sequencer.id,
-            SequencerData::new(
-                sequencer.sequencer.kafka_partition,
+        let ingester_data = Arc::new(
+            IngesterData::new(
+                catalog.object_store(),
+                catalog.catalog(),
+                [(shard.shard.id, shard.shard.shard_index)],
+                catalog.exec(),
+                BackoffConfig::default(),
                 catalog.metric_registry(),
-            ),
-        )]);
-        let ingester_data = Arc::new(IngesterData::new(
-            catalog.object_store(),
-            catalog.catalog(),
-            sequencers,
-            catalog.exec(),
-            BackoffConfig::default(),
-        ));
+            )
+            .await
+            .expect("failed to initialise ingester"),
+        );
 
         Self {
             catalog,
             ns,
-            sequencer,
+            shard,
             partition_keys: Default::default(),
             ingester_data,
             sequence_counter: 0,
-            querier_load_settings: Default::default(),
         }
     }
 
@@ -724,18 +686,16 @@ impl MockIngester {
     /// Takes `&self mut` because our partioning implementation does not work with concurrent
     /// access.
     async fn buffer_operation(&mut self, dml_operation: DmlOperation) {
-        let lifecycle_handle = NoopLifecycleHandle {};
+        let lifecycle_handle = MockLifecycleHandle::default();
 
-        let should_pause = self
+        let action = self
             .ingester_data
-            .buffer_operation(
-                self.sequencer.sequencer.id,
-                dml_operation,
-                &lifecycle_handle,
-            )
+            .buffer_operation(self.shard.shard.id, dml_operation, &lifecycle_handle)
             .await
             .unwrap();
-        assert!(!should_pause);
+        if let DmlApplyAction::Applied(should_pause) = action {
+            assert!(!should_pause);
+        }
     }
 
     /// Persists the given set of partitions.
@@ -758,7 +718,32 @@ impl MockIngester {
                 .map(|f| f.id)
                 .collect();
 
-            self.ingester_data.persist(*partition_id).await;
+            let p = self
+                .catalog
+                .catalog
+                .repositories()
+                .await
+                .partitions()
+                .get_by_id(*partition_id)
+                .await
+                .unwrap()
+                .expect("partition not found");
+
+            let namespace_id = self
+                .catalog
+                .catalog
+                .repositories()
+                .await
+                .tables()
+                .get_by_id(p.table_id)
+                .await
+                .unwrap()
+                .expect("table does not exist")
+                .namespace_id;
+
+            self.ingester_data
+                .persist(p.shard_id, namespace_id, p.table_id, *partition_id)
+                .await;
 
             result.extend(
                 self.catalog
@@ -801,36 +786,38 @@ impl MockIngester {
         }
         let (mutable_batches, _stats) = converter.finish().unwrap();
 
-        // set up catalog
-        let tables = {
-            // sort names so that IDs are deterministic
-            let mut table_names: Vec<_> = mutable_batches.keys().cloned().collect();
-            table_names.sort();
+        // sort names so that IDs are deterministic
+        let mut table_names: Vec<_> = mutable_batches.keys().cloned().collect();
+        table_names.sort();
 
-            let mut tables = vec![];
-            for table_name in table_names {
-                let table = self.ns.create_table(&table_name).await;
-                tables.push(table);
-            }
-            tables
-        };
+        // set up catalog, map from catalog id to batch
+        let mut tables = Vec::with_capacity(table_names.len());
+        let mut batches_by_id = hashbrown::HashMap::with_capacity(table_names.len());
+
+        for table_name in table_names {
+            let table = self.ns.create_table(&table_name).await;
+            let table_id = table.table.id;
+            tables.push(table);
+            batches_by_id.insert(table_id, mutable_batches.get(&table_name).unwrap().clone());
+        }
+
         let mut partition_ids = vec![];
         for table in &tables {
             let partition = table
-                .with_sequencer(&self.sequencer)
+                .with_shard(&self.shard)
                 .create_partition(partition_key)
                 .await;
             partition_ids.push(partition.partition.id);
         }
-        for table in tables {
+
+        for table in &tables {
             let schema = mutable_batches
                 .get(&table.table.name)
                 .unwrap()
-                .schema(Selection::All)
+                .schema(Projection::All)
                 .unwrap();
 
             for (t, field) in schema.iter() {
-                let t = t.unwrap();
                 table.create_column(field.name(), t.into()).await;
             }
         }
@@ -839,15 +826,15 @@ impl MockIngester {
         self.partition_keys
             .insert(sequence_number, partition_key.to_string());
         let meta = DmlMeta::sequenced(
-            Sequence::new(self.sequencer.sequencer.id.get() as u32, sequence_number),
+            Sequence::new(self.shard.shard.shard_index, sequence_number),
             self.catalog.time_provider().now(),
             None,
             0,
         );
         let op = DmlOperation::Write(DmlWrite::new(
-            self.ns.namespace.name.clone(),
-            mutable_batches,
-            Some(PartitionKey::from(partition_key)),
+            self.ns.namespace.id,
+            batches_by_id,
+            PartitionKey::from(partition_key),
             meta,
         ));
         (op, partition_ids)
@@ -864,13 +851,13 @@ impl MockIngester {
 
         let sequence_number = self.next_sequence_number();
         let meta = DmlMeta::sequenced(
-            Sequence::new(self.sequencer.sequencer.id.get() as u32, sequence_number),
+            Sequence::new(self.shard.shard.shard_index, sequence_number),
             self.catalog.time_provider().now(),
             None,
             0,
         );
         DmlOperation::Delete(DmlDelete::new(
-            self.ns.namespace.name.clone(),
+            self.ns.namespace.id,
             predicate,
             Some(NonEmptyString::new(delete_table_name).unwrap()),
             meta,
@@ -901,18 +888,6 @@ impl MockIngester {
         tombstones.iter().map(|t| t.id).collect()
     }
 
-    /// Register load setting for given parquet file.
-    fn register_load_setting(
-        &mut self,
-        parquet_file_id: ParquetFileId,
-        load_setting: QuerierChunkLoadSetting,
-    ) {
-        let existing = self
-            .querier_load_settings
-            .insert(parquet_file_id, load_setting);
-        assert!(existing.is_none());
-    }
-
     /// Finalizes the ingester and creates a querier namespace that can be used for query tests.
     ///
     /// The querier namespace will hold a simulated connection to the ingester to be able to query
@@ -931,54 +906,53 @@ impl MockIngester {
             self.catalog.catalog(),
             self.catalog.time_provider(),
             self.catalog.metric_registry(),
-            usize::MAX,
+            self.catalog.object_store(),
+            &Handle::current(),
         ));
-        let sequencer_to_ingesters = [(0, IngesterMapping::Addr(Arc::from("some_address")))]
-            .into_iter()
-            .collect();
-        let load_settings = self.querier_load_settings.clone();
-        let ingester_connection = IngesterConnectionImpl::by_sequencer_with_flight_client(
-            sequencer_to_ingesters,
+
+        // patch in parquet store
+        let parquet_store = catalog_cache.parquet_store();
+        ns.catalog
+            .exec()
+            .new_context(ExecutorType::Query)
+            .inner()
+            .runtime_env()
+            .register_object_store(
+                "iox",
+                parquet_store.id(),
+                Arc::clone(parquet_store.object_store()),
+            );
+
+        let shard_to_ingesters = [(
+            ShardIndex::new(0),
+            IngesterMapping::Addr(Arc::from("some_address")),
+        )]
+        .into_iter()
+        .collect();
+        let ingester_connection = IngesterConnectionImpl::by_shard_with_flight_client(
+            shard_to_ingesters,
             Arc::new(self),
             Arc::clone(&catalog_cache),
+            BackoffConfig {
+                init_backoff: Duration::from_secs(1),
+                max_backoff: Duration::from_secs(2),
+                base: 1.1,
+                deadline: Some(Duration::from_millis(500)),
+            },
         );
         let ingester_connection = Arc::new(ingester_connection);
-        let sharder =
-            Arc::new(JumpHash::new((0..1).map(KafkaPartition::new).map(Arc::new)).unwrap());
+        let sharder = Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new)));
 
         Arc::new(QuerierNamespace::new_testing(
             catalog_cache,
-            ParquetStorage::new(catalog.object_store()),
             catalog.metric_registry(),
             ns.namespace.name.clone().into(),
-            schema,
+            Arc::new(schema.as_ref().clone().into()),
             catalog.exec(),
             Some(ingester_connection),
             sharder,
-            load_settings,
+            usize::MAX,
         ))
-    }
-}
-
-/// Special [`LifecycleHandle`] that never persists and always accepts more data.
-///
-/// This is useful to control persists manually.
-struct NoopLifecycleHandle {}
-
-impl LifecycleHandle for NoopLifecycleHandle {
-    fn log_write(
-        &self,
-        _partition_id: PartitionId,
-        _sequencer_id: SequencerId,
-        _sequence_number: SequenceNumber,
-        _bytes_written: usize,
-    ) -> bool {
-        // do NOT pause ingest
-        false
-    }
-
-    fn can_resume_ingest(&self) -> bool {
-        true
     }
 }
 
@@ -988,17 +962,21 @@ impl IngesterFlightClient for MockIngester {
         &self,
         _ingester_address: Arc<str>,
         request: IngesterQueryRequest,
+        span_context: Option<SpanContext>,
     ) -> Result<Box<dyn IngesterFlightClientQueryData>, IngesterFlightClientError> {
+        let span_recorder = SpanRecorder::new(span_context.child_span("ingester"));
         // NOTE: we MUST NOT unwrap errors here because some query tests assert error behavior
         // (e.g. passing predicates of wrong types)
         let request = Arc::new(request);
-        let response = prepare_data_to_querier(&self.ingester_data, &request)
-            .await
-            .map_err(|e| IngesterFlightClientError::Flight {
-                source: FlightError::ArrowError(arrow::error::ArrowError::ExternalError(Box::new(
-                    e,
-                ))),
-            })?;
+        let response = prepare_data_to_querier(
+            &self.ingester_data,
+            &request,
+            span_recorder.child_span("prepare_data_to_querier"),
+        )
+        .await
+        .map_err(|e| IngesterFlightClientError::Flight {
+            source: FlightError::ArrowError(arrow::error::ArrowError::ExternalError(Box::new(e))),
+        })?;
 
         Ok(Box::new(QueryDataAdapter::new(response).await))
     }
@@ -1040,9 +1018,6 @@ impl QueryDataAdapter {
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: status
                                         .parquet_max_sequence_number
-                                        .map(|x| x.get()),
-                                    tombstone_max_sequence_number: status
-                                        .tombstone_max_sequence_number
                                         .map(|x| x.get()),
                                 }),
                             },

@@ -14,20 +14,21 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::ready;
 use http::{HeaderValue, Request, Response};
 use http_body::SizeHint;
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use tower::{Layer, Service};
 
-use observability_deps::tracing::error;
+use observability_deps::tracing::{error, warn};
 use trace::{span::SpanRecorder, TraceCollector};
 
 use crate::classify::{classify_headers, classify_response, Classification};
-use crate::ctx::TraceHeaderParser;
+use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};
 use crate::metrics::{MetricsCollection, MetricsRecorder};
 
 /// `TraceLayer` implements `tower::Layer` and can be used to decorate a
@@ -99,26 +100,16 @@ where
     fn call(&mut self, mut request: Request<ReqBody>) -> Self::Future {
         let metrics_recorder = Some(self.metrics.recorder(&request));
 
-        let collector = match self.collector.as_ref() {
-            Some(collector) => collector,
-            None => {
-                return TracedFuture {
-                    metrics_recorder,
-                    span_recorder: SpanRecorder::new(None),
-                    inner: self.service.call(request),
-                }
-            }
-        };
-
-        let span = match self.trace_header_parser.parse(collector, request.headers()) {
+        let request_ctx = match self
+            .trace_header_parser
+            .parse(self.collector.as_ref(), request.headers())
+        {
             Ok(Some(ctx)) => {
-                let span = ctx.child("IOx");
+                let ctx = RequestLogContext::new(ctx);
 
-                // Add context to request for use by service handlers
-                request.extensions_mut().insert(span.ctx.clone());
+                request.extensions_mut().insert(ctx.clone());
 
-                // Create Span to use to instrument request
-                Some(span)
+                Some(ctx)
             }
             Ok(None) => None,
             Err(e) => {
@@ -127,9 +118,24 @@ where
             }
         };
 
+        let span = request_ctx.as_ref().and_then(|ctx| {
+            let ctx = ctx.ctx();
+
+            (ctx.sampled && ctx.collector.is_some()).then(|| {
+                let span = ctx.child("IOx");
+
+                // Add context to request for use by service handlers
+                request.extensions_mut().insert(span.ctx.clone());
+
+                span
+            })
+        });
+
         TracedFuture {
+            request_ctx,
             metrics_recorder,
             span_recorder: SpanRecorder::new(span),
+            was_ready: false,
             inner: self.service.call(request),
         }
     }
@@ -137,13 +143,29 @@ where
 
 /// `TracedFuture` wraps a future returned by a `tower::Service` and
 /// instruments the returned body if any
-#[pin_project]
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 pub struct TracedFuture<F> {
+    request_ctx: Option<RequestLogContext>,
     span_recorder: SpanRecorder,
     metrics_recorder: Option<MetricsRecorder>,
+    was_ready: bool,
     #[pin]
     inner: F,
+}
+
+#[pinned_drop]
+impl<F> PinnedDrop for TracedFuture<F> {
+    fn drop(self: Pin<&mut Self>) {
+        if !self.was_ready {
+            let trace = self.request_ctx.format_jaeger();
+            warn!(
+                %trace,
+                when="before returning headers",
+                "request cancelled",
+            );
+        }
+    }
 }
 
 impl<F, ResBody, Error> Future for TracedFuture<F>
@@ -158,6 +180,7 @@ where
             ready!(self.as_mut().project().inner.poll(cx));
 
         let projected = self.as_mut().project();
+        *projected.was_ready = true;
         let span_recorder = projected.span_recorder;
         let mut metrics_recorder = projected.metrics_recorder.take().unwrap();
         match &result {
@@ -183,7 +206,9 @@ where
         match result {
             Ok(mut response) => {
                 // add trace-id header to the response, if we have one
-                let span_recorder = self.as_mut().project().span_recorder.take();
+                let projected = self.as_mut().project();
+                let request_ctx = projected.request_ctx.take();
+                let span_recorder = projected.span_recorder.take();
                 if let Some(trace_id) = span_recorder.span().map(|span| span.ctx.trace_id) {
                     // format as hex
                     let trace_id = HeaderValue::from_str(&format!("{:x}", trace_id.get())).unwrap();
@@ -191,7 +216,10 @@ where
                 }
 
                 Poll::Ready(Ok(response.map(|body| TracedBody {
+                    request_ctx,
                     span_recorder,
+                    was_done_data: AtomicBool::new(false),
+                    was_ready_trailers: AtomicBool::new(false),
                     inner: body,
                     metrics_recorder,
                 })))
@@ -202,13 +230,37 @@ where
 }
 
 /// `TracedBody` wraps a `http_body::Body` and instruments it
-#[pin_project]
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 pub struct TracedBody<B> {
+    request_ctx: Option<RequestLogContext>,
     span_recorder: SpanRecorder,
     metrics_recorder: MetricsRecorder,
+    was_done_data: AtomicBool,
+    was_ready_trailers: AtomicBool,
     #[pin]
     inner: B,
+}
+
+#[pinned_drop]
+impl<B> PinnedDrop for TracedBody<B> {
+    fn drop(self: Pin<&mut Self>) {
+        if !self.was_done_data.load(Ordering::SeqCst) {
+            let trace = self.request_ctx.format_jaeger();
+            warn!(
+                %trace,
+                when="before fully returning body data",
+                "request cancelled",
+            );
+        } else if !self.was_ready_trailers.load(Ordering::SeqCst) {
+            let trace = self.request_ctx.format_jaeger();
+            warn!(
+                %trace,
+                when="before returning trailers",
+                "request cancelled",
+            );
+        }
+    }
 }
 
 impl<B: http_body::Body> http_body::Body for TracedBody<B> {
@@ -222,7 +274,13 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
         let maybe_result = ready!(self.as_mut().project().inner.poll_data(cx));
         let result = match maybe_result {
             Some(result) => result,
-            None => return Poll::Ready(None),
+            None => {
+                self.as_mut()
+                    .project()
+                    .was_done_data
+                    .store(true, Ordering::SeqCst);
+                return Poll::Ready(None);
+            }
         };
 
         let projected = self.as_mut().project();
@@ -232,13 +290,17 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
             Ok(_) => match projected.inner.is_end_stream() {
                 true => {
                     metrics_recorder.set_classification(Classification::Ok);
-                    span_recorder.ok("returned body data and no trailers")
+                    span_recorder.ok("returned body data and no trailers");
+                    projected.was_done_data.store(true, Ordering::SeqCst);
+                    projected.was_ready_trailers.store(true, Ordering::SeqCst);
                 }
                 false => span_recorder.event("returned body data"),
             },
             Err(_) => {
                 metrics_recorder.set_classification(Classification::ServerErr);
                 span_recorder.error("error getting body");
+                projected.was_done_data.store(true, Ordering::SeqCst);
+                projected.was_ready_trailers.store(true, Ordering::SeqCst);
             }
         }
         Poll::Ready(Some(result))
@@ -252,6 +314,10 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
             ready!(self.as_mut().project().inner.poll_trailers(cx));
 
         let projected = self.as_mut().project();
+
+        projected.was_done_data.store(true, Ordering::SeqCst);
+        projected.was_ready_trailers.store(true, Ordering::SeqCst);
+
         let span_recorder = projected.span_recorder;
         let metrics_recorder = projected.metrics_recorder;
         match &result {
@@ -275,7 +341,12 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        let res = self.inner.is_end_stream();
+        if res {
+            self.was_done_data.store(true, Ordering::SeqCst);
+            self.was_ready_trailers.store(true, Ordering::SeqCst);
+        }
+        res
     }
 
     fn size_hint(&self) -> SizeHint {

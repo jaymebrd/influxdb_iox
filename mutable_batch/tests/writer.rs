@@ -1,7 +1,7 @@
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
 use mutable_batch::{writer::Writer, MutableBatch, TimestampSummary};
-use schema::selection::Selection;
+use schema::Projection;
 use std::num::NonZeroU64;
 
 fn get_stats(batch: &MutableBatch) -> Vec<(&str, Statistics)> {
@@ -158,7 +158,7 @@ fn test_basic() {
         ),
     ];
 
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
     assert_eq!(stats, expected_stats);
 
     let mut writer = Writer::new(&mut batch, 4);
@@ -175,28 +175,28 @@ fn test_basic() {
     let stats: Vec<_> = get_stats(&batch);
 
     // Writer dropped, should not impact stats or data
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
     assert_eq!(stats, expected_stats);
 
     let err = Writer::new(&mut batch, 1)
         .write_tag("b1", None, vec!["err"].into_iter())
         .unwrap_err()
         .to_string();
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::tag type into a column of iox::column_type::field::boolean");
+    assert_eq!(err.as_str(), "Unable to insert iox::column_type::tag type into column b1 with type iox::column_type::field::boolean");
 
     let err = Writer::new(&mut batch, 1)
         .write_i64("f64", None, vec![3].into_iter())
         .unwrap_err()
         .to_string();
 
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::integer type into a column of iox::column_type::field::float");
+    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::integer type into column f64 with type iox::column_type::field::float");
 
     let err = Writer::new(&mut batch, 1)
         .write_string("tag3", None, vec!["sd"].into_iter())
         .unwrap_err()
         .to_string();
 
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::string type into a column of iox::column_type::tag");
+    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::string type into column tag3 with type iox::column_type::tag");
 
     let err = Writer::new(&mut batch, 1)
         .write_tag_dict("tag3", None, vec![1].into_iter(), vec!["v1"].into_iter())
@@ -208,7 +208,7 @@ fn test_basic() {
     let stats: Vec<_> = get_stats(&batch);
 
     // Writer not committed, should not impact stats or data
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
     assert_eq!(stats, expected_stats);
 
     let mut writer = Writer::new(&mut batch, 17);
@@ -330,7 +330,7 @@ fn test_basic() {
         ),
     ];
 
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Selection::All).unwrap()]);
+    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
     assert_eq!(stats, expected_stats);
 
     let mut expected_timestamps = TimestampSummary::default();

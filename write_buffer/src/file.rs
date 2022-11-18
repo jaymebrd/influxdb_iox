@@ -5,7 +5,7 @@
 //! messages and (currently) does not implement any message pruning.
 //!
 //! # Format
-//! Given a root path, the database name and the number of sequencers, the directory structure
+//! Given a root path, the database name and the number of shards, the directory structure
 //! looks like this:
 //!
 //! ```text
@@ -35,7 +35,7 @@
 //!                         :      :
 //!                         :      :
 //!                         :      /1/...                \
-//!                         :      /2/...                | More sequencers
+//!                         :      /2/...                | More shards
 //!                         :      ...                   /
 //!                         :
 //!                         :
@@ -83,7 +83,7 @@
 //!
 //! ## Atomic Directory Creation
 //!
-//! To setup a new sequencer config we need to create the directory structure in an atomic way.
+//! To setup a new shard config we need to create the directory structure in an atomic way.
 //! Hardlinks don't work for directories, but [`symlink(2)`] does and -- like [`link(2)`] -- does
 //! not overwrite existing targets.
 //!
@@ -129,7 +129,7 @@ use crate::{
     core::{WriteBufferError, WriteBufferReading, WriteBufferStreamHandler, WriteBufferWriting},
 };
 use async_trait::async_trait;
-use data_types::{Sequence, SequenceNumber};
+use data_types::{Sequence, SequenceNumber, ShardIndex};
 use dml::{DmlMeta, DmlOperation};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use iox_time::{Time, TimeProvider};
@@ -154,8 +154,7 @@ pub const HEADER_TIME: &str = "last-modified";
 /// File-based write buffer writer.
 #[derive(Debug)]
 pub struct FileBufferProducer {
-    db_name: String,
-    dirs: BTreeMap<u32, PathBuf>,
+    dirs: BTreeMap<ShardIndex, PathBuf>,
     time_provider: Arc<dyn TimeProvider>,
 }
 
@@ -170,7 +169,6 @@ impl FileBufferProducer {
         let root = root.join(database_name);
         let dirs = maybe_auto_create_directories(&root, creation_config).await?;
         Ok(Self {
-            db_name: database_name.to_string(),
             dirs,
             time_provider,
         })
@@ -179,20 +177,20 @@ impl FileBufferProducer {
 
 #[async_trait]
 impl WriteBufferWriting for FileBufferProducer {
-    fn sequencer_ids(&self) -> BTreeSet<u32> {
+    fn shard_indexes(&self) -> BTreeSet<ShardIndex> {
         self.dirs.keys().cloned().collect()
     }
 
     async fn store_operation(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         operation: DmlOperation,
     ) -> Result<DmlMeta, WriteBufferError> {
-        let sequencer_path = self
+        let shard_path = self
             .dirs
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
 
         // measure time
@@ -207,7 +205,6 @@ impl WriteBufferWriting for FileBufferProducer {
         let iox_headers = IoxHeaders::new(
             ContentType::Protobuf,
             operation.meta().span_context().cloned(),
-            operation.namespace().to_string(),
         );
 
         for (name, value) in iox_headers.headers() {
@@ -216,14 +213,14 @@ impl WriteBufferWriting for FileBufferProducer {
 
         message.extend(b"\n");
 
-        crate::codec::encode_operation(&self.db_name, &operation, &mut message)?;
+        crate::codec::encode_operation(&operation, &mut message)?;
 
         // write data to scratchpad file in temp directory
-        let temp_file = sequencer_path.join("temp").join(Uuid::new_v4().to_string());
+        let temp_file = shard_path.join("temp").join(Uuid::new_v4().to_string());
         tokio::fs::write(&temp_file, &message).await?;
 
         // scan existing files to figure out new sequence number
-        let committed = sequencer_path.join("committed");
+        let committed = shard_path.join("committed");
         let existing_files = scan_dir::<i64>(&committed, FileType::File).await?;
         let mut sequence_number = if let Some(max) = existing_files.keys().max() {
             max.checked_add(1).ok_or_else::<WriteBufferError, _>(|| {
@@ -257,7 +254,7 @@ impl WriteBufferWriting for FileBufferProducer {
         tokio::fs::remove_file(&temp_file).await.ok();
 
         Ok(DmlMeta::sequenced(
-            Sequence::new(sequencer_id, SequenceNumber::new(sequence_number)),
+            Sequence::new(shard_index, SequenceNumber::new(sequence_number)),
             now,
             operation.meta().span_context().cloned(),
             message.len(),
@@ -276,7 +273,7 @@ impl WriteBufferWriting for FileBufferProducer {
 
 #[derive(Debug)]
 pub struct FileBufferStreamHandler {
-    sequencer_id: u32,
+    shard_index: ShardIndex,
     path: PathBuf,
     next_sequence_number: Arc<AtomicI64>,
     terminated: Arc<AtomicBool>,
@@ -289,7 +286,7 @@ impl WriteBufferStreamHandler for FileBufferStreamHandler {
         let committed = self.path.join("committed");
 
         ConsumerStream::new(
-            self.sequencer_id,
+            self.shard_index,
             committed,
             Arc::clone(&self.next_sequence_number),
             Arc::clone(&self.terminated),
@@ -299,6 +296,21 @@ impl WriteBufferStreamHandler for FileBufferStreamHandler {
     }
 
     async fn seek(&mut self, sequence_number: SequenceNumber) -> Result<(), WriteBufferError> {
+        let offset = sequence_number.get();
+
+        // Find the current high watermark
+        let committed = self.path.join("committed");
+        let existing_files = scan_dir::<i64>(&committed, FileType::File).await?;
+        let current = existing_files.keys().max().cloned().unwrap_or_default();
+
+        if offset > current {
+            return Err(WriteBufferError::sequence_number_after_watermark(format!(
+                "attempted to seek to offset {offset}, but current high \
+                watermark for partition {p} is {current}",
+                p = self.shard_index
+            )));
+        }
+
         self.next_sequence_number
             .store(sequence_number.get(), Ordering::SeqCst);
         self.terminated.store(false, Ordering::SeqCst);
@@ -314,7 +326,7 @@ impl WriteBufferStreamHandler for FileBufferStreamHandler {
 /// File-based write buffer reader.
 #[derive(Debug)]
 pub struct FileBufferConsumer {
-    dirs: BTreeMap<u32, (PathBuf, Arc<AtomicU64>)>,
+    dirs: BTreeMap<ShardIndex, (PathBuf, Arc<AtomicU64>)>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
@@ -331,7 +343,7 @@ impl FileBufferConsumer {
         let dirs = maybe_auto_create_directories(&root, creation_config)
             .await?
             .into_iter()
-            .map(|(sequencer_id, path)| (sequencer_id, (path, Arc::new(AtomicU64::new(0)))))
+            .map(|(shard_index, path)| (shard_index, (path, Arc::new(AtomicU64::new(0)))))
             .collect();
         Ok(Self {
             dirs,
@@ -342,23 +354,23 @@ impl FileBufferConsumer {
 
 #[async_trait]
 impl WriteBufferReading for FileBufferConsumer {
-    fn sequencer_ids(&self) -> BTreeSet<u32> {
+    fn shard_indexes(&self) -> BTreeSet<ShardIndex> {
         self.dirs.keys().copied().collect()
     }
 
     async fn stream_handler(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
     ) -> Result<Box<dyn WriteBufferStreamHandler>, WriteBufferError> {
         let (path, _next_sequence_number) = self
             .dirs
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
 
         Ok(Box::new(FileBufferStreamHandler {
-            sequencer_id,
+            shard_index,
             path: path.clone(),
             next_sequence_number: Arc::new(AtomicI64::new(0)),
             terminated: Arc::new(AtomicBool::new(false)),
@@ -368,13 +380,13 @@ impl WriteBufferReading for FileBufferConsumer {
 
     async fn fetch_high_watermark(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
     ) -> Result<SequenceNumber, WriteBufferError> {
         let (path, _next_sequence_number) = self
             .dirs
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
         let committed = path.join("committed");
 
@@ -390,7 +402,7 @@ impl WriteBufferReading for FileBufferConsumer {
 #[pin_project]
 struct ConsumerStream {
     fut: ReusableBoxFuture<'static, Option<Result<DmlOperation, WriteBufferError>>>,
-    sequencer_id: u32,
+    shard_index: ShardIndex,
     path: PathBuf,
     next_sequence_number: Arc<AtomicI64>,
     terminated: Arc<AtomicBool>,
@@ -399,7 +411,7 @@ struct ConsumerStream {
 
 impl ConsumerStream {
     fn new(
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         path: PathBuf,
         next_sequence_number: Arc<AtomicI64>,
         terminated: Arc<AtomicBool>,
@@ -407,13 +419,13 @@ impl ConsumerStream {
     ) -> Self {
         Self {
             fut: ReusableBoxFuture::new(Self::poll_next_inner(
-                sequencer_id,
+                shard_index,
                 path.clone(),
                 Arc::clone(&next_sequence_number),
                 Arc::clone(&terminated),
                 trace_collector.clone(),
             )),
-            sequencer_id,
+            shard_index,
             path,
             next_sequence_number,
             terminated,
@@ -422,7 +434,7 @@ impl ConsumerStream {
     }
 
     async fn poll_next_inner(
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         path: PathBuf,
         next_sequence_number: Arc<AtomicI64>,
         terminated: Arc<AtomicBool>,
@@ -441,7 +453,7 @@ impl ConsumerStream {
                 Ok(data) => {
                     // decode file
                     let sequence = Sequence {
-                        sequencer_id,
+                        shard_index,
                         sequence_number: SequenceNumber::new(sequence_number),
                     };
                     match Self::decode_file(data, sequence, trace_collector.clone()) {
@@ -491,7 +503,7 @@ impl ConsumerStream {
                                     }
                                 } else if sequence_number > watermark {
                                     terminated.store(true, Ordering::SeqCst);
-                                    return Some(Err(WriteBufferError::unknown_sequence_number(
+                                    return Some(Err(WriteBufferError::sequence_number_after_watermark(
                                         format!("unknown sequence number, high watermark is {watermark}"),
                                     )));
                                 }
@@ -575,7 +587,7 @@ impl Stream for ConsumerStream {
         match this.fut.poll(cx) {
             std::task::Poll::Ready(res) => {
                 this.fut.set(Self::poll_next_inner(
-                    *this.sequencer_id,
+                    *this.shard_index,
                     this.path.clone(),
                     Arc::clone(this.next_sequence_number),
                     Arc::clone(this.terminated),
@@ -591,7 +603,7 @@ impl Stream for ConsumerStream {
 async fn maybe_auto_create_directories(
     root: &Path,
     creation_config: Option<&WriteBufferCreationConfig>,
-) -> Result<BTreeMap<u32, PathBuf>, WriteBufferError> {
+) -> Result<BTreeMap<ShardIndex, PathBuf>, WriteBufferError> {
     loop {
         // figure out if a active version exists
         let active = root.join("active");
@@ -600,9 +612,7 @@ async fn maybe_auto_create_directories(
             let directories = scan_dir(&active, FileType::Dir).await?;
 
             if directories.is_empty() {
-                return Err("Active configuration has zero sequencers."
-                    .to_string()
-                    .into());
+                return Err("Active configuration has zero shards.".to_string().into());
             }
             return Ok(directories);
         }
@@ -614,24 +624,24 @@ async fn maybe_auto_create_directories(
             tokio::fs::create_dir_all(&version).await?;
 
             let mut directories = BTreeMap::new();
-            for sequencer_id in 0..creation_config.n_sequencers.get() {
-                let sequencer_path_in_version = version.join(sequencer_id.to_string());
-                tokio::fs::create_dir(&sequencer_path_in_version).await?;
+            for shard_index in 0..creation_config.n_shards.get() {
+                let shard_path_in_version = version.join(shard_index.to_string());
+                tokio::fs::create_dir(&shard_path_in_version).await?;
 
-                let committed = sequencer_path_in_version.join("committed");
+                let committed = shard_path_in_version.join("committed");
                 tokio::fs::create_dir(&committed).await?;
 
-                let temp = sequencer_path_in_version.join("temp");
+                let temp = shard_path_in_version.join("temp");
                 tokio::fs::create_dir(&temp).await?;
 
-                let sequencer_path_in_active = active.join(sequencer_id.to_string());
-                directories.insert(sequencer_id, sequencer_path_in_active);
+                let shard_path_in_active = active.join(shard_index.to_string());
+                directories.insert(ShardIndex::new(shard_index as i32), shard_path_in_active);
             }
 
             // A symlink target is resolved relative to the parent directory of
             // the link itself.
             let target = version
-                .strip_prefix(&root)
+                .strip_prefix(root)
                 .expect("symlink target not in root workspace");
 
             // symlink active->version
@@ -645,7 +655,7 @@ async fn maybe_auto_create_directories(
                 continue;
             }
         } else {
-            return Err("no file sequencers initialized".to_string().into());
+            return Err("no file shards initialized".to_string().into());
         }
     }
 }
@@ -683,12 +693,12 @@ where
             }
         }
 
-        if let Some(sequencer_id) = path
+        if let Some(shard_index) = path
             .file_name()
             .and_then(|p| p.to_str())
             .and_then(|p| p.parse::<T>().ok())
         {
-            results.insert(sequencer_id, path);
+            results.insert(shard_index, path);
         } else {
             return Err(format!("Cannot parse '{}'", path.display()).into());
         }
@@ -706,20 +716,20 @@ async fn watermark(path: &Path) -> Result<i64, WriteBufferError> {
 pub mod test_utils {
     use std::path::Path;
 
-    use data_types::SequenceNumber;
+    use data_types::{SequenceNumber, ShardIndex};
 
     /// Remove specific entry from write buffer.
     pub async fn remove_entry(
         write_buffer_path: &Path,
         database_name: &str,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         sequence_number: SequenceNumber,
     ) {
         tokio::fs::remove_file(
             write_buffer_path
                 .join(database_name)
                 .join("active")
-                .join(sequencer_id.to_string())
+                .join(shard_index.to_string())
                 .join("committed")
                 .join(sequence_number.get().to_string()),
         )
@@ -760,13 +770,13 @@ mod tests {
 
         async fn new_context_with_time(
             &self,
-            n_sequencers: NonZeroU32,
+            n_shards: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
         ) -> Self::Context {
             FileTestContext {
                 path: self.tempdir.path().to_path_buf(),
                 database_name: format!("test_db_{}", Uuid::new_v4()),
-                n_sequencers,
+                n_shards,
                 time_provider,
                 trace_collector: Arc::new(RingBufferTraceCollector::new(100)),
             }
@@ -776,7 +786,7 @@ mod tests {
     struct FileTestContext {
         path: PathBuf,
         database_name: String,
-        n_sequencers: NonZeroU32,
+        n_shards: NonZeroU32,
         time_provider: Arc<dyn TimeProvider>,
         trace_collector: Arc<RingBufferTraceCollector>,
     }
@@ -784,7 +794,7 @@ mod tests {
     impl FileTestContext {
         fn creation_config(&self, value: bool) -> Option<WriteBufferCreationConfig> {
             value.then(|| WriteBufferCreationConfig {
-                n_sequencers: self.n_sequencers,
+                n_shards: self.n_shards,
                 ..Default::default()
             })
         }
@@ -831,44 +841,40 @@ mod tests {
         let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
 
         let writer = ctx.writing(true).await.unwrap();
-        let sequencer_id = writer.sequencer_ids().into_iter().next().unwrap();
+        let shard_index = writer.shard_indexes().into_iter().next().unwrap();
         let entry_1 = "upc,region=east user=1 100";
         let entry_2 = "upc,region=east user=2 200";
         let entry_3 = "upc,region=east user=3 300";
         let entry_4 = "upc,region=east user=4 400";
 
         let w1 = write(
-            &ctx.database_name,
             &writer,
             entry_1,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
         .await;
         let w2 = write(
-            &ctx.database_name,
             &writer,
             entry_2,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
         .await;
         let w3 = write(
-            &ctx.database_name,
             &writer,
             entry_3,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
         .await;
         let w4 = write(
-            &ctx.database_name,
             &writer,
             entry_4,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
@@ -877,20 +883,20 @@ mod tests {
         remove_entry(
             &ctx.path,
             &ctx.database_name,
-            sequencer_id,
+            shard_index,
             w2.meta().sequence().unwrap().sequence_number,
         )
         .await;
         remove_entry(
             &ctx.path,
             &ctx.database_name,
-            sequencer_id,
+            shard_index,
             w3.meta().sequence().unwrap().sequence_number,
         )
         .await;
 
         let reader = ctx.reading(true).await.unwrap();
-        let mut handler = reader.stream_handler(sequencer_id).await.unwrap();
+        let mut handler = reader.stream_handler(shard_index).await.unwrap();
         let mut stream = handler.stream().await;
 
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w1);
@@ -903,24 +909,22 @@ mod tests {
         let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
 
         let writer = ctx.writing(true).await.unwrap();
-        let sequencer_id = writer.sequencer_ids().into_iter().next().unwrap();
+        let shard_index = writer.shard_indexes().into_iter().next().unwrap();
         let entry_1 = "upc,region=east user=1 100";
         let entry_2 = "upc,region=east user=2 200";
 
         let w1 = write(
-            &ctx.database_name,
             &writer,
             entry_1,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
         .await;
         let w2 = write(
-            &ctx.database_name,
             &writer,
             entry_2,
-            sequencer_id,
+            shard_index,
             PartitionKey::from("bananas"),
             None,
         )
@@ -929,13 +933,13 @@ mod tests {
         remove_entry(
             &ctx.path,
             &ctx.database_name,
-            sequencer_id,
+            shard_index,
             w1.meta().sequence().unwrap().sequence_number,
         )
         .await;
 
         let reader = ctx.reading(true).await.unwrap();
-        let mut handler = reader.stream_handler(sequencer_id).await.unwrap();
+        let mut handler = reader.stream_handler(shard_index).await.unwrap();
         let mut stream = handler.stream().await;
 
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w2);

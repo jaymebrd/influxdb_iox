@@ -1,17 +1,16 @@
 //! Ingester server entrypoint.
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 use self::{grpc::GrpcDelegate, http::HttpDelegate};
 use crate::handler::IngestHandler;
-use std::fmt::Debug;
 
 pub mod grpc;
 pub mod http;
 
 /// The [`IngesterServer`] manages the lifecycle and contains all state for a
 /// `ingester` server instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IngesterServer<I: IngestHandler> {
     metrics: Arc<metric::Registry>,
 

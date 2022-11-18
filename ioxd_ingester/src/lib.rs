@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use clap_blocks::{ingester::IngesterConfig, write_buffer::WriteBufferConfig};
-use data_types::KafkaPartition;
+use data_types::ShardIndex;
 use hyper::{Body, Request, Response};
 use ingester::{
     handler::{IngestHandler, IngestHandlerImpl},
@@ -33,11 +33,11 @@ pub enum Error {
     #[error("Catalog error: {0}")]
     Catalog(#[from] iox_catalog::interface::Error),
 
-    #[error("Kafka topic {0} not found in the catalog")]
-    KafkaTopicNotFound(String),
+    #[error("Topic name {0} not found in the catalog")]
+    TopicNotFound(String),
 
-    #[error("kafka_partition_range_start must be <= kafka_partition_range_end")]
-    KafkaRange,
+    #[error("shard_index_range_start must be <= shard_index_range_end")]
+    ShardIndexRange,
 
     #[error("error initializing ingester: {0}")]
     Ingester(#[from] ingester::handler::Error),
@@ -88,11 +88,14 @@ impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterSe
         Err(Box::new(IoxHttpError::NotFound))
     }
 
-    /// Provide a placeholder gRPC service.
+    /// Configure the gRPC services.
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
+
         add_service!(builder, self.server.grpc().flight_service());
         add_service!(builder, self.server.grpc().write_info_service());
+        add_service!(builder, self.server.grpc().catalog_service());
+
         serve_builder!(builder);
 
         Ok(())
@@ -146,34 +149,35 @@ pub async fn create_ingester_server_type(
     ingester_config: IngesterConfig,
 ) -> Result<Arc<dyn ServerType>> {
     let mut txn = catalog.start_transaction().await?;
-    let kafka_topic = txn
-        .kafka_topics()
+    let topic = txn
+        .topics()
         .get_by_name(write_buffer_config.topic())
         .await?
-        .ok_or_else(|| Error::KafkaTopicNotFound(write_buffer_config.topic().to_string()))?;
+        .ok_or_else(|| Error::TopicNotFound(write_buffer_config.topic().to_string()))?;
 
-    if ingester_config.write_buffer_partition_range_start
-        > ingester_config.write_buffer_partition_range_end
-    {
-        return Err(Error::KafkaRange);
+    if ingester_config.shard_index_range_start > ingester_config.shard_index_range_end {
+        return Err(Error::ShardIndexRange);
     }
 
-    let kafka_partitions: Vec<_> = (ingester_config.write_buffer_partition_range_start
-        ..=ingester_config.write_buffer_partition_range_end)
-        .map(KafkaPartition::new)
-        .collect();
+    let shard_range =
+        ingester_config.shard_index_range_start..(ingester_config.shard_index_range_end + 1);
+    let shard_indexes: Vec<_> = shard_range.clone().map(ShardIndex::new).collect();
 
-    let mut sequencers = BTreeMap::new();
-    for k in kafka_partitions {
-        let s = txn.sequencers().create_or_get(&kafka_topic, k).await?;
-        sequencers.insert(k, s);
+    let mut shards = BTreeMap::new();
+    for shard_index in shard_indexes {
+        let s = txn.shards().create_or_get(&topic, shard_index).await?;
+        shards.insert(shard_index, s);
     }
     txn.commit().await?;
 
     let trace_collector = common_state.trace_collector();
 
     let write_buffer = write_buffer_config
-        .reading(Arc::clone(&metric_registry), trace_collector.clone())
+        .reading(
+            Arc::clone(&metric_registry),
+            Some(shard_range),
+            trace_collector.clone(),
+        )
         .await?;
 
     let lifecycle_config = LifecycleConfig::new(
@@ -182,12 +186,14 @@ pub async fn create_ingester_server_type(
         ingester_config.persist_partition_size_threshold_bytes,
         Duration::from_secs(ingester_config.persist_partition_age_threshold_seconds),
         Duration::from_secs(ingester_config.persist_partition_cold_threshold_seconds),
+        ingester_config.persist_partition_rows_max,
     );
+    let grpc_catalog = Arc::clone(&catalog);
     let ingest_handler = Arc::new(
         IngestHandlerImpl::new(
             lifecycle_config,
-            kafka_topic,
-            sequencers,
+            topic,
+            shards,
             catalog,
             object_store,
             write_buffer,
@@ -200,6 +206,7 @@ pub async fn create_ingester_server_type(
     );
     let http = HttpDelegate::new(Arc::clone(&ingest_handler));
     let grpc = GrpcDelegate::new(
+        grpc_catalog,
         Arc::clone(&ingest_handler),
         Arc::new(AtomicU64::new(ingester_config.test_flight_do_get_panic)),
     );

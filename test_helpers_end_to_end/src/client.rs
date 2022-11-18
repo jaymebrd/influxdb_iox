@@ -6,8 +6,7 @@ use hyper::{Body, Client, Request};
 use influxdb_iox_client::{
     connection::Connection,
     flight::generated_types::ReadInfo,
-    write::generated_types::{DatabaseBatch, TableBatch, WriteRequest, WriteResponse},
-    write_info::generated_types::{merge_responses, GetWriteInfoResponse, KafkaPartitionStatus},
+    write_info::generated_types::{merge_responses, GetWriteInfoResponse, ShardStatus},
 };
 use observability_deps::tracing::info;
 use std::time::Duration;
@@ -39,44 +38,11 @@ pub async fn write_to_router(
         .expect("http error sending write")
 }
 
-/// Writes the table batch to the gRPC write API on the router into the org/bucket (typically on
-/// the router)
-pub async fn write_to_router_grpc(
-    table_batches: Vec<TableBatch>,
-    namespace: impl Into<String>,
-    router_connection: Connection,
-) -> tonic::Response<WriteResponse> {
-    let request = WriteRequest {
-        database_batch: Some(DatabaseBatch {
-            database_name: namespace.into(),
-            table_batches,
-            partition_key: Default::default(),
-        }),
-    };
-
-    influxdb_iox_client::write::Client::new(router_connection)
-        .write_pb(request)
-        .await
-        .expect("grpc error sending write")
-}
-
 /// Extracts the write token from the specified response (to the /api/v2/write api)
 pub fn get_write_token(response: &Response<Body>) -> String {
     let message = format!("no write token in {:?}", response);
     response
         .headers()
-        .get("X-IOx-Write-Token")
-        .expect(&message)
-        .to_str()
-        .expect("Value not a string")
-        .to_string()
-}
-
-/// Extracts the write token from the specified response (to the gRPC write API)
-pub fn get_write_token_from_grpc(response: &tonic::Response<WriteResponse>) -> String {
-    let message = format!("no write token in {:?}", response);
-    response
-        .metadata()
         .get("X-IOx-Write-Token")
         .expect(&message)
         .to_str()
@@ -202,25 +168,25 @@ pub async fn wait_for_persisted(write_token: impl Into<String>, connection: Conn
     .await
 }
 
-/// returns true if all partitions in the response are readablel
+/// returns true if all shards in the response are readable
 /// TODO: maybe put this in the influxdb_iox_client library / make a
 /// proper public facing client API. For now, iterate in the end to end tests.
 pub fn all_readable(res: &GetWriteInfoResponse) -> bool {
-    res.kafka_partition_infos.iter().all(|info| {
+    res.shard_infos.iter().all(|info| {
         matches!(
             info.status(),
-            KafkaPartitionStatus::Readable | KafkaPartitionStatus::Persisted
+            ShardStatus::Readable | ShardStatus::Persisted
         )
     })
 }
 
-/// returns true if all partitions in the response are readablel
+/// returns true if all shards in the response are persisted
 /// TODO: maybe put this in the influxdb_iox_client library / make a
 /// proper public facing client API. For now, iterate in the end to end tests.
 pub fn all_persisted(res: &GetWriteInfoResponse) -> bool {
-    res.kafka_partition_infos
+    res.shard_infos
         .iter()
-        .all(|info| matches!(info.status(), KafkaPartitionStatus::Persisted))
+        .all(|info| matches!(info.status(), ShardStatus::Persisted))
 }
 
 /// Runs a query using the flight API on the specified connection.

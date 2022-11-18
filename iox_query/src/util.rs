@@ -13,27 +13,32 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use data_types::TimestampMinMax;
+use data_types::{
+    ColumnSummary, InfluxDbType, StatValues, Statistics, TableSummary, TimestampMinMax,
+};
 use datafusion::{
-    datasource::MemTable,
+    self,
+    common::{DFSchema, ToDFSchema},
+    datasource::{provider_as_source, MemTable},
     error::{DataFusionError, Result as DatafusionResult},
     execution::context::ExecutionProps,
-    logical_plan::{
-        lit, provider_as_source, DFSchema, Expr, ExprRewriter, ExprSchemable, LogicalPlan,
-        LogicalPlanBuilder,
+    logical_expr::{
+        expr_rewriter::ExprRewriter, BinaryExpr, ExprSchemable, LogicalPlan, LogicalPlanBuilder,
     },
+    optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext},
     physical_expr::create_physical_expr,
     physical_plan::{
         expressions::{col as physical_col, PhysicalSortExpr},
         ExecutionPlan, PhysicalExpr,
     },
+    prelude::{binary_expr, lit, Expr},
     scalar::ScalarValue,
 };
 
 use itertools::Itertools;
 use observability_deps::tracing::trace;
 use predicate::rpc_predicate::{FIELD_COLUMN_NAME, MEASUREMENT_COLUMN_NAME};
-use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
+use schema::{sort::SortKey, InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
@@ -111,34 +116,25 @@ pub fn arrow_sort_key_exprs(
         .collect()
 }
 
-/// Build a datafusion physical expression from its logical one
+/// Build a datafusion physical expression from a logical one
 pub fn df_physical_expr(
     input: &dyn ExecutionPlan,
     expr: Expr,
 ) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-    df_physical_expr_from_schema_and_expr(input.schema(), expr)
-}
+    let schema = input.schema();
 
-/// Build a datafusion physical expression from its logical one and a provided schema
-pub fn df_physical_expr_from_schema_and_expr(
-    schema: Arc<ArrowSchema>,
-    expr: Expr,
-) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-    let execution_props = ExecutionProps::new();
+    let df_schema = Arc::clone(&schema).to_dfschema_ref()?;
 
-    let input_physical_schema = schema;
-    let input_logical_schema: DFSchema = input_physical_schema.as_ref().clone().try_into()?;
+    let props = ExecutionProps::new();
+    let simplifier =
+        ExprSimplifier::new(SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema)));
 
-    trace!(%expr, "logical expression");
-    trace!(%input_logical_schema, "input logical schema");
-    trace!(%input_physical_schema, "input physical schema");
+    // apply type coercion here to ensure types match
+    trace!(%df_schema, "input schema");
+    let expr = simplifier.coerce(expr, Arc::clone(&df_schema))?;
+    trace!(%expr, "coerced logical expression");
 
-    create_physical_expr(
-        &expr,
-        &input_logical_schema,
-        &input_physical_schema,
-        &execution_props,
-    )
+    create_physical_expr(&expr, df_schema.as_ref(), schema.as_ref(), &props)
 }
 
 /// Rewrites the provided expr such that references to any column that
@@ -219,14 +215,10 @@ impl<'a> ExprRewriter for MissingColumnsToNull<'a> {
         // Until then, we need to know what type of expr the column is
         // being compared with, so workaround by finding the datatype of the other arg
         match expr {
-            Expr::BinaryExpr { left, op, right } => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let left = self.rewrite_op_arg(*left, &right)?;
                 let right = self.rewrite_op_arg(*right, &left)?;
-                Ok(Expr::BinaryExpr {
-                    left: Box::new(left),
-                    op,
-                    right: Box::new(right),
-                })
+                Ok(binary_expr(left, op, right))
             }
             Expr::IsNull(expr) if self.is_null_column(&expr) => Ok(lit(true)),
             Expr::IsNotNull(expr) if self.is_null_column(&expr) => Ok(lit(false)),
@@ -236,7 +228,10 @@ impl<'a> ExprRewriter for MissingColumnsToNull<'a> {
 }
 
 /// Return min and max for column `time` of the given set of record batches
-pub fn compute_timenanosecond_min_max(batches: &[RecordBatch]) -> Result<TimestampMinMax> {
+pub fn compute_timenanosecond_min_max<'a, I>(batches: I) -> Result<TimestampMinMax>
+where
+    I: IntoIterator<Item = &'a RecordBatch>,
+{
     let mut min_time = i64::MAX;
     let mut max_time = i64::MIN;
     for batch in batches {
@@ -281,11 +276,90 @@ pub fn compute_timenanosecond_min_max_for_one_record_batch(
     Ok((min, max))
 }
 
+/// Create basic table summary.
+///
+/// This contains:
+/// - correct column types
+/// - [total count](StatValues::total_count) for all columns
+/// - [min](StatValues::min)/[max](StatValues::max) for the timestamp column
+pub fn create_basic_summary(
+    row_count: u64,
+    schema: &Schema,
+    ts_min_max: TimestampMinMax,
+) -> TableSummary {
+    let mut columns = Vec::with_capacity(schema.len());
+    for i in 0..schema.len() {
+        let (t, field) = schema.field(i);
+
+        let influxdb_type = match t {
+            InfluxColumnType::Tag => InfluxDbType::Tag,
+            InfluxColumnType::Field(_) => InfluxDbType::Field,
+            InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
+        };
+
+        let stats = match t {
+            InfluxColumnType::Tag | InfluxColumnType::Field(InfluxFieldType::String) => {
+                Statistics::String(StatValues {
+                    min: None,
+                    max: None,
+                    total_count: row_count,
+                    null_count: None,
+                    distinct_count: None,
+                })
+            }
+            InfluxColumnType::Timestamp => Statistics::I64(StatValues {
+                min: Some(ts_min_max.min),
+                max: Some(ts_min_max.max),
+                total_count: row_count,
+                null_count: None,
+                distinct_count: None,
+            }),
+            InfluxColumnType::Field(InfluxFieldType::Integer) => Statistics::I64(StatValues {
+                min: None,
+                max: None,
+                total_count: row_count,
+                null_count: None,
+                distinct_count: None,
+            }),
+            InfluxColumnType::Field(InfluxFieldType::UInteger) => Statistics::U64(StatValues {
+                min: None,
+                max: None,
+                total_count: row_count,
+                null_count: None,
+                distinct_count: None,
+            }),
+            InfluxColumnType::Field(InfluxFieldType::Float) => Statistics::F64(StatValues {
+                min: None,
+                max: None,
+                total_count: row_count,
+                null_count: None,
+                distinct_count: None,
+            }),
+            InfluxColumnType::Field(InfluxFieldType::Boolean) => Statistics::Bool(StatValues {
+                min: None,
+                max: None,
+                total_count: row_count,
+                null_count: None,
+                distinct_count: None,
+            }),
+        };
+
+        columns.push(ColumnSummary {
+            name: field.name().clone(),
+            influxdb_type,
+            stats,
+        })
+    }
+
+    TableSummary { columns }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
     use datafusion::{
-        logical_plan::{col, lit, ExprRewritable},
+        logical_expr::expr_rewriter::ExprRewritable,
+        prelude::{col, lit},
         scalar::ScalarValue,
     };
     use schema::builder::SchemaBuilder;
@@ -297,10 +371,15 @@ mod tests {
         let schema = SchemaBuilder::new()
             .tag("tag")
             .field("str", DataType::Utf8)
+            .unwrap()
             .field("int", DataType::Int64)
+            .unwrap()
             .field("uint", DataType::UInt64)
+            .unwrap()
             .field("float", DataType::Float64)
+            .unwrap()
             .field("bool", DataType::Boolean)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -397,5 +476,211 @@ mod tests {
             "Mismatch rewriting\nInput: {}\nRewritten: {}\nExpected: {}",
             expr, rewritten_expr, expected
         );
+    }
+
+    #[test]
+    fn test_create_basic_summary_no_columns_no_rows() {
+        let schema = SchemaBuilder::new().build().unwrap();
+        let row_count = 0;
+        let ts_min_max = TimestampMinMax { min: 10, max: 20 };
+
+        let actual = create_basic_summary(row_count, &schema, ts_min_max);
+        let expected = TableSummary { columns: vec![] };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_create_basic_summary_no_rows() {
+        let schema = full_schema();
+        let row_count = 0;
+        let ts_min_max = TimestampMinMax { min: 10, max: 20 };
+
+        let actual = create_basic_summary(row_count, &schema, ts_min_max);
+        let expected = TableSummary {
+            columns: vec![
+                ColumnSummary {
+                    name: String::from("tag"),
+                    influxdb_type: InfluxDbType::Tag,
+                    stats: Statistics::String(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_bool"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::Bool(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_float"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::F64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_integer"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::I64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_string"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::String(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_uinteger"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::U64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("time"),
+                    influxdb_type: InfluxDbType::Timestamp,
+                    stats: Statistics::I64(StatValues {
+                        min: Some(10),
+                        max: Some(20),
+                        total_count: 0,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_create_basic_summary() {
+        let schema = full_schema();
+        let row_count = 3;
+        let ts_min_max = TimestampMinMax { min: 42, max: 42 };
+
+        let actual = create_basic_summary(row_count, &schema, ts_min_max);
+        let expected = TableSummary {
+            columns: vec![
+                ColumnSummary {
+                    name: String::from("tag"),
+                    influxdb_type: InfluxDbType::Tag,
+                    stats: Statistics::String(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_bool"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::Bool(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_float"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::F64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_integer"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::I64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_string"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::String(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("field_uinteger"),
+                    influxdb_type: InfluxDbType::Field,
+                    stats: Statistics::U64(StatValues {
+                        min: None,
+                        max: None,
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+                ColumnSummary {
+                    name: String::from("time"),
+                    influxdb_type: InfluxDbType::Timestamp,
+                    stats: Statistics::I64(StatValues {
+                        min: Some(42),
+                        max: Some(42),
+                        total_count: 3,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(actual, expected);
+    }
+
+    fn full_schema() -> Schema {
+        SchemaBuilder::new()
+            .tag("tag")
+            .influx_field("field_bool", InfluxFieldType::Boolean)
+            .influx_field("field_float", InfluxFieldType::Float)
+            .influx_field("field_integer", InfluxFieldType::Integer)
+            .influx_field("field_string", InfluxFieldType::String)
+            .influx_field("field_uinteger", InfluxFieldType::UInteger)
+            .timestamp()
+            .build()
+            .unwrap()
     }
 }

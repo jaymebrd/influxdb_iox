@@ -2,18 +2,20 @@
 
 use backoff::{Backoff, BackoffConfig};
 use cache_system::{
-    backend::{
-        lru::{LruBackend, ResourcePool},
-        resource_consumption::FunctionEstimator,
-        ttl::{TtlBackend, TtlProvider},
+    backend::policy::{
+        lru::{LruPolicy, ResourcePool},
+        ttl::{TtlPolicy, TtlProvider},
+        PolicyBackend,
     },
     cache::{driver::CacheDriver, metrics::CacheWithMetrics, Cache},
     loader::{metrics::MetricsLoader, FunctionLoader},
+    resource_consumption::FunctionEstimator,
 };
 use data_types::{ParquetFileId, TombstoneId};
 use iox_catalog::interface::Catalog;
 use iox_time::TimeProvider;
 use std::{collections::HashMap, mem::size_of_val, sync::Arc, time::Duration};
+use trace::span::Span;
 
 use super::ram::RamSize;
 
@@ -25,7 +27,14 @@ pub const TTL_NOT_PROCESSED: Duration = Duration::from_secs(100);
 
 const CACHE_ID: &str = "processed_tombstones";
 
-type CacheT = Box<dyn Cache<K = (ParquetFileId, TombstoneId), V = bool, Extra = ()>>;
+type CacheT = Box<
+    dyn Cache<
+        K = (ParquetFileId, TombstoneId),
+        V = bool,
+        GetExtra = ((), Option<Span>),
+        PeekExtra = ((), Option<Span>),
+    >,
+>;
 
 /// Cache for processed tombstones.
 #[derive(Debug)]
@@ -43,26 +52,24 @@ impl ProcessedTombstonesCache {
         ram_pool: Arc<ResourcePool<RamSize>>,
         testing: bool,
     ) -> Self {
-        let loader = Box::new(FunctionLoader::new(
-            move |(parquet_file_id, tombstone_id), _extra: ()| {
-                let catalog = Arc::clone(&catalog);
-                let backoff_config = backoff_config.clone();
+        let loader = FunctionLoader::new(move |(parquet_file_id, tombstone_id), _extra: ()| {
+            let catalog = Arc::clone(&catalog);
+            let backoff_config = backoff_config.clone();
 
-                async move {
-                    Backoff::new(&backoff_config)
-                        .retry_all_errors("processed tombstone exists", || async {
-                            catalog
-                                .repositories()
-                                .await
-                                .processed_tombstones()
-                                .exist(parquet_file_id, tombstone_id)
-                                .await
-                        })
-                        .await
-                        .expect("retry forever")
-                }
-            },
-        ));
+            async move {
+                Backoff::new(&backoff_config)
+                    .retry_all_errors("processed tombstone exists", || async {
+                        catalog
+                            .repositories()
+                            .await
+                            .processed_tombstones()
+                            .exist(parquet_file_id, tombstone_id)
+                            .await
+                    })
+                    .await
+                    .expect("retry forever")
+            }
+        });
         let loader = Arc::new(MetricsLoader::new(
             loader,
             CACHE_ID,
@@ -71,14 +78,13 @@ impl ProcessedTombstonesCache {
             testing,
         ));
 
-        let backend = Box::new(HashMap::new());
-        let backend = Box::new(TtlBackend::new(
-            backend,
+        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider));
+        backend.add_policy(TtlPolicy::new(
             Arc::new(KeepExistsForever {}),
-            Arc::clone(&time_provider),
+            CACHE_ID,
+            metric_registry,
         ));
-        let backend = Box::new(LruBackend::new(
-            backend,
+        backend.add_policy(LruPolicy::new(
             ram_pool,
             CACHE_ID,
             Arc::new(FunctionEstimator::new(|k, v| {
@@ -86,7 +92,7 @@ impl ProcessedTombstonesCache {
             })),
         ));
 
-        let cache = Box::new(CacheDriver::new(loader, backend));
+        let cache = CacheDriver::new(loader, backend);
         let cache = Box::new(CacheWithMetrics::new(
             cache,
             CACHE_ID,
@@ -98,8 +104,15 @@ impl ProcessedTombstonesCache {
     }
 
     /// Check if the specified tombstone is mark as "processed" for the given parquet file.
-    pub async fn exists(&self, parquet_file_id: ParquetFileId, tombstone_id: TombstoneId) -> bool {
-        self.cache.get((parquet_file_id, tombstone_id), ()).await
+    pub async fn exists(
+        &self,
+        parquet_file_id: ParquetFileId,
+        tombstone_id: TombstoneId,
+        span: Option<Span>,
+    ) -> bool {
+        self.cache
+            .get((parquet_file_id, tombstone_id), ((), span))
+            .await
     }
 }
 
@@ -134,22 +147,22 @@ mod tests {
     async fn test() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table").await;
         table.create_column("foo", ColumnType::F64).await;
         table.create_column("time", ColumnType::Time).await;
-        let sequencer = ns.create_sequencer(1).await;
-        let partition = table.with_sequencer(&sequencer).create_partition("k").await;
+        let shard = ns.create_shard(1).await;
+        let partition = table.with_shard(&shard).create_partition("k").await;
 
         let builder = TestParquetFileBuilder::default().with_line_protocol(TABLE_LINE_PROTOCOL);
         let file1 = partition.create_parquet_file(builder.clone()).await;
         let file2 = partition.create_parquet_file(builder).await;
         let ts1 = table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(1, 1, 10, "foo=1")
             .await;
         let ts2 = table
-            .with_sequencer(&sequencer)
+            .with_shard(&shard)
             .create_tombstone(2, 1, 10, "foo=1")
             .await;
 
@@ -164,10 +177,26 @@ mod tests {
             true,
         );
 
-        assert!(cache.exists(file1.parquet_file.id, ts1.tombstone.id).await);
-        assert!(!cache.exists(file1.parquet_file.id, ts2.tombstone.id).await);
-        assert!(!cache.exists(file2.parquet_file.id, ts1.tombstone.id).await);
-        assert!(!cache.exists(file2.parquet_file.id, ts2.tombstone.id).await);
+        assert!(
+            cache
+                .exists(file1.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file1.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file2.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file2.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
 
         assert_histogram_metric_count(&catalog.metric_registry, "processed_tombstone_exist", 4);
 
@@ -178,27 +207,71 @@ mod tests {
         catalog
             .mock_time_provider()
             .inc(TTL_NOT_PROCESSED - Duration::from_millis(1));
-        assert!(!cache.exists(file2.parquet_file.id, ts2.tombstone.id).await);
+        assert!(
+            !cache
+                .exists(file2.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
         assert_histogram_metric_count(&catalog.metric_registry, "processed_tombstone_exist", 4);
 
         catalog.mock_time_provider().inc(Duration::from_millis(1));
-        assert!(cache.exists(file2.parquet_file.id, ts2.tombstone.id).await);
+        assert!(
+            cache
+                .exists(file2.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
         assert_histogram_metric_count(&catalog.metric_registry, "processed_tombstone_exist", 5);
 
         // "true" results are cached forever
-        assert!(cache.exists(file1.parquet_file.id, ts1.tombstone.id).await);
+        assert!(
+            cache
+                .exists(file1.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
         assert_histogram_metric_count(&catalog.metric_registry, "processed_tombstone_exist", 5);
 
         // cache key has two dimensions
-        assert!(cache.exists(file1.parquet_file.id, ts1.tombstone.id).await);
-        assert!(!cache.exists(file1.parquet_file.id, ts2.tombstone.id).await);
-        assert!(!cache.exists(file2.parquet_file.id, ts1.tombstone.id).await);
-        assert!(cache.exists(file2.parquet_file.id, ts2.tombstone.id).await);
+        assert!(
+            cache
+                .exists(file1.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file1.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file2.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            cache
+                .exists(file2.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
         ts1.mark_processed(&file2).await;
         catalog.mock_time_provider().inc(TTL_NOT_PROCESSED);
-        assert!(cache.exists(file1.parquet_file.id, ts1.tombstone.id).await);
-        assert!(!cache.exists(file1.parquet_file.id, ts2.tombstone.id).await);
-        assert!(cache.exists(file2.parquet_file.id, ts1.tombstone.id).await);
-        assert!(cache.exists(file2.parquet_file.id, ts2.tombstone.id).await);
+        assert!(
+            cache
+                .exists(file1.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            !cache
+                .exists(file1.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
+        assert!(
+            cache
+                .exists(file2.parquet_file.id, ts1.tombstone.id, None)
+                .await
+        );
+        assert!(
+            cache
+                .exists(file2.parquet_file.id, ts2.tombstone.id, None)
+                .await
+        );
     }
 }

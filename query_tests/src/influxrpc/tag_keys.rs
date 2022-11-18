@@ -1,6 +1,6 @@
 use crate::scenarios::*;
 use data_types::{MAX_NANO_TIME, MIN_NANO_TIME};
-use datafusion::logical_plan::{col, lit};
+use datafusion::prelude::{col, lit};
 use iox_query::{
     exec::stringset::{IntoStringSet, StringSetRef},
     frontend::influxrpc::InfluxRpcPlanner,
@@ -27,11 +27,11 @@ async fn run_tag_keys_test_case<D>(
         } = scenario;
         println!("Running scenario '{}'", scenario_name);
         println!("Predicate: '{:#?}'", predicate);
-        let planner = InfluxRpcPlanner::default();
         let ctx = db.new_query_context(None);
+        let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
         let plan = planner
-            .tag_keys(db.as_query_database(), predicate.clone())
+            .tag_keys(db.as_query_namespace_arc(), predicate.clone())
             .await
             .expect("built plan successfully");
         let names = ctx
@@ -170,24 +170,6 @@ async fn list_tag_name_end_to_end() {
 }
 
 #[tokio::test]
-async fn list_tag_name_end_to_end_with_delete_and_pred() {
-    let predicate = Predicate::default()
-        .with_range(0, 10000)
-        .with_expr(col("host").eq(lit("server01")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-    let expected_tag_keys = vec!["host", "region"];
-    run_tag_keys_test_case(EndToEndTestWithDelete {}, predicate, expected_tag_keys).await;
-}
-
-#[tokio::test]
-async fn list_tag_name_end_to_end_with_delete() {
-    let predicate = Predicate::default().with_expr(col("_measurement").eq(lit("swap")));
-    let predicate = InfluxRpcPredicate::new(None, predicate);
-    let expected_tag_keys = vec!["host", "name"];
-    run_tag_keys_test_case(EndToEndTestWithDelete {}, predicate, expected_tag_keys).await;
-}
-
-#[tokio::test]
 async fn list_tag_name_max_time() {
     test_helpers::maybe_start_logging();
     let predicate = Predicate::default().with_range(MIN_NANO_TIME, i64::MAX);
@@ -222,6 +204,15 @@ async fn list_tag_name_max_time_included() {
     let predicate = InfluxRpcPredicate::new(None, predicate);
     let expected_tag_keys = vec!["host"];
     run_tag_keys_test_case(MeasurementWithMaxTime {}, predicate, expected_tag_keys).await;
+}
+
+#[tokio::test]
+async fn list_tag_name_with_periods() {
+    test_helpers::maybe_start_logging();
+    let predicate = Predicate::default().with_range(0, 1700000001000000000);
+    let predicate = InfluxRpcPredicate::new(None, predicate);
+    let expected_tag_keys = vec!["tag.one", "tag.two"];
+    run_tag_keys_test_case(PeriodsInNames {}, predicate, expected_tag_keys).await;
 }
 
 fn to_stringset(v: &[&str]) -> StringSetRef {

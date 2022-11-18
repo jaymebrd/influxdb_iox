@@ -8,7 +8,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use parking_lot::Mutex;
@@ -67,7 +69,7 @@ impl<T> Job<T> {
     ///
     /// You must ensure that this task eventually finishes, otherwise [`DedicatedExecutor::join`] may never return!
     pub fn detach(mut self) {
-        // cannot destructure `Self` because we implement `Drop`, so we use a flag instead to prevent cancelation.
+        // cannot destructure `Self` because we implement `Drop`, so we use a flag instead to prevent cancellation.
         self.detached = true;
     }
 }
@@ -197,7 +199,7 @@ impl DedicatedExecutor {
                 }
 
                 // Wait for all tasks to finish
-                join.write().await;
+                let _guard = join.write().await;
 
                 // signal shutdown, but it's OK if the other side is gone
                 tx_shutdown.send(()).ok();
@@ -621,7 +623,7 @@ mod tests {
     async fn wait_for_tasks(exec: &DedicatedExecutor, num: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if dbg!(exec.tasks()) == num {
+                if exec.tasks() == num {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;

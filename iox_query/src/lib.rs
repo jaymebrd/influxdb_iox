@@ -5,24 +5,25 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use data_types::{
-    ChunkId, ChunkOrder, DeletePredicate, InfluxDbType, PartitionId, TableSummary, TimestampMinMax,
-};
-use datafusion::physical_plan::SendableRecordBatchStream;
+use data_types::{ChunkId, ChunkOrder, DeletePredicate, InfluxDbType, PartitionId, TableSummary};
+use datafusion::{error::DataFusionError, prelude::SessionContext};
 use exec::{stringset::StringSet, IOxSessionContext};
 use hashbrown::HashMap;
 use observability_deps::tracing::{debug, trace};
-use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate, PredicateMatch};
+use parquet_file::storage::ParquetExecInput;
+use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate, PredicateMatch};
 use schema::{
-    selection::Selection,
     sort::{SortKey, SortKeyBuilder},
-    Schema, TIME_COLUMN_NAME,
+    Projection, Schema, TIME_COLUMN_NAME,
 };
-use std::{collections::BTreeSet, fmt::Debug, iter::FromIterator, sync::Arc};
+use std::{any::Any, collections::BTreeSet, fmt::Debug, iter::FromIterator, sync::Arc};
 
 pub mod exec;
 pub mod frontend;
@@ -32,7 +33,6 @@ pub mod pruning;
 pub mod statistics;
 pub mod util;
 
-pub use exec::context::{DEFAULT_CATALOG, DEFAULT_SCHEMA};
 pub use frontend::common::ScanPlanBuilder;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
@@ -40,23 +40,20 @@ pub use query_functions::group_by::{Aggregate, WindowDuration};
 /// metadata
 pub trait QueryChunkMeta {
     /// Return a summary of the data
-    fn summary(&self) -> Option<Arc<TableSummary>>;
+    fn summary(&self) -> Arc<TableSummary>;
 
     /// return a reference to the summary of the data held in this chunk
     fn schema(&self) -> Arc<Schema>;
 
-    /// Return a reference to the chunk's partition sort key if any
+    /// Return a reference to the chunk's partition sort key if any.
     /// Only persisted chunk has its partition sort key
     fn partition_sort_key(&self) -> Option<&SortKey>;
 
     /// Return partition id for this chunk
-    fn partition_id(&self) -> Option<PartitionId>;
+    fn partition_id(&self) -> PartitionId;
 
     /// return a reference to the sort key if any
     fn sort_key(&self) -> Option<&SortKey>;
-
-    /// Return time range of the data
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax>;
 
     /// return a reference to delete predicates of the chunk
     fn delete_predicates(&self) -> &[Arc<DeletePredicate>];
@@ -92,7 +89,7 @@ pub trait QueryChunkMeta {
 }
 
 /// A `QueryCompletedToken` is returned by `record_query` implementations of
-/// a `QueryDatabase`. It is used to trigger side-effects (such as query timing)
+/// a `QueryNamespace`. It is used to trigger side-effects (such as query timing)
 /// on query completion.
 ///
 pub struct QueryCompletedToken {
@@ -139,24 +136,27 @@ impl Drop for QueryCompletedToken {
 /// This avoids storing potentially large strings
 pub type QueryText = Box<dyn std::fmt::Display + Send + Sync>;
 
-/// Error type for [`QueryDatabase`] operations.
-pub type QueryDatabaseError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-/// A `Database` is the main trait implemented by the IOx subsystems
-/// that store actual data.
+/// `QueryNamespace` is the main trait implemented by the IOx subsystems that store actual data.
 ///
-/// Databases store data organized by partitions and each partition stores
-/// data in Chunks.
+/// Namespaces store data organized by partitions and each partition stores data in Chunks.
 #[async_trait]
-pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
-    /// Returns a set of chunks within the partition with data that may match
-    /// the provided predicate. If possible, chunks which have no rows that can
-    /// possibly match the predicate may be omitted.
+pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
+    /// Returns a set of chunks within the partition with data that may match the provided
+    /// predicate.
+    ///
+    /// If possible, chunks which have no rows that can possibly match the predicate may be omitted.
+    ///
+    /// If projection is `None`, returned chunks will include all columns of its original data.
+    /// Otherwise, returned chunks will include PK columns (tags and time) and columns specified in
+    /// the projection. Projecting chunks here is optional and a mere optimization. The query
+    /// subsystem does NOT rely on it.
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, QueryDatabaseError>;
+        projection: &Option<Vec<usize>>,
+        ctx: IOxSessionContext,
+    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
 
     /// Record that particular type of query was run / planned
     fn record_query(
@@ -166,23 +166,48 @@ pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
         query_text: QueryText,
     ) -> QueryCompletedToken;
 
-    /// Upcast to [`QueryDatabaseMeta`].
+    /// Upcast to [`QueryNamespaceMeta`].
     ///
     /// This is required until <https://github.com/rust-lang/rust/issues/65991> is fixed.
-    fn as_meta(&self) -> &dyn QueryDatabaseMeta;
+    fn as_meta(&self) -> &dyn QueryNamespaceMeta;
 }
 
-/// Error type for [`QueryChunk`] operations.
-pub type QueryChunkError = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// Raw data of a [`QueryChunk`].
+#[derive(Debug)]
+pub enum QueryChunkData {
+    /// In-memory record batches.
+    ///
+    /// **IMPORTANT: All batches MUST have the schema that the [chunk reports](QueryChunkMeta::schema).**
+    RecordBatches(Vec<RecordBatch>),
+
+    /// Parquet file.
+    ///
+    /// See [`ParquetExecInput`] for details.
+    Parquet(ParquetExecInput),
+}
+
+impl QueryChunkData {
+    /// Read data into [`RecordBatch`]es. This is mostly meant for testing!
+    pub async fn read_to_batches(
+        self,
+        schema: Arc<Schema>,
+        session_ctx: &SessionContext,
+    ) -> Vec<RecordBatch> {
+        match self {
+            Self::RecordBatches(batches) => batches,
+            Self::Parquet(exec_input) => exec_input
+                .read_to_batches(schema.as_arrow(), Projection::All, session_ctx)
+                .await
+                .unwrap(),
+        }
+    }
+}
 
 /// Collection of data that shares the same partition key
 pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
     /// returns the Id of this chunk. Ids are unique within a
     /// particular partition.
     fn id(&self) -> ChunkId;
-
-    /// Returns the name of the table stored in this chunk
-    fn table_name(&self) -> &str;
 
     /// Returns true if the chunk may contain a duplicate "primary
     /// key" within itself
@@ -197,11 +222,8 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
     fn apply_predicate_to_metadata(
         &self,
         predicate: &Predicate,
-    ) -> Result<PredicateMatch, QueryChunkError> {
-        Ok(self
-            .summary()
-            .map(|summary| predicate.apply_to_table_summary(&summary, self.schema().as_arrow()))
-            .unwrap_or(PredicateMatch::Unknown))
+    ) -> Result<PredicateMatch, DataFusionError> {
+        Ok(predicate.apply_to_table_summary(&self.summary(), self.schema().as_arrow()))
     }
 
     /// Returns a set of Strings with column names from the specified
@@ -212,8 +234,8 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         &self,
         ctx: IOxSessionContext,
         predicate: &Predicate,
-        columns: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError>;
+        columns: Projection<'_>,
+    ) -> Result<Option<StringSet>, DataFusionError>;
 
     /// Return a set of Strings containing the distinct values in the
     /// specified columns. If the predicate can be evaluated entirely
@@ -225,33 +247,21 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         ctx: IOxSessionContext,
         column_name: &str,
         predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError>;
+    ) -> Result<Option<StringSet>, DataFusionError>;
 
-    /// Provides access to raw `QueryChunk` data as an
-    /// asynchronous stream of `RecordBatch`es filtered by a *required*
-    /// predicate. Note that not all chunks can evaluate all types of
-    /// predicates and this function will return an error
-    /// if requested to evaluate with a predicate that is not supported
+    /// Provides access to raw [`QueryChunk`] data.
     ///
-    /// This is the analog of the `TableProvider` in DataFusion
-    ///
-    /// The reason we can't simply use the `TableProvider` trait
-    /// directly is that the data for a particular Table lives in
-    /// several chunks within a partition, so there needs to be an
-    /// implementation of `TableProvider` that stitches together the
-    /// streams from several different `QueryChunk`s.
-    fn read_filter(
-        &self,
-        ctx: IOxSessionContext,
-        predicate: &Predicate,
-        selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, QueryChunkError>;
+    /// The engine assume that minimal work shall be performed to gather the `QueryChunkData`.
+    fn data(&self) -> QueryChunkData;
 
     /// Returns chunk type. Useful in tests and debug logs.
     fn chunk_type(&self) -> &str;
 
     /// Order of this chunk relative to other overlapping chunks.
     fn order(&self) -> ChunkOrder;
+
+    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Implement ChunkMeta for something wrapped in an Arc (like Chunks often are)
@@ -259,7 +269,7 @@ impl<P> QueryChunkMeta for Arc<P>
 where
     P: QueryChunkMeta,
 {
-    fn summary(&self) -> Option<Arc<TableSummary>> {
+    fn summary(&self) -> Arc<TableSummary> {
         self.as_ref().summary()
     }
 
@@ -267,7 +277,7 @@ where
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.as_ref().partition_id()
     }
 
@@ -283,16 +293,12 @@ where
         let pred = self.as_ref().delete_predicates();
         debug!(?pred, "Delete predicate in QueryChunkMeta");
         pred
-    }
-
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax> {
-        self.as_ref().timestamp_min_max()
     }
 }
 
 /// Implement ChunkMeta for Arc<dyn QueryChunk>
 impl QueryChunkMeta for Arc<dyn QueryChunk> {
-    fn summary(&self) -> Option<Arc<TableSummary>> {
+    fn summary(&self) -> Arc<TableSummary> {
         self.as_ref().summary()
     }
 
@@ -300,7 +306,7 @@ impl QueryChunkMeta for Arc<dyn QueryChunk> {
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.as_ref().partition_id()
     }
 
@@ -317,29 +323,34 @@ impl QueryChunkMeta for Arc<dyn QueryChunk> {
         debug!(?pred, "Delete predicate in QueryChunkMeta");
         pred
     }
-
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax> {
-        self.as_ref().timestamp_min_max()
-    }
 }
 
-/// return true if all the chunks include statistics
-pub fn chunks_have_stats(chunks: &[Arc<dyn QueryChunk>]) -> bool {
+/// return true if all the chunks include distinct counts for all columns.
+pub fn chunks_have_distinct_counts<'a>(
+    chunks: impl IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
+) -> bool {
     // If at least one of the provided chunk cannot provide stats,
     // do not need to compute potential duplicates. We will treat
     // as all of them have duplicates
-    chunks.iter().all(|c| c.summary().is_some())
+    chunks.into_iter().all(|chunk| {
+        chunk
+            .summary()
+            .columns
+            .iter()
+            .all(|col| col.stats.distinct_count().is_some())
+    })
 }
 
-pub fn compute_sort_key_for_chunks(schema: &Schema, chunks: &[Arc<dyn QueryChunk>]) -> SortKey {
-    if !chunks_have_stats(chunks) {
+pub fn compute_sort_key_for_chunks<'a>(
+    schema: &Schema,
+    chunks: impl Copy + IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
+) -> SortKey {
+    if !chunks_have_distinct_counts(chunks) {
         // chunks have not enough stats, return its pk that is
         // sorted lexicographically but time column always last
         SortKey::from_columns(schema.primary_key())
     } else {
-        let summaries = chunks
-            .iter()
-            .map(|x| x.summary().expect("Chunk should have summary"));
+        let summaries = chunks.into_iter().map(|x| x.summary());
         compute_sort_key(summaries)
     }
 }
@@ -355,7 +366,7 @@ fn compute_sort_key(summaries: impl Iterator<Item = Arc<TableSummary>>) -> SortK
     let mut cardinalities: HashMap<String, u64> = Default::default();
     for summary in summaries {
         for column in &summary.columns {
-            if column.influxdb_type != Some(InfluxDbType::Tag) {
+            if column.influxdb_type != InfluxDbType::Tag {
                 continue;
             }
 

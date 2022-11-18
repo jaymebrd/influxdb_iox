@@ -1,5 +1,4 @@
-//! This module provides a reference implementation of
-//! [`QueryDatabase`] for use in testing.
+//! This module provides a reference implementation of [`QueryNamespace`] for use in testing.
 //!
 //! AKA it is a Mock
 
@@ -8,8 +7,8 @@ use crate::{
         stringset::{StringSet, StringSetRef},
         ExecutionContextProvider, Executor, ExecutorType, IOxSessionContext,
     },
-    Predicate, PredicateMatch, QueryChunk, QueryChunkError, QueryChunkMeta, QueryCompletedToken,
-    QueryDatabase, QueryDatabaseError, QueryText,
+    Predicate, PredicateMatch, QueryChunk, QueryChunkData, QueryChunkMeta, QueryCompletedToken,
+    QueryNamespace, QueryText,
 };
 use arrow::{
     array::{
@@ -21,20 +20,18 @@ use arrow::{
 use async_trait::async_trait;
 use data_types::{
     ChunkId, ChunkOrder, ColumnSummary, DeletePredicate, InfluxDbType, PartitionId, StatValues,
-    Statistics, TableSummary, TimestampMinMax,
+    Statistics, TableSummary,
 };
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_util::stream_from_batches;
-use futures::StreamExt;
+use datafusion::error::DataFusionError;
 use hashbrown::HashSet;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
-use predicate::rpc_predicate::QueryDatabaseMeta;
+use predicate::rpc_predicate::QueryNamespaceMeta;
 use schema::{
-    builder::SchemaBuilder, merge::SchemaMerger, selection::Selection, sort::SortKey,
-    InfluxColumnType, Schema,
+    builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, InfluxColumnType, Projection,
+    Schema, TIME_COLUMN_NAME,
 };
-use std::{collections::BTreeMap, fmt, num::NonZeroU64, sync::Arc};
+use std::{any::Any, collections::BTreeMap, fmt, num::NonZeroU64, sync::Arc};
 use trace::ctx::SpanContext;
 
 #[derive(Debug)]
@@ -102,22 +99,32 @@ impl TestDatabase {
 }
 
 #[async_trait]
-impl QueryDatabase for TestDatabase {
+impl QueryNamespace for TestDatabase {
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, QueryDatabaseError> {
+        _projection: &Option<Vec<usize>>,
+        _ctx: IOxSessionContext,
+    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         // save last predicate
         *self.chunks_predicate.lock() = predicate.clone();
 
-        let partitions = self.partitions.lock();
+        let partitions = self.partitions.lock().clone();
         Ok(partitions
             .values()
             .flat_map(|x| x.values())
-            .filter(|x| x.table_name == table_name)
-            .map(|x| Arc::clone(x) as _)
-            .collect())
+            // filter by table
+            .filter(|c| c.table_name == table_name)
+            // only keep chunks if their statistics overlap
+            .filter(|c| {
+                !matches!(
+                    predicate.apply_to_table_summary(&c.table_summary, c.schema.as_arrow()),
+                    PredicateMatch::Zero
+                )
+            })
+            .map(|x| Arc::clone(x) as Arc<dyn QueryChunk>)
+            .collect::<Vec<_>>())
     }
 
     fn record_query(
@@ -129,12 +136,12 @@ impl QueryDatabase for TestDatabase {
         QueryCompletedToken::new(|_| {})
     }
 
-    fn as_meta(&self) -> &dyn QueryDatabaseMeta {
+    fn as_meta(&self) -> &dyn QueryNamespaceMeta {
         self
     }
 }
 
-impl QueryDatabaseMeta for TestDatabase {
+impl QueryNamespaceMeta for TestDatabase {
     fn table_schema(&self, table_name: &str) -> Option<Arc<Schema>> {
         let mut merger = SchemaMerger::new();
         let mut found_one = false;
@@ -149,7 +156,7 @@ impl QueryDatabaseMeta for TestDatabase {
             }
         }
 
-        found_one.then(|| Arc::new(merger.build()))
+        found_one.then(|| merger.build())
     }
 
     fn table_names(&self) -> Vec<String> {
@@ -188,7 +195,7 @@ pub struct TestChunk {
 
     id: ChunkId,
 
-    partition_id: Option<PartitionId>,
+    partition_id: PartitionId,
 
     /// Set the flag if this chunk might contain duplicates
     may_contain_pk_duplicates: bool,
@@ -216,9 +223,6 @@ pub struct TestChunk {
 
     /// The partition sort key of this chunk
     partition_sort_key: Option<SortKey>,
-
-    /// Time range of the data
-    timestamp_min_max: Option<TimestampMinMax>,
 }
 
 /// Implements a method for adding a column with default stats
@@ -229,6 +233,7 @@ macro_rules! impl_with_column {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
             self.add_schema_to_table(new_column_schema, true, None)
@@ -244,6 +249,7 @@ macro_rules! impl_with_column_no_stats {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
 
@@ -265,6 +271,7 @@ macro_rules! impl_with_column_with_stats {
 
             let new_column_schema = SchemaBuilder::new()
                 .field(&column_name, DataType::$DATA_TYPE)
+                .unwrap()
                 .build()
                 .unwrap();
 
@@ -296,8 +303,7 @@ impl TestChunk {
             order: ChunkOrder::MIN,
             sort_key: None,
             partition_sort_key: None,
-            timestamp_min_max: None,
-            partition_id: None,
+            partition_id: PartitionId::new(0),
         }
     }
 
@@ -307,7 +313,7 @@ impl TestChunk {
     }
 
     pub fn with_partition_id(mut self, id: i64) -> Self {
-        self.partition_id = Some(PartitionId::new(id));
+        self.partition_id = PartitionId::new(id);
         self
     }
 
@@ -325,9 +331,9 @@ impl TestChunk {
     }
 
     /// Checks the saved error, and returns it if any, otherwise returns OK
-    fn check_error(&self) -> Result<(), QueryChunkError> {
+    fn check_error(&self) -> Result<(), DataFusionError> {
         if let Some(message) = self.saved_error.as_ref() {
-            Err(message.clone().into())
+            Err(DataFusionError::External(message.clone().into()))
         } else {
             Ok(())
         }
@@ -424,7 +430,7 @@ impl TestChunk {
 
     /// Register a timestamp column with full stats with the test chunk
     pub fn with_time_column_with_full_stats(
-        mut self,
+        self,
         min: Option<i64>,
         max: Option<i64>,
         count: u64,
@@ -444,17 +450,41 @@ impl TestChunk {
             distinct_count,
         });
 
-        if let Some(min) = min {
-            if let Some(max) = max {
-                self.timestamp_min_max = Some(TimestampMinMax { min, max });
-            }
-        }
-
         self.add_schema_to_table(new_column_schema, true, Some(stats))
     }
 
     pub fn with_timestamp_min_max(mut self, min: i64, max: i64) -> Self {
-        self.timestamp_min_max = Some(TimestampMinMax { min, max });
+        match self
+            .table_summary
+            .columns
+            .iter_mut()
+            .find(|c| c.name == TIME_COLUMN_NAME)
+        {
+            Some(col) => {
+                let stats = &mut col.stats;
+                *stats = Statistics::I64(StatValues {
+                    min: Some(min),
+                    max: Some(max),
+                    total_count: stats.total_count(),
+                    null_count: stats.null_count(),
+                    distinct_count: stats.distinct_count(),
+                });
+            }
+            None => {
+                let total_count = self.table_summary.total_count();
+                self.table_summary.columns.push(ColumnSummary {
+                    name: TIME_COLUMN_NAME.to_string(),
+                    influxdb_type: InfluxDbType::Timestamp,
+                    stats: Statistics::I64(StatValues {
+                        min: Some(min),
+                        max: Some(max),
+                        total_count,
+                        null_count: None,
+                        distinct_count: None,
+                    }),
+                });
+            }
+        }
         self
     }
 
@@ -487,6 +517,7 @@ impl TestChunk {
         // merge it in to any existing schema
         let new_column_schema = SchemaBuilder::new()
             .field(&column_name, DataType::Utf8)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -507,47 +538,47 @@ impl TestChunk {
         mut self,
         new_column_schema: Schema,
         add_column_summary: bool,
-        stats: Option<Statistics>,
+        input_stats: Option<Statistics>,
     ) -> Self {
-        // assume the new schema has exactly a single table
-        assert_eq!(new_column_schema.len(), 1);
-        let (col_type, new_field) = new_column_schema.field(0);
-
         let mut merger = SchemaMerger::new();
         merger = merger.merge(&new_column_schema).unwrap();
         merger = merger
             .merge(self.schema.as_ref())
             .expect("merging was successful");
-        self.schema = Arc::new(merger.build());
+        self.schema = merger.build();
 
-        if add_column_summary {
-            let influxdb_type = col_type.map(|t| match t {
-                InfluxColumnType::Tag => InfluxDbType::Tag,
-                InfluxColumnType::Field(_) => InfluxDbType::Field,
-                InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
-            });
+        for i in 0..new_column_schema.len() {
+            let (col_type, new_field) = new_column_schema.field(i);
+            if add_column_summary {
+                let influxdb_type = match col_type {
+                    InfluxColumnType::Tag => InfluxDbType::Tag,
+                    InfluxColumnType::Field(_) => InfluxDbType::Field,
+                    InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
+                };
 
-            let stats = stats.unwrap_or_else(|| match new_field.data_type() {
-                DataType::Boolean => Statistics::Bool(StatValues::default()),
-                DataType::Int64 => Statistics::I64(StatValues::default()),
-                DataType::UInt64 => Statistics::U64(StatValues::default()),
-                DataType::Utf8 => Statistics::String(StatValues::default()),
-                DataType::Dictionary(_, value_type) => {
-                    assert!(matches!(**value_type, DataType::Utf8));
-                    Statistics::String(StatValues::default())
-                }
-                DataType::Float64 => Statistics::F64(StatValues::default()),
-                DataType::Timestamp(_, _) => Statistics::I64(StatValues::default()),
-                _ => panic!("Unsupported type in TestChunk: {:?}", new_field.data_type()),
-            });
+                let stats = input_stats.clone();
+                let stats = stats.unwrap_or_else(|| match new_field.data_type() {
+                    DataType::Boolean => Statistics::Bool(StatValues::default()),
+                    DataType::Int64 => Statistics::I64(StatValues::default()),
+                    DataType::UInt64 => Statistics::U64(StatValues::default()),
+                    DataType::Utf8 => Statistics::String(StatValues::default()),
+                    DataType::Dictionary(_, value_type) => {
+                        assert!(matches!(**value_type, DataType::Utf8));
+                        Statistics::String(StatValues::default())
+                    }
+                    DataType::Float64 => Statistics::F64(StatValues::default()),
+                    DataType::Timestamp(_, _) => Statistics::I64(StatValues::default()),
+                    _ => panic!("Unsupported type in TestChunk: {:?}", new_field.data_type()),
+                });
 
-            let column_summary = ColumnSummary {
-                name: new_field.name().clone(),
-                influxdb_type,
-                stats,
-            };
+                let column_summary = ColumnSummary {
+                    name: new_field.name().clone(),
+                    influxdb_type,
+                    stats,
+                };
 
-            self.table_summary.columns.push(column_summary);
+                self.table_summary.columns.push(column_summary);
+            }
         }
 
         self
@@ -560,6 +591,7 @@ impl TestChunk {
 
     /// Prepares this chunk to return a specific record batch with one
     /// row of non null data.
+    /// tag: MA
     pub fn with_one_row_of_data(mut self) -> Self {
         // create arrays
         let columns = self
@@ -569,12 +601,50 @@ impl TestChunk {
                 DataType::Int64 => Arc::new(Int64Array::from(vec![1000])) as ArrayRef,
                 DataType::Utf8 => Arc::new(StringArray::from(vec!["MA"])) as ArrayRef,
                 DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    Arc::new(TimestampNanosecondArray::from_vec(vec![1000], None)) as ArrayRef
+                    Arc::new(TimestampNanosecondArray::from(vec![1000])) as ArrayRef
                 }
                 DataType::Dictionary(key, value)
                     if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
                 {
                     let dict: DictionaryArray<Int32Type> = vec!["MA"].into_iter().collect();
+                    Arc::new(dict) as ArrayRef
+                }
+                _ => unimplemented!(
+                    "Unimplemented data type for test database: {:?}",
+                    field.data_type()
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let batch =
+            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+        println!("TestChunk batch data: {:#?}", batch);
+
+        self.table_data.push(Arc::new(batch));
+        self
+    }
+
+    /// Prepares this chunk to return a specific record batch with a single tag, field and timestamp like
+    pub fn with_one_row_of_specific_data(
+        mut self,
+        tag_val: impl AsRef<str>,
+        field_val: i64,
+        ts_val: i64,
+    ) -> Self {
+        // create arrays
+        let columns = self
+            .schema
+            .iter()
+            .map(|(_influxdb_column_type, field)| match field.data_type() {
+                DataType::Int64 => Arc::new(Int64Array::from(vec![field_val])) as ArrayRef,
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(vec![ts_val])) as ArrayRef
+                }
+                DataType::Dictionary(key, value)
+                    if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
+                {
+                    let dict: DictionaryArray<Int32Type> =
+                        vec![tag_val.as_ref()].into_iter().collect();
                     Arc::new(dict) as ArrayRef
                 }
                 _ => unimplemented!(
@@ -615,9 +685,9 @@ impl TestChunk {
                     "tag2" => Arc::new(StringArray::from(vec!["SC", "NC", "RI"])) as ArrayRef,
                     _ => Arc::new(StringArray::from(vec!["TX", "PR", "OR"])) as ArrayRef,
                 },
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
-                    TimestampNanosecondArray::from_vec(vec![8000, 10000, 20000], None),
-                ) as ArrayRef,
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(vec![8000, 10000, 20000])) as ArrayRef
+                }
                 DataType::Dictionary(key, value)
                     if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
                 {
@@ -676,9 +746,11 @@ impl TestChunk {
                     "tag2" => Arc::new(StringArray::from(vec!["SC", "NC", "RI", "NC"])) as ArrayRef,
                     _ => Arc::new(StringArray::from(vec!["TX", "PR", "OR", "AL"])) as ArrayRef,
                 },
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
-                    TimestampNanosecondArray::from_vec(vec![28000, 210000, 220000, 210000], None),
-                ) as ArrayRef,
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        28000, 210000, 220000, 210000,
+                    ])) as ArrayRef
+                }
                 DataType::Dictionary(key, value)
                     if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
                 {
@@ -728,53 +800,54 @@ impl TestChunk {
     /// Stats(min, max) : tag1(AL, MT), tag2(AL, MA), time(5, 7000)
     pub fn with_five_rows_of_data(mut self) -> Self {
         // create arrays
-        let columns = self
-            .schema
-            .iter()
-            .map(|(_influxdb_column_type, field)| match field.data_type() {
-                DataType::Int64 => {
-                    Arc::new(Int64Array::from(vec![1000, 10, 70, 100, 5])) as ArrayRef
-                }
-                DataType::Utf8 => {
-                    match field.name().as_str() {
+        let columns =
+            self.schema
+                .iter()
+                .map(|(_influxdb_column_type, field)| match field.data_type() {
+                    DataType::Int64 => {
+                        Arc::new(Int64Array::from(vec![1000, 10, 70, 100, 5])) as ArrayRef
+                    }
+                    DataType::Utf8 => match field.name().as_str() {
                         "tag1" => Arc::new(StringArray::from(vec!["MT", "MT", "CT", "AL", "MT"]))
                             as ArrayRef,
                         "tag2" => Arc::new(StringArray::from(vec!["CT", "AL", "CT", "MA", "AL"]))
                             as ArrayRef,
                         _ => Arc::new(StringArray::from(vec!["CT", "MT", "AL", "AL", "MT"]))
                             as ArrayRef,
+                    },
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                        Arc::new(TimestampNanosecondArray::from(vec![
+                            1000, 7000, 100, 50, 5000,
+                        ])) as ArrayRef
                     }
-                }
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
-                    TimestampNanosecondArray::from_vec(vec![1000, 7000, 100, 50, 5000], None),
-                ) as ArrayRef,
-                DataType::Dictionary(key, value)
-                    if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
-                {
-                    match field.name().as_str() {
-                        "tag1" => Arc::new(
-                            vec!["MT", "MT", "CT", "AL", "MT"]
-                                .into_iter()
-                                .collect::<DictionaryArray<Int32Type>>(),
-                        ) as ArrayRef,
-                        "tag2" => Arc::new(
-                            vec!["CT", "AL", "CT", "MA", "AL"]
-                                .into_iter()
-                                .collect::<DictionaryArray<Int32Type>>(),
-                        ) as ArrayRef,
-                        _ => Arc::new(
-                            vec!["CT", "MT", "AL", "AL", "MT"]
-                                .into_iter()
-                                .collect::<DictionaryArray<Int32Type>>(),
-                        ) as ArrayRef,
+                    DataType::Dictionary(key, value)
+                        if key.as_ref() == &DataType::Int32
+                            && value.as_ref() == &DataType::Utf8 =>
+                    {
+                        match field.name().as_str() {
+                            "tag1" => Arc::new(
+                                vec!["MT", "MT", "CT", "AL", "MT"]
+                                    .into_iter()
+                                    .collect::<DictionaryArray<Int32Type>>(),
+                            ) as ArrayRef,
+                            "tag2" => Arc::new(
+                                vec!["CT", "AL", "CT", "MA", "AL"]
+                                    .into_iter()
+                                    .collect::<DictionaryArray<Int32Type>>(),
+                            ) as ArrayRef,
+                            _ => Arc::new(
+                                vec!["CT", "MT", "AL", "AL", "MT"]
+                                    .into_iter()
+                                    .collect::<DictionaryArray<Int32Type>>(),
+                            ) as ArrayRef,
+                        }
                     }
-                }
-                _ => unimplemented!(
-                    "Unimplemented data type for test database: {:?}",
-                    field.data_type()
-                ),
-            })
-            .collect::<Vec<_>>();
+                    _ => unimplemented!(
+                        "Unimplemented data type for test database: {:?}",
+                        field.data_type()
+                    ),
+                })
+                .collect::<Vec<_>>();
 
         let batch =
             RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
@@ -821,10 +894,9 @@ impl TestChunk {
                     ])) as ArrayRef,
                 },
                 DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    Arc::new(TimestampNanosecondArray::from_vec(
-                        vec![1000, 7000, 100, 50, 5, 2000, 7000, 500, 50, 5],
-                        None,
-                    )) as ArrayRef
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1000, 7000, 100, 50, 5, 2000, 7000, 500, 50, 5,
+                    ])) as ArrayRef
                 }
                 DataType::Dictionary(key, value)
                     if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
@@ -893,6 +965,10 @@ impl TestChunk {
             .filter(|col| columns.contains(&col.as_str()))
             .collect()
     }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
 }
 
 impl fmt::Display for TestChunk {
@@ -906,27 +982,12 @@ impl QueryChunk for TestChunk {
         self.id
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
     fn may_contain_pk_duplicates(&self) -> bool {
         self.may_contain_pk_duplicates
     }
 
-    fn read_filter(
-        &self,
-        _ctx: IOxSessionContext,
-        predicate: &Predicate,
-        _selection: Selection<'_>,
-    ) -> Result<SendableRecordBatchStream, QueryChunkError> {
-        self.check_error()?;
-
-        // save the predicate
-        self.predicates.lock().push(predicate.clone());
-
-        let batches = self.table_data.clone();
-        Ok(stream_from_batches(batches))
+    fn data(&self) -> QueryChunkData {
+        QueryChunkData::RecordBatches(self.table_data.iter().map(|b| b.as_ref().clone()).collect())
     }
 
     fn chunk_type(&self) -> &str {
@@ -936,7 +997,7 @@ impl QueryChunk for TestChunk {
     fn apply_predicate_to_metadata(
         &self,
         predicate: &Predicate,
-    ) -> Result<PredicateMatch, QueryChunkError> {
+    ) -> Result<PredicateMatch, DataFusionError> {
         self.check_error()?;
 
         // save the predicate
@@ -955,7 +1016,7 @@ impl QueryChunk for TestChunk {
         _ctx: IOxSessionContext,
         _column_name: &str,
         _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // Model not being able to get column values from metadata
         Ok(None)
     }
@@ -964,8 +1025,8 @@ impl QueryChunk for TestChunk {
         &self,
         _ctx: IOxSessionContext,
         predicate: &Predicate,
-        selection: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+        selection: Projection<'_>,
+    ) -> Result<Option<StringSet>, DataFusionError> {
         self.check_error()?;
 
         // save the predicate
@@ -973,8 +1034,8 @@ impl QueryChunk for TestChunk {
 
         // only return columns specified in selection
         let column_names = match selection {
-            Selection::All => self.all_column_names(),
-            Selection::Some(cols) => self.specific_column_names_selection(cols),
+            Projection::All => self.all_column_names(),
+            Projection::Some(cols) => self.specific_column_names_selection(cols),
         };
 
         Ok(Some(column_names))
@@ -983,11 +1044,15 @@ impl QueryChunk for TestChunk {
     fn order(&self) -> ChunkOrder {
         self.order
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl QueryChunkMeta for TestChunk {
-    fn summary(&self) -> Option<Arc<TableSummary>> {
-        Some(Arc::new(self.table_summary.clone()))
+    fn summary(&self) -> Arc<TableSummary> {
+        Arc::new(self.table_summary.clone())
     }
 
     fn schema(&self) -> Arc<Schema> {
@@ -998,7 +1063,7 @@ impl QueryChunkMeta for TestChunk {
         self.partition_sort_key.as_ref()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
+    fn partition_id(&self) -> PartitionId {
         self.partition_id
     }
 
@@ -1013,25 +1078,14 @@ impl QueryChunkMeta for TestChunk {
 
         pred
     }
-
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax> {
-        self.timestamp_min_max
-    }
 }
 
 /// Return the raw data from the list of chunks
 pub async fn raw_data(chunks: &[Arc<dyn QueryChunk>]) -> Vec<RecordBatch> {
+    let ctx = IOxSessionContext::with_testing();
     let mut batches = vec![];
     for c in chunks {
-        let pred = Predicate::default();
-        let selection = Selection::All;
-        let mut stream = c
-            .read_filter(IOxSessionContext::default(), &pred, selection)
-            .expect("Error in read_filter");
-        while let Some(b) = stream.next().await {
-            let b = b.expect("Error in stream");
-            batches.push(b)
-        }
+        batches.append(&mut c.data().read_to_batches(c.schema(), ctx.inner()).await);
     }
     batches
 }

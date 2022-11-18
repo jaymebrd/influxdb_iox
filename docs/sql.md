@@ -14,87 +14,57 @@ Ready for commands. (Hint: try 'help;')
 ```
 
 ## Remote Mode
-In this mode queries are run on the remote server in the context of a database. To use this mode, specify a database and then run queries as normal
+In this mode queries are run on the remote server in the context of a namespace. To use this mode, specify a namespace and then run queries as normal
 
 ```
-> show databases;
-+-----------------------------------+
-| db_name                           |
-+-----------------------------------+
-| 084d710ebdd819a5_apps             |
-| 7f4b06e9112d7bc8_system%255Fusage |
-| 7f4b06e9112d7bc8_system%5Fusage   |
-| 844910ece80be8bc_057abada752bc8ce |
-| 844910ece80be8bc_05a7a51565539000 |
-+-----------------------------------+
+> show namespaces;
++--------------+-----------------------------------+
+| namespace_id | name                              |
++--------------+-----------------------------------+
+| 1            | internal_test                     |
+| 2            | 33a8e04942966029_8dce392f44992579 |
+| 3            | 810c5937734635d8_dbce66e3a6cbe757 |
++--------------+-----------------------------------+
 ```
 
-Then run the `USE DATABASE` command
+Then run the `USE <your_namespace>` command
 
 ```
-> use database my_db;
-You are now in remote mode, querying database my_db
-my_db>
+>  use 810c5937734635d8_dbce66e3a6cbe757;
+You are now in remote mode, querying namespace 810c5937734635d8_dbce66e3a6cbe757
+810c5937734635d8_dbce66e3a6cbe757>
 ```
 
-Now, all queries will be run against the specified database (`my_db`) in this example
+Now, all queries will be run against the specified namespace (`810c5937734635d8_dbce66e3a6cbe757`) in this example
 ```
-my_db> show tables;
+810c5937734635d8_dbce66e3a6cbe757> show tables;
 +---------------+--------------------+-------------+------------+
 | table_catalog | table_schema       | table_name  | table_type |
 +---------------+--------------------+-------------+------------+
-| public        | iox                | query_count | BASE TABLE |
-| public        | system             | chunks      | BASE TABLE |
-| public        | system             | columns     | BASE TABLE |
-| public        | system             | operations  | BASE TABLE |
+| public        | iox                | cpu         | BASE TABLE |
+| public        | iox                | disk        | BASE TABLE |
+| public        | iox                | diskio      | BASE TABLE |
+| public        | iox                | mem         | BASE TABLE |
+| public        | iox                | net         | BASE TABLE |
+| public        | iox                | processes   | BASE TABLE |
+| public        | iox                | swap        | BASE TABLE |
+| public        | iox                | system      | BASE TABLE |
+| public        | system             | queries     | BASE TABLE |
 | public        | information_schema | tables      | VIEW       |
+| public        | information_schema | views       | VIEW       |
 | public        | information_schema | columns     | VIEW       |
+| public        | information_schema | df_settings | VIEW       |
 +---------------+--------------------+-------------+------------+
-
-Query execution complete in 32.034867ms
-my_db> select count(*) from query_count;
+Returned 13 rows in 101.973855ms
+810c5937734635d8_dbce66e3a6cbe757> select count(*) from cpu;
 +-----------------+
 | COUNT(UInt8(1)) |
 +-----------------+
-| 2               |
+| 66980           |
 +-----------------+
-
-Query execution complete in 46.852934ms
+Returned 1 row in 74.022768ms
+810c5937734635d8_dbce66e3a6cbe757>
 ```
-
-
-## Observer
-In this mode queries are run *locally* against a cached unified view of the remote system tables
-
-```
-my_db> observer;
-Preparing local views of remote system tables
-Loading system tables from 49 databases
-...................................................................................................................................................
- Completed in 4.048318429s
-You are now in Observer mode.
-
-SQL commands in this mode run against a cached unified view of
-remote system tables in all remote databases.
-
-To see the unified tables available to you, try running
-SHOW TABLES;
-
-To reload the most recent version of the database system tables, run
-OBSERVER;
-
-Example SQL to show the total estimated storage size by database:
-
-SELECT database_name, storage, count(*) as num_chunks,
-  sum(memory_bytes)/1024/1024 as estimated_mb
-FROM chunks
-GROUP BY database_name, storage
-ORDER BY estimated_mb desc;
-
-OBSERVER>
-
-```
-
 
 
 # Query Cookbook
@@ -113,9 +83,6 @@ my_db> show tables;
 | table_catalog | table_schema       | table_name  | table_type |
 +---------------+--------------------+-------------+------------+
 | public        | iox                | query_count | BASE TABLE |
-| public        | system             | chunks      | BASE TABLE |
-| public        | system             | columns     | BASE TABLE |
-| public        | system             | operations  | BASE TABLE |
 | public        | information_schema | tables      | VIEW       |
 | public        | information_schema | columns     | VIEW       |
 +---------------+--------------------+-------------+------------+
@@ -154,96 +121,6 @@ Query execution complete in 39.046225ms
 ```
 
 
-
-## System Tables
-
-Here are some interesting reports you can run when in `OBSERVER` mode:
-
-### Total storage size taken by each database
-
-```sql
-SELECT
-  database_name, count(*) as num_chunks,
-  sum(memory_bytes)/1024/1024 as estimated_mb
-FROM chunks
-GROUP BY database_name
-ORDER BY estimated_mb desc
-LIMIT 20;
-```
-
-### Total estimated storage size by database and storage class
-```sql
-SELECT
-  database_name, storage, count(*) as num_chunks,
-  sum(memory_bytes)/1024/1024 as estimated_mb
-FROM chunks
-GROUP BY database_name, storage
-ORDER BY estimated_mb desc
-LIMIT 20;
-```
-
-### Total estimated storage size by database, table_name and storage class
-
-```sql
-SELECT
-  database_name, table_name, storage, count(*) as num_chunks,
-  sum(memory_bytes)/1024/1024 as estimated_mb
-FROM chunks
-GROUP BY database_name, table_name, storage
-ORDER BY estimated_mb desc
-LIMIT 20;
-```
-
-
-### Total row count by table
-
-```sql
-SELECT database_name, table_name, sum(total_rows) as total_rows
-FROM (
-  SELECT database_name, table_name, max(row_count) as total_rows
-  FROM chunk_columns
-  GROUP BY database_name, partition_key, table_name
-)
-GROUP BY database_name, table_name
-ORDER BY total_rows DESC
-LIMIT 20;
-```
-
-### Total row count by partition and table
-
-```sql
-SELECT database_name, partition_key, table_name, max(row_count) as total_rows
-FROM chunk_columns
-GROUP BY database_name, partition_key, table_name
-ORDER BY total_rows DESC
-LIMIT 20;
-```
-
-### Time range stored per table
-
-This query provides an estimate, by table, of how long of a time range
-and the  estimated number of rows per second it holds in IOx
-(the `1,000,000,000` is the conversion from nanoseconds)
-
-```sql
-select table_name,
-1000000000.0 * total_rows / range as rows_per_sec,
-range / 1000000000.0 as range_sec,
-total_rows
-from
-(select table_name,
-        column_name,
-        sum(row_count) as total_rows,
-        max(cast(max_value as double)) - min(cast(min_value as double)) as range
- from chunk_columns
- where column_name = 'time'
- group by table_name, column_name
-)
-where range > 0
-order by range_sec desc;
-```
-
-
 # SQL Reference
 
 Since IOx uses Apache Arrow's
@@ -254,14 +131,7 @@ In this section, IOx specific SQL tables, commands, and extensions are documente
 
 ## System Tables
 
-In addition to the SQL standard `information_schema`, IOx contains several *system tables* that provide access to IOx specific information. The information in each system table is scoped to that particular database. Cross database queries are not possible due to the design of IOx's security model. Another process, such as the `observer` mode in the IOx SQL client, must be used for queries on information that spans databases.
+In addition to the SQL standard `information_schema`, IOx contains several *system tables* that provide access to IOx specific information. The information in each system table is scoped to that particular namespace. Cross namespace queries are not possible due to the design of IOx's security model.
 
-### `system.chunks`
-`system.chunks` contains information about each IOx storage chunk (which holds part of the data for a table).
-
-TODO: document each column, once they have stabilized.
-
-### `system.columns`
-`system.columns` contains IOx specific schema information about each column in each table, such as which columns were loaded as tags, fields, and timestamps in the InfluxDB data model.
-
-TODO: document each column, once they have stabilized.
+### `system.queries`
+`system.queries` contains information about queries run against this IOx instance

@@ -1,219 +1,159 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use super::adapter::SchemaAdapterStream;
-use crate::{exec::IOxSessionContext, QueryChunk};
-use arrow::datatypes::SchemaRef;
+use crate::{provider::record_batch_exec::RecordBatchesExec, QueryChunk, QueryChunkData};
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use data_types::TableSummary;
 use datafusion::{
-    error::DataFusionError,
+    datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
     execution::context::TaskContext,
     physical_plan::{
-        expressions::PhysicalSortExpr,
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+        empty::EmptyExec,
+        file_format::{FileScanConfig, ParquetExec},
+        union::UnionExec,
+        ExecutionPlan, Statistics,
     },
 };
-use observability_deps::tracing::trace;
+use object_store::ObjectMeta;
 use predicate::Predicate;
-use schema::{selection::Selection, Schema};
-use std::{fmt, sync::Arc};
+use schema::Schema;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
 
-/// Implements the DataFusion physical plan interface
-#[derive(Debug)]
-pub(crate) struct IOxReadFilterNode {
-    table_name: Arc<str>,
-    /// The desired output schema (includes selection)
-    /// note that the chunk may not have all these columns.
+/// Place [chunk](QueryChunk)s into physical nodes.
+///
+/// This will group chunks into [record batch](QueryChunkData::RecordBatches) and [parquet
+/// file](QueryChunkData::Parquet) chunks. The latter will also be grouped by store.
+///
+/// Record batch chunks will be turned into a single [`RecordBatchesExec`].
+///
+/// Parquet chunks will be turned into a [`ParquetExec`] per store, each of them with
+/// [`target_partitions`](datafusion::execution::context::SessionConfig::target_partitions) file groups.
+///
+/// If this function creates more than one physical node, they will be combined using an [`UnionExec`]. Otherwise, a
+/// single node will be returned directly.
+///
+/// # Empty Inputs
+/// For empty inputs (i.e. no chunks), this will create a single [`EmptyExec`] node with appropriate schema.
+///
+/// # Predicates
+/// The give `predicate` will only be applied to [`ParquetExec`] nodes since they are the only node type benifiting from
+/// pushdown ([`RecordBatchesExec`] has NO builtin filter function). Delete predicates are NOT applied at all. The
+/// caller is responsible for wrapping the output node into appropriate filter nodes.
+pub fn chunks_to_physical_nodes(
     iox_schema: Arc<Schema>,
     chunks: Vec<Arc<dyn QueryChunk>>,
     predicate: Predicate,
-    /// Execution metrics
-    metrics: ExecutionPlanMetricsSet,
-
-    // execution context used for tracing
-    ctx: IOxSessionContext,
-}
-
-impl IOxReadFilterNode {
-    /// Create a execution plan node that reads data from `chunks` producing
-    /// output according to schema, while applying `predicate` and
-    /// returns
-    pub fn new(
-        ctx: IOxSessionContext,
-        table_name: Arc<str>,
-        iox_schema: Arc<Schema>,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-        predicate: Predicate,
-    ) -> Self {
-        Self {
-            ctx,
-            table_name,
-            iox_schema,
-            chunks,
-            predicate,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
-    }
-}
-
-impl ExecutionPlan for IOxReadFilterNode {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    context: Arc<TaskContext>,
+) -> Arc<dyn ExecutionPlan> {
+    if chunks.is_empty() {
+        return Arc::new(EmptyExec::new(false, iox_schema.as_arrow()));
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.iox_schema.as_arrow()
-    }
+    let mut record_batch_chunks: Vec<(SchemaRef, Vec<RecordBatch>, Arc<TableSummary>)> = vec![];
+    let mut parquet_chunks: HashMap<String, (ObjectStoreUrl, Vec<ObjectMeta>)> = HashMap::new();
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.chunks.len())
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        // TODO ??
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        // no inputs
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        assert!(children.is_empty(), "no children expected in iox plan");
-
-        let chunks: Vec<Arc<dyn QueryChunk>> = self.chunks.to_vec();
-
-        // For some reason when I used an automatically derived `Clone` implementation
-        // the compiler didn't recognize the trait implementation
-        let new_self = Self {
-            ctx: IOxSessionContext::default(), // FIXME: we can't clone context because we shouldn't clone span recorder bits
-            table_name: Arc::clone(&self.table_name),
-            iox_schema: Arc::clone(&self.iox_schema),
-            chunks,
-            predicate: self.predicate.clone(),
-            metrics: ExecutionPlanMetricsSet::new(),
-        };
-
-        Ok(Arc::new(new_self))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        trace!(partition, "Start IOxReadFilterNode::execute");
-
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let timer = baseline_metrics.elapsed_compute().timer();
-
-        let schema = self.schema();
-        let fields = schema.fields();
-        let selection_cols = fields.iter().map(|f| f.name() as &str).collect::<Vec<_>>();
-
-        let chunk = Arc::clone(&self.chunks[partition]);
-
-        let chunk_table_schema = chunk.schema();
-
-        // The output selection is all the columns in the schema.
-        //
-        // However, this chunk may not have all those columns. Thus we
-        // restrict the requested selection to the actual columns
-        // available, and use SchemaAdapterStream to pad the rest of
-        // the columns with NULLs if necessary
-        let selection_cols = restrict_selection(selection_cols, &chunk_table_schema);
-        let selection = Selection::Some(&selection_cols);
-
-        let stream = chunk
-            .read_filter(
-                self.ctx.child_ctx("chunk read_filter"),
-                &self.predicate,
-                selection,
-            )
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Error creating scan for table {} chunk {}: {}",
-                    self.table_name,
-                    chunk.id(),
-                    e
-                ))
-            })?;
-
-        // all CPU time is now done, pass in baseline metrics to adapter
-        timer.done();
-
-        let adapter = SchemaAdapterStream::try_new(stream, schema, baseline_metrics)
-            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-
-        trace!(partition, "End IOxReadFilterNode::execute");
-        Ok(Box::pin(adapter))
-    }
-
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(
-                    f,
-                    "IOxReadFilterNode: table_name={}, chunks={} predicate={}",
-                    self.table_name,
-                    self.chunks.len(),
-                    self.predicate,
-                )
+    for chunk in &chunks {
+        match chunk.data() {
+            QueryChunkData::RecordBatches(batches) => {
+                record_batch_chunks.push((chunk.schema().as_arrow(), batches, chunk.summary()));
             }
-        }
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> Statistics {
-        let mut combined_summary_option: Option<TableSummary> = None;
-        for chunk in &self.chunks {
-            if chunk.has_delete_predicates() || chunk.may_contain_pk_duplicates() {
-                // Not use statistics if there is at least one delete predicate or
-                // if chunk may have duplicates
-                return Statistics::default();
-            }
-
-            combined_summary_option = match combined_summary_option {
-                None => Some(
-                    chunk
-                        .summary()
-                        .expect("Chunk should have summary")
-                        .as_ref()
-                        .clone(),
-                ),
-                Some(mut combined_summary) => {
-                    combined_summary
-                        .update_from(&chunk.summary().expect("Chunk should have summary"));
-                    Some(combined_summary)
+            QueryChunkData::Parquet(parquet_input) => {
+                let url_str = parquet_input.object_store_url.as_str().to_owned();
+                match parquet_chunks.entry(url_str) {
+                    Entry::Occupied(mut o) => {
+                        o.get_mut().1.push(parquet_input.object_meta);
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert((
+                            parquet_input.object_store_url,
+                            vec![parquet_input.object_meta],
+                        ));
+                    }
                 }
             }
         }
+    }
 
-        combined_summary_option
-            .map(|combined_summary| {
-                crate::statistics::df_from_iox(self.iox_schema.as_ref(), &combined_summary)
-            })
-            .unwrap_or_default()
+    let mut output_nodes: Vec<Arc<dyn ExecutionPlan>> = vec![];
+    if !record_batch_chunks.is_empty() {
+        output_nodes.push(Arc::new(RecordBatchesExec::new(
+            record_batch_chunks,
+            iox_schema.as_arrow(),
+        )));
+    }
+    let mut parquet_chunks: Vec<_> = parquet_chunks.into_iter().collect();
+    parquet_chunks.sort_by_key(|(url_str, _)| url_str.clone());
+    let target_partitions = context.session_config().target_partitions;
+    for (_url_str, (url, chunks)) in parquet_chunks {
+        let file_groups = distribute(
+            chunks.into_iter().map(|object_meta| PartitionedFile {
+                object_meta,
+                partition_values: vec![],
+                range: None,
+                extensions: None,
+            }),
+            target_partitions,
+        );
+        let base_config = FileScanConfig {
+            object_store_url: url,
+            file_schema: iox_schema.as_arrow(),
+            file_groups,
+            statistics: Statistics::default(),
+            projection: None,
+            limit: None,
+            table_partition_cols: vec![],
+            config_options: context.session_config().config_options(),
+        };
+        output_nodes.push(Arc::new(ParquetExec::new(
+            base_config,
+            predicate.filter_expr(),
+            None,
+        )));
+    }
+
+    assert!(!output_nodes.is_empty());
+    if output_nodes.len() == 1 {
+        output_nodes.pop().expect("checked length")
+    } else {
+        Arc::new(UnionExec::new(output_nodes))
     }
 }
 
-/// Removes any columns that are not present in schema, returning a possibly
-/// restricted set of columns
-fn restrict_selection<'a>(
-    selection_cols: Vec<&'a str>,
-    chunk_table_schema: &'a Schema,
-) -> Vec<&'a str> {
-    let arrow_schema = chunk_table_schema.as_arrow();
+/// Distribute items from the given iterator into `n` containers.
+///
+/// This will produce less than `n` containers if the input has less than `n` elements.
+///
+/// # Panic
+/// Panics if `n` is 0.
+fn distribute<I, T>(it: I, n: usize) -> Vec<Vec<T>>
+where
+    I: IntoIterator<Item = T>,
+{
+    assert!(n > 0);
 
-    selection_cols
-        .into_iter()
-        .filter(|col| arrow_schema.fields().iter().any(|f| f.name() == col))
-        .collect()
+    let mut outputs: Vec<_> = (0..n).map(|_| vec![]).collect();
+    let mut pos = 0usize;
+    for x in it {
+        outputs[pos].push(x);
+        pos = (pos + 1) % n;
+    }
+    outputs.into_iter().filter(|o| !o.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_distribute() {
+        assert_eq!(distribute(0..0u8, 1), Vec::<Vec<u8>>::new(),);
+
+        assert_eq!(distribute(0..3u8, 1), vec![vec![0, 1, 2]],);
+
+        assert_eq!(distribute(0..3u8, 2), vec![vec![0, 2], vec![1]],);
+
+        assert_eq!(distribute(0..3u8, 10), vec![vec![0], vec![1], vec![2]],);
+    }
 }

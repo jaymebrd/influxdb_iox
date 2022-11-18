@@ -1,7 +1,8 @@
-use super::{DmlError, DmlHandler};
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate};
+use data_types::{DeletePredicate, NamespaceId, NamespaceName};
 use trace::ctx::SpanContext;
+
+use super::{DmlError, DmlHandler};
 
 /// An extension trait to chain together the execution of a pair of
 /// [`DmlHandler`] implementations.
@@ -57,18 +58,19 @@ where
     /// Write `batches` to `namespace`.
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
         let output = self
             .first
-            .write(namespace, input, span_ctx.clone())
+            .write(namespace, namespace_id, input, span_ctx.clone())
             .await
             .map_err(Into::into)?;
 
         self.second
-            .write(namespace, output, span_ctx)
+            .write(namespace, namespace_id, output, span_ctx)
             .await
             .map_err(Into::into)
     }
@@ -76,18 +78,25 @@ where
     /// Delete the data specified in `delete`.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
         span_ctx: Option<SpanContext>,
     ) -> Result<(), Self::DeleteError> {
         self.first
-            .delete(namespace, table_name, predicate, span_ctx.clone())
+            .delete(
+                namespace,
+                namespace_id,
+                table_name,
+                predicate,
+                span_ctx.clone(),
+            )
             .await
             .map_err(Into::into)?;
 
         self.second
-            .delete(namespace, table_name, predicate, span_ctx)
+            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
             .await
             .map_err(Into::into)
     }

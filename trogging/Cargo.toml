@@ -1,17 +1,17 @@
 [package]
 name = "trogging"
-version = "0.1.0"
-authors = ["Marko Mikulicic <mkm@influxdata.com>"]
-edition = "2021"
 description = "IOx logging pipeline built upon tokio-tracing"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-clap = { version = "3", features = ["derive", "env"], optional = true }
+atty = "0.2.14"
+clap = { version = "4", features = ["derive", "env"], optional = true }
 logfmt = { path = "../logfmt" }
 observability_deps = { path = "../observability_deps" }
-thiserror = "1.0.31"
+thiserror = "1.0.37"
 tracing-log = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

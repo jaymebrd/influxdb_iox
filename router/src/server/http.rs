@@ -1,23 +1,32 @@
 //! HTTP service implementations for `router`.
 
-use crate::dml_handlers::{DmlError, DmlHandler, PartitionError, SchemaError};
+mod delete_predicate;
+
 use bytes::{Bytes, BytesMut};
-use data_types::{org_and_bucket_to_database, OrgBucketMappingError};
+use data_types::{org_and_bucket_to_namespace, OrgBucketMappingError};
 use futures::StreamExt;
 use hashbrown::HashMap;
 use hyper::{header::CONTENT_ENCODING, Body, Method, Request, Response, StatusCode};
 use iox_time::{SystemProvider, TimeProvider};
-use metric::U64Counter;
+use metric::{DurationHistogram, U64Counter};
 use mutable_batch::MutableBatch;
 use mutable_batch_lp::LinesConverter;
 use observability_deps::tracing::*;
-use predicate::delete_predicate::{parse_delete_predicate, parse_http_delete_request};
+use predicate::delete_predicate::parse_delete_predicate;
 use serde::Deserialize;
-use std::{str::Utf8Error, sync::Arc};
+use std::{str::Utf8Error, time::Instant};
 use thiserror::Error;
 use tokio::sync::{Semaphore, TryAcquireError};
 use trace::ctx::SpanContext;
 use write_summary::WriteSummary;
+
+use self::delete_predicate::parse_http_delete_request;
+use crate::{
+    dml_handlers::{
+        DmlError, DmlHandler, PartitionError, RetentionError, RpcWriteError, SchemaError,
+    },
+    namespace_resolver::NamespaceResolver,
+};
 
 const WRITE_TOKEN_HTTP_HEADER: &str = "X-IOx-Write-Token";
 
@@ -64,9 +73,20 @@ pub enum Error {
     #[error("failed to parse delete predicate: {0}")]
     ParseDelete(#[from] predicate::delete_predicate::Error),
 
+    /// Failure to parse the delete predicate in the http request
+    #[error("failed to parse delete predicate from http request: {0}")]
+    ParseHttpDelete(#[from] self::delete_predicate::Error),
+
     /// An error returned from the [`DmlHandler`].
     #[error("dml handler error: {0}")]
     DmlHandler(#[from] DmlError),
+
+    /// An error that occurs when attempting to map the user-provided namespace
+    /// name into a [`NamespaceId`].
+    ///
+    /// [`NamespaceId`]: data_types::NamespaceId
+    #[error("failed to resolve namespace ID: {0}")]
+    NamespaceResolver(#[from] crate::namespace_resolver::Error),
 
     /// The router is currently servicing the maximum permitted number of
     /// simultaneous requests.
@@ -87,12 +107,14 @@ impl Error {
             Error::NonUtf8Body(_) => StatusCode::BAD_REQUEST,
             Error::ParseLineProtocol(_) => StatusCode::BAD_REQUEST,
             Error::ParseDelete(_) => StatusCode::BAD_REQUEST,
+            Error::ParseHttpDelete(_) => StatusCode::BAD_REQUEST,
             Error::RequestSizeExceeded(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InvalidContentEncoding(_) => {
                 // https://www.rfc-editor.org/rfc/rfc7231#section-6.5.13
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             }
             Error::DmlHandler(err) => StatusCode::from(err),
+            Error::NamespaceResolver(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::RequestLimit => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -101,7 +123,7 @@ impl Error {
 impl From<&DmlError> for StatusCode {
     fn from(e: &DmlError) -> Self {
         match e {
-            DmlError::DatabaseNotFound(_) => StatusCode::NOT_FOUND,
+            DmlError::NamespaceNotFound(_) => StatusCode::NOT_FOUND,
 
             // Schema validation error cases
             DmlError::Schema(SchemaError::NamespaceLookup(_)) => {
@@ -111,23 +133,28 @@ impl From<&DmlError> for StatusCode {
             }
             DmlError::Schema(SchemaError::ServiceLimit(_)) => {
                 // https://docs.influxdata.com/influxdb/cloud/account-management/limits/#api-error-responses
-                StatusCode::TOO_MANY_REQUESTS
+                StatusCode::BAD_REQUEST
             }
             DmlError::Schema(SchemaError::Conflict(_)) => StatusCode::BAD_REQUEST,
             DmlError::Schema(SchemaError::UnexpectedCatalogError(_)) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
 
-            DmlError::Internal(_) | DmlError::WriteBuffer(_) | DmlError::NamespaceCreation(_) => {
+            DmlError::Internal(_) | DmlError::WriteBuffer(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::Partition(PartitionError::BatchWrite(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::Retention(RetentionError::NamespaceLookup(_)) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            DmlError::Partition(PartitionError::BatchWrite(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::Retention(RetentionError::OutsideRetention(_)) => StatusCode::FORBIDDEN,
+            DmlError::RpcWrite(RpcWriteError::Upstream(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::RpcWrite(RpcWriteError::DeletesUnsupported) => StatusCode::NOT_IMPLEMENTED,
+            DmlError::RpcWrite(RpcWriteError::Timeout(_)) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
 
 /// Errors returned when decoding the organisation / bucket information from a
-/// HTTP request and deriving the database name from it.
+/// HTTP request and deriving the namespace name from it.
 #[derive(Debug, Error)]
 pub enum OrgBucketError {
     /// The request contains no org/bucket destination information.
@@ -138,7 +165,7 @@ pub enum OrgBucketError {
     #[error("failed to deserialize org/bucket/precision in request: {0}")]
     DecodeFail(#[from] serde::de::value::Error),
 
-    /// The provided org/bucket could not be converted into a database name.
+    /// The provided org/bucket could not be converted into a namespace name.
     #[error(transparent)]
     MappingFail(#[from] OrgBucketMappingError),
 }
@@ -206,10 +233,11 @@ impl<T> TryFrom<&Request<T>> for WriteInfo {
 /// server runner framework takes care of implementing the heath endpoint,
 /// metrics, pprof, etc.
 #[derive(Debug)]
-pub struct HttpDelegate<D, T = SystemProvider> {
+pub struct HttpDelegate<D, N, T = SystemProvider> {
     max_request_bytes: usize,
     time_provider: T,
-    dml_handler: Arc<D>,
+    namespace_resolver: N,
+    dml_handler: D,
 
     // A request limiter to restrict the number of simultaneous requests this
     // router services.
@@ -221,6 +249,7 @@ pub struct HttpDelegate<D, T = SystemProvider> {
     request_sem: Semaphore,
 
     write_metric_lines: U64Counter,
+    http_line_protocol_parse_duration: DurationHistogram,
     write_metric_fields: U64Counter,
     write_metric_tables: U64Counter,
     write_metric_body_size: U64Counter,
@@ -228,7 +257,7 @@ pub struct HttpDelegate<D, T = SystemProvider> {
     request_limit_rejected: U64Counter,
 }
 
-impl<D> HttpDelegate<D, SystemProvider> {
+impl<D, N> HttpDelegate<D, N, SystemProvider> {
     /// Initialise a new [`HttpDelegate`] passing valid requests to the
     /// specified `dml_handler`.
     ///
@@ -237,36 +266,37 @@ impl<D> HttpDelegate<D, SystemProvider> {
     pub fn new(
         max_request_bytes: usize,
         max_requests: usize,
-        dml_handler: Arc<D>,
+        namespace_resolver: N,
+        dml_handler: D,
         metrics: &metric::Registry,
     ) -> Self {
         let write_metric_lines = metrics
             .register_metric::<U64Counter>(
-                "http_write_lines_total",
+                "http_write_lines",
                 "cumulative number of line protocol lines successfully routed",
             )
             .recorder(&[]);
         let write_metric_fields = metrics
             .register_metric::<U64Counter>(
-                "http_write_fields_total",
+                "http_write_fields",
                 "cumulative number of line protocol fields successfully routed",
             )
             .recorder(&[]);
         let write_metric_tables = metrics
             .register_metric::<U64Counter>(
-                "http_write_tables_total",
+                "http_write_tables",
                 "cumulative number of tables in each write request",
             )
             .recorder(&[]);
         let write_metric_body_size = metrics
             .register_metric::<U64Counter>(
-                "http_write_body_bytes_total",
+                "http_write_body_bytes",
                 "cumulative byte size of successfully routed (decompressed) line protocol write requests",
             )
             .recorder(&[]);
         let delete_metric_body_size = metrics
             .register_metric::<U64Counter>(
-                "http_delete_body_bytes_total",
+                "http_delete_body_bytes",
                 "cumulative byte size of successfully routed (decompressed) delete requests",
             )
             .recorder(&[]);
@@ -276,13 +306,21 @@ impl<D> HttpDelegate<D, SystemProvider> {
                 "number of HTTP requests rejected due to exceeding parallel request limit",
             )
             .recorder(&[]);
+        let http_line_protocol_parse_duration = metrics
+            .register_metric::<DurationHistogram>(
+                "http_line_protocol_parse_duration",
+                "write latency of line protocol parsing",
+            )
+            .recorder(&[]);
 
         Self {
             max_request_bytes,
             time_provider: SystemProvider::default(),
+            namespace_resolver,
             dml_handler,
             request_sem: Semaphore::new(max_requests),
             write_metric_lines,
+            http_line_protocol_parse_duration,
             write_metric_fields,
             write_metric_tables,
             write_metric_body_size,
@@ -292,9 +330,10 @@ impl<D> HttpDelegate<D, SystemProvider> {
     }
 }
 
-impl<D, T> HttpDelegate<D, T>
+impl<D, N, T> HttpDelegate<D, N, T>
 where
     D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = WriteSummary>,
+    N: NamespaceResolver,
     T: TimeProvider,
 {
     /// Routes `req` to the appropriate handler, if any, returning the handler
@@ -336,10 +375,15 @@ where
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
         let write_info = WriteInfo::try_from(&req)?;
-        let namespace = org_and_bucket_to_database(&write_info.org, &write_info.bucket)
+        let namespace = org_and_bucket_to_namespace(&write_info.org, &write_info.bucket)
             .map_err(OrgBucketError::MappingFail)?;
 
-        trace!(org=%write_info.org, bucket=%write_info.bucket, %namespace, "processing write request");
+        trace!(
+            org=%write_info.org,
+            bucket=%write_info.bucket,
+            %namespace,
+            "processing write request"
+        );
 
         // Read the HTTP body and convert it to a str.
         let body = self.read_body(req).await?;
@@ -348,6 +392,7 @@ where
         // The time, in nanoseconds since the epoch, to assign to any points that don't
         // contain a timestamp
         let default_time = self.time_provider.now().timestamp_nanos();
+        let start_instant = Instant::now();
 
         let mut converter = LinesConverter::new(default_time);
         converter.set_timestamp_base(write_info.precision.timestamp_base());
@@ -361,6 +406,8 @@ where
         };
 
         let num_tables = batches.len();
+        let duration = start_instant.elapsed();
+        self.http_line_protocol_parse_duration.record(duration);
         debug!(
             num_lines=stats.num_lines,
             num_fields=stats.num_fields,
@@ -370,12 +417,16 @@ where
             %namespace,
             org=%write_info.org,
             bucket=%write_info.bucket,
+            duration=?duration,
             "routing write",
         );
 
+        // Retrieve the namespace ID for this namespace.
+        let namespace_id = self.namespace_resolver.get_namespace_id(&namespace).await?;
+
         let summary = self
             .dml_handler
-            .write(&namespace, batches, span_ctx)
+            .write(&namespace, namespace_id, batches, span_ctx)
             .await
             .map_err(Into::into)?;
 
@@ -391,7 +442,7 @@ where
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
         let account = WriteInfo::try_from(&req)?;
-        let namespace = org_and_bucket_to_database(&account.org, &account.bucket)
+        let namespace = org_and_bucket_to_namespace(&account.org, &account.bucket)
             .map_err(OrgBucketError::MappingFail)?;
 
         trace!(org=%account.org, bucket=%account.bucket, %namespace, "processing delete request");
@@ -420,9 +471,12 @@ where
             "routing delete"
         );
 
+        let namespace_id = self.namespace_resolver.get_namespace_id(&namespace).await?;
+
         self.dml_handler
             .delete(
                 &namespace,
+                namespace_id,
                 parsed_delete.table_name.as_str(),
                 &predicate,
                 span_ctx,
@@ -497,23 +551,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, iter, sync::Arc, time::Duration};
-
+    use super::*;
+    use crate::{
+        dml_handlers::mock::{MockDmlHandler, MockDmlHandlerCall},
+        namespace_resolver::mock::MockNamespaceResolver,
+    };
     use assert_matches::assert_matches;
-
+    use data_types::{NamespaceId, NamespaceNameError};
     use flate2::{write::GzEncoder, Compression};
     use hyper::header::HeaderValue;
     use metric::{Attributes, Metric};
     use mutable_batch::column::ColumnData;
     use mutable_batch_lp::LineWriteError;
+    use serde::de::Error as _;
+    use std::{io::Write, iter, sync::Arc, time::Duration};
     use test_helpers::timeout::FutureTimeout;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::dml_handlers::mock::{MockDmlHandler, MockDmlHandlerCall};
-
-    use super::*;
-
     const MAX_BYTES: usize = 1024;
+    const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
 
     fn summary() -> WriteSummary {
         WriteSummary::default()
@@ -600,12 +656,20 @@ mod tests {
                     // encoding
                     test_http_handler!(encoding_header=$encoding, request);
 
+                    let mock_namespace_resolver = MockNamespaceResolver::default()
+                        .with_mapping("bananas_test", NAMESPACE_ID);
                     let dml_handler = Arc::new(MockDmlHandler::default()
                         .with_write_return($dml_write_handler)
                         .with_delete_return($dml_delete_handler)
                     );
                     let metrics = Arc::new(metric::Registry::default());
-                    let delegate = HttpDelegate::new(MAX_BYTES, 100, Arc::clone(&dml_handler), &metrics);
+                    let delegate = HttpDelegate::new(
+                        MAX_BYTES,
+                        100,
+                        mock_namespace_resolver,
+                        Arc::clone(&dml_handler),
+                        &metrics
+                    );
 
                     let got = delegate.route(request).await;
                     assert_matches!(got, $want_result);
@@ -615,12 +679,12 @@ mod tests {
                     if let Ok(v) = got {
                         assert_eq!(v.status(), StatusCode::NO_CONTENT);
                         if $uri.contains("/api/v2/write") {
-                            assert_metric_hit(&metrics, "http_write_lines_total", None);
-                            assert_metric_hit(&metrics, "http_write_fields_total", None);
-                            assert_metric_hit(&metrics, "http_write_tables_total", None);
-                            assert_metric_hit(&metrics, "http_write_body_bytes_total", Some($body.len() as _));
+                            assert_metric_hit(&metrics, "http_write_lines", None);
+                            assert_metric_hit(&metrics, "http_write_fields", None);
+                            assert_metric_hit(&metrics, "http_write_tables", None);
+                            assert_metric_hit(&metrics, "http_write_body_bytes", Some($body.len() as _));
                         } else {
-                            assert_metric_hit(&metrics, "http_delete_body_bytes_total", Some($body.len() as _));
+                            assert_metric_hit(&metrics, "http_delete_body_bytes", Some($body.len() as _));
                         }
                     }
 
@@ -712,8 +776,9 @@ mod tests {
         body = "platanos,tag1=A,tag2=B val=42i 1647622847".as_bytes(),
         dml_handler = [Ok(summary())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+        want_dml_calls = [MockDmlHandlerCall::Write{namespace, namespace_id, write_input}] => {
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
 
             let table = write_input.get("platanos").expect("table not found");
             let ts = table.timestamp_summary().expect("no timestamp summary");
@@ -727,8 +792,9 @@ mod tests {
         body = "platanos,tag1=A,tag2=B val=42i 1647622847000".as_bytes(),
         dml_handler = [Ok(summary())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+        want_dml_calls = [MockDmlHandlerCall::Write{namespace, namespace_id, write_input}] => {
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
 
             let table = write_input.get("platanos").expect("table not found");
             let ts = table.timestamp_summary().expect("no timestamp summary");
@@ -742,8 +808,9 @@ mod tests {
         body = "platanos,tag1=A,tag2=B val=42i 1647622847000000".as_bytes(),
         dml_handler = [Ok(summary())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+        want_dml_calls = [MockDmlHandlerCall::Write{namespace, namespace_id, write_input}] => {
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
 
             let table = write_input.get("platanos").expect("table not found");
             let ts = table.timestamp_summary().expect("no timestamp summary");
@@ -757,8 +824,9 @@ mod tests {
         body = "platanos,tag1=A,tag2=B val=42i 1647622847000000000".as_bytes(),
         dml_handler = [Ok(summary())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+        want_dml_calls = [MockDmlHandlerCall::Write{namespace, namespace_id, write_input}] => {
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
 
             let table = write_input.get("platanos").expect("table not found");
             let ts = table.timestamp_summary().expect("no timestamp summary");
@@ -862,8 +930,8 @@ mod tests {
         db_not_found,
         query_string = "?org=bananas&bucket=test",
         body = "platanos,tag1=A,tag2=B val=42i 123456".as_bytes(),
-        dml_handler = [Err(DmlError::DatabaseNotFound("bananas_test".to_string()))],
-        want_result = Err(Error::DmlHandler(DmlError::DatabaseNotFound(_))),
+        dml_handler = [Err(DmlError::NamespaceNotFound("bananas_test".to_string()))],
+        want_result = Err(Error::DmlHandler(DmlError::NamespaceNotFound(_))),
         want_dml_calls = [MockDmlHandlerCall::Write{namespace, ..}] => {
             assert_eq!(namespace, "bananas_test");
         }
@@ -886,8 +954,9 @@ mod tests {
         body = "test field=1u 100\ntest field=2u 100".as_bytes(),
         dml_handler = [Ok(summary())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+        want_dml_calls = [MockDmlHandlerCall::Write{namespace, namespace_id, write_input}] => {
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
             let table = write_input.get("test").expect("table not in write");
             let col = table.column("field").expect("column missing");
             assert_matches!(col.data(), ColumnData::U64(data, _) => {
@@ -912,9 +981,10 @@ mod tests {
         body = r#"{"start":"2021-04-01T14:00:00Z","stop":"2021-04-02T14:00:00Z", "predicate":"_measurement=its_a_table and location=Boston"}"#.as_bytes(),
         dml_handler = [Ok(())],
         want_result = Ok(_),
-        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, table, predicate}] => {
+        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, namespace_id, table, predicate}] => {
             assert_eq!(table, "its_a_table");
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
             assert!(!predicate.exprs.is_empty());
         }
     );
@@ -924,7 +994,7 @@ mod tests {
         query_string = "?org=bananas&bucket=test",
         body = r#"{wat}"#.as_bytes(),
         dml_handler = [],
-        want_result = Err(Error::ParseDelete(_)),
+        want_result = Err(Error::ParseHttpDelete(_)),
         want_dml_calls = []
     );
 
@@ -977,11 +1047,12 @@ mod tests {
         db_not_found,
         query_string = "?org=bananas&bucket=test",
         body = r#"{"start":"2021-04-01T14:00:00Z","stop":"2021-04-02T14:00:00Z", "predicate":"_measurement=its_a_table and location=Boston"}"#.as_bytes(),
-        dml_handler = [Err(DmlError::DatabaseNotFound("bananas_test".to_string()))],
-        want_result = Err(Error::DmlHandler(DmlError::DatabaseNotFound(_))),
-        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, table, predicate}] => {
+        dml_handler = [Err(DmlError::NamespaceNotFound("bananas_test".to_string()))],
+        want_result = Err(Error::DmlHandler(DmlError::NamespaceNotFound(_))),
+        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, namespace_id, table, predicate}] => {
             assert_eq!(table, "its_a_table");
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
             assert!(!predicate.exprs.is_empty());
         }
     );
@@ -992,9 +1063,10 @@ mod tests {
         body = r#"{"start":"2021-04-01T14:00:00Z","stop":"2021-04-02T14:00:00Z", "predicate":"_measurement=its_a_table and location=Boston"}"#.as_bytes(),
         dml_handler = [Err(DmlError::Internal("💣".into()))],
         want_result = Err(Error::DmlHandler(DmlError::Internal(_))),
-        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, table, predicate}] => {
+        want_dml_calls = [MockDmlHandlerCall::Delete{namespace, namespace_id, table, predicate}] => {
             assert_eq!(table, "its_a_table");
             assert_eq!(namespace, "bananas_test");
+            assert_eq!(*namespace_id, NAMESPACE_ID);
             assert!(!predicate.exprs.is_empty());
         }
     );
@@ -1019,7 +1091,7 @@ mod tests {
             body = "whydo InputPower=300i,InputPower=300i".as_bytes(),
             dml_handler = [Ok(summary())],
             want_result = Ok(_),
-            want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+            want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input, ..}] => {
                 assert_eq!(namespace, "bananas_test");
                 let table = write_input.get("whydo").expect("table not in write");
                 let col = table.column("InputPower").expect("column missing");
@@ -1036,7 +1108,7 @@ mod tests {
             body = "whydo InputPower=300i,InputPower=42i".as_bytes(),
             dml_handler = [Ok(summary())],
             want_result = Ok(_),
-            want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input}] => {
+            want_dml_calls = [MockDmlHandlerCall::Write{namespace, write_input, ..}] => {
                 assert_eq!(namespace, "bananas_test");
                 let table = write_input.get("whydo").expect("table not in write");
                 let col = table.column("InputPower").expect("column missing");
@@ -1134,11 +1206,15 @@ mod tests {
     // number of simultaneous requests are being serviced.
     #[tokio::test]
     async fn test_request_limit_enforced() {
+        let mock_namespace_resolver =
+            MockNamespaceResolver::default().with_mapping("bananas", NamespaceId::new(42));
+
         let dml_handler = Arc::new(MockDmlHandler::default());
         let metrics = Arc::new(metric::Registry::default());
         let delegate = Arc::new(HttpDelegate::new(
             MAX_BYTES,
             1,
+            mock_namespace_resolver,
             Arc::clone(&dml_handler),
             &metrics,
         ));
@@ -1185,7 +1261,7 @@ mod tests {
         // immediate drop of any subsequent requests.
         //
 
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(0));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(0));
 
         // Retain this tx handle for the second request and use it to prove the
         // request dropped before anything was read from the body - the request
@@ -1211,7 +1287,7 @@ mod tests {
         assert_matches!(err, Error::RequestLimit);
 
         // Ensure the "rejected requests" metric was incremented
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(1));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(1));
 
         // Prove the dropped request body is not being read:
         body_2_tx
@@ -1247,6 +1323,196 @@ mod tests {
             .expect("empty write should succeed");
 
         // And the request rejected metric must remain unchanged
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(1));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(1));
+    }
+
+    // The display text of Error gets passed through `ioxd_router::IoxHttpErrorAdaptor` then
+    // `ioxd_common::http::error::HttpApiError` as the JSON "message" value in error response
+    // bodies. These are fixture tests to document error messages that users might see when
+    // making requests to `/api/v2/write`.
+    macro_rules! check_errors {
+        (
+            $((                   // This macro expects a list of tuples, each specifying:
+                $variant:ident        // - One of the error enum variants
+                $(($data:expr))?,     // - If needed, an expression to construct the variant's data
+                $msg:expr $(,)?       // - The string expected for `Display`ing this variant
+            )),*,
+        ) => {
+            // Generate code that contains all possible error variants, to ensure a compiler error
+            // if any errors are not explicitly covered in this test.
+            #[test]
+            fn all_error_variants_are_checked() {
+                #[allow(dead_code)]
+                fn all_documented(ensure_all_error_variants_are_checked: Error) {
+                    #[allow(unreachable_patterns)]
+                    match ensure_all_error_variants_are_checked {
+                        $(Error::$variant { .. } => {},)*
+                        // If this test doesn't compile because of a non-exhaustive pattern,
+                        // a variant needs to be added to the `check_errors!` call with the
+                        // expected `to_string()` text.
+                    }
+                }
+            }
+
+            // A test that covers all errors given to this macro.
+            #[tokio::test]
+            async fn error_messages_match() {
+                // Generate an assert for each error given to this macro.
+                $(
+                    let e = Error::$variant $(($data))?;
+                    assert_eq!(e.to_string(), $msg);
+                )*
+            }
+
+            #[test]
+            fn print_out_error_text() {
+                println!("{}", concat!($(stringify!($variant), "\t", $msg, "\n",)*),)
+            }
+        };
+    }
+
+    check_errors! {
+        (
+            NoHandler,
+            "not found",
+        ),
+
+        (InvalidOrgBucket(OrgBucketError::NotSpecified), "no org/bucket destination provided"),
+
+        (
+            InvalidOrgBucket({
+                let e = serde::de::value::Error::custom("[deserialization error]");
+                OrgBucketError::DecodeFail(e)
+            }),
+            "failed to deserialize org/bucket/precision in request: [deserialization error]",
+        ),
+
+        (
+            InvalidOrgBucket(OrgBucketError::MappingFail(OrgBucketMappingError::NotSpecified)),
+            "missing org/bucket value",
+        ),
+
+        (
+            InvalidOrgBucket({
+                let e = NamespaceNameError::LengthConstraint { name: "[too long name]".into() };
+                let e = OrgBucketMappingError::InvalidNamespaceName { source: e };
+                OrgBucketError::MappingFail(e)
+            }),
+            "Invalid namespace name: \
+             Namespace name [too long name] length must be between 1 and 64 characters",
+        ),
+
+        (
+            NonUtf8Body(std::str::from_utf8(&[0, 159]).unwrap_err()),
+            "body content is not valid utf8: invalid utf-8 sequence of 1 bytes from index 1",
+        ),
+
+        (
+            NonUtf8ContentHeader({
+                hyper::header::HeaderValue::from_bytes(&[159]).unwrap().to_str().unwrap_err()
+            }),
+            "invalid content-encoding header: failed to convert header to a str",
+        ),
+
+        (
+            InvalidContentEncoding("[invalid content encoding value]".into()),
+            "unacceptable content-encoding: [invalid content encoding value]",
+        ),
+
+        (
+            ClientHangup({
+                let url = "wrong://999.999.999.999:999999".parse().unwrap();
+                hyper::Client::new().get(url).await.unwrap_err()
+            }),
+            "client disconnected",
+        ),
+
+        (
+            RequestSizeExceeded(1337),
+            "max request size (1337 bytes) exceeded",
+        ),
+
+        (
+            InvalidGzip(std::io::Error::new(std::io::ErrorKind::Other, "[io Error]")),
+            "error decoding gzip stream: [io Error]",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::LineProtocol {
+                source: influxdb_line_protocol::Error::FieldSetMissing,
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error parsing line 42 (1-based): No fields were provided",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::Write {
+                source: mutable_batch_lp::LineWriteError::DuplicateTag {
+                    name: "host".into(),
+                },
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error writing line 42: \
+            the tag 'host' is specified more than once with conflicting values",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::Write {
+                source: mutable_batch_lp::LineWriteError::ConflictedFieldTypes {
+                    name: "bananas".into(),
+                },
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error writing line 42: \
+            the field 'bananas' is specified more than once with conflicting types",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::EmptyPayload),
+            "failed to parse line protocol: empty write payload",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::TimestampOverflow),
+            "failed to parse line protocol: timestamp overflows i64",
+        ),
+
+        (
+            ParseDelete({
+                predicate::delete_predicate::Error::InvalidSyntax { value: "[syntax]".into() }
+            }),
+            "failed to parse delete predicate: Invalid predicate syntax: ([syntax])",
+        ),
+
+        (
+            ParseHttpDelete({
+                delete_predicate::Error::TableInvalid { value: "[table name]".into() }
+            }),
+            "failed to parse delete predicate from http request: \
+             Invalid table name in delete '[table name]'"
+        ),
+
+        (
+            DmlHandler(DmlError::NamespaceNotFound("[namespace name]".into())),
+            "dml handler error: namespace [namespace name] does not exist",
+        ),
+
+        (
+            NamespaceResolver({
+                let e = iox_catalog::interface::Error::NameExists { name: "[name]".into() };
+                crate::namespace_resolver::Error::Lookup(e)
+            }),
+            "failed to resolve namespace ID: \
+             failed to resolve namespace ID: \
+             name [name] already exists",
+        ),
+
+        (
+            RequestLimit,
+            "this service is overloaded, please try again later",
+        ),
     }
 }

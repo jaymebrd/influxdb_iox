@@ -1,10 +1,12 @@
-use super::DmlHandler;
-use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate};
-use dml::DmlMeta;
 use std::fmt::Debug;
+
+use async_trait::async_trait;
+use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use dml::DmlMeta;
 use trace::ctx::SpanContext;
 use write_summary::WriteSummary;
+
+use super::DmlHandler;
 
 /// A [`WriteSummaryAdapter`] wraps DML Handler that produces
 ///  `Vec<Vec<DmlMeta>>` for each write, and produces a WriteSummary,
@@ -37,24 +39,29 @@ where
     /// `Vec<Vec<DmlMeta>>`, creating a `WriteSummary`
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
-        let metas = self.inner.write(namespace, input, span_ctx).await?;
+        let metas = self
+            .inner
+            .write(namespace, namespace_id, input, span_ctx)
+            .await?;
         Ok(WriteSummary::new(metas))
     }
 
     /// Pass the delete through to the inner handler.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
         span_ctx: Option<SpanContext>,
     ) -> Result<(), Self::DeleteError> {
         self.inner
-            .delete(namespace, table_name, predicate, span_ctx)
+            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
             .await
     }
 }

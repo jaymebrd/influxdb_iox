@@ -1,16 +1,18 @@
 use self::{
+    circuit_breaker::CircuitBreakerFlightClient,
     flight_client::{Error as FlightClientError, FlightClient, FlightClientImpl, FlightError},
     test_util::MockIngesterConnection,
 };
-use crate::{cache::CatalogCache, chunk::util::create_basic_summary};
+use crate::cache::CatalogCache;
 use arrow::{datatypes::DataType, error::ArrowError, record_batch::RecordBatch};
 use async_trait::async_trait;
+use backoff::{Backoff, BackoffConfig, BackoffError};
 use client_util::connection;
 use data_types::{
-    ChunkId, ChunkOrder, IngesterMapping, KafkaPartition, PartitionId, SequenceNumber, SequencerId,
-    TableSummary, TimestampMinMax,
+    ChunkId, ChunkOrder, IngesterMapping, NamespaceId, PartitionId, SequenceNumber, ShardId,
+    ShardIndex, TableId, TableSummary, TimestampMinMax,
 };
-use datafusion_util::MemoryStream;
+use datafusion::error::DataFusionError;
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use generated_types::{
     influxdata::iox::ingester::v1::GetWriteInfoResponse,
@@ -22,21 +24,24 @@ use influxdb_iox_client::flight::{
 };
 use iox_query::{
     exec::{stringset::StringSet, IOxSessionContext},
-    util::compute_timenanosecond_min_max,
-    QueryChunk, QueryChunkError, QueryChunkMeta,
+    util::{compute_timenanosecond_min_max, create_basic_summary},
+    QueryChunk, QueryChunkData, QueryChunkMeta,
 };
 use iox_time::{Time, TimeProvider};
 use metric::{DurationHistogram, Metric};
-use observability_deps::tracing::{debug, info, trace, warn};
+use observability_deps::tracing::{debug, trace, warn};
 use predicate::Predicate;
-use schema::{selection::Selection, sort::SortKey, Schema};
+use schema::{sort::SortKey, Projection, Schema};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
+use trace::span::{Span, SpanRecorder};
 
+mod circuit_breaker;
 pub(crate) mod flight_client;
 pub(crate) mod test_util;
 
@@ -122,38 +127,34 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "No ingester found in sequencer to ingester mapping for sequencer {sequencer_id}"
+        "No ingester found in shard to ingester mapping for shard index {shard_index}"
     ))]
-    NoIngesterFoundForSequencer { sequencer_id: KafkaPartition },
+    NoIngesterFoundForShard { shard_index: ShardIndex },
 
     #[snafu(display(
-        "Sequencer {sequencer_id} was neither mapped to an ingester nor marked ignore"
+        "Shard index {shard_index} was neither mapped to an ingester nor marked ignore"
     ))]
-    SequencerNotMapped { sequencer_id: KafkaPartition },
+    ShardNotMapped { shard_index: ShardIndex },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Create a new connection given Vec of `ingester_address` such as
-/// "http://127.0.0.1:8083"
-pub fn create_ingester_connection(
-    ingester_addresses: Vec<String>,
+/// Create a new set of connections given a map of shard indexes to Ingester configurations
+pub fn create_ingester_connections_by_shard(
+    shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
     catalog_cache: Arc<CatalogCache>,
+    open_circuit_after_n_errors: u64,
 ) -> Arc<dyn IngesterConnection> {
-    Arc::new(IngesterConnectionImpl::new(
-        ingester_addresses,
+    Arc::new(IngesterConnectionImpl::by_shard(
+        shard_to_ingesters,
         catalog_cache,
-    ))
-}
-
-/// Create a new set of connections given a map of sequencer IDs to Ingester configurations
-pub fn create_ingester_connections_by_sequencer(
-    sequencer_to_ingesters: HashMap<i32, IngesterMapping>,
-    catalog_cache: Arc<CatalogCache>,
-) -> Arc<dyn IngesterConnection> {
-    Arc::new(IngesterConnectionImpl::by_sequencer(
-        sequencer_to_ingesters,
-        catalog_cache,
+        BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(1),
+            base: 3.0,
+            deadline: Some(Duration::from_secs(10)),
+        },
+        open_circuit_after_n_errors,
     ))
 }
 
@@ -170,22 +171,24 @@ pub trait IngesterConnection: std::fmt::Debug + Send + Sync + 'static {
     ///
     /// # Panics
     ///
-    /// Panics if the list of sequencer_ids is empty.
+    /// Panics if the list of shard_indexes is empty.
+    #[allow(clippy::too_many_arguments)]
     async fn partitions(
         &self,
-        sequencer_ids: &[KafkaPartition],
-        namespace_name: Arc<str>,
-        table_name: Arc<str>,
+        shard_indexes: &[ShardIndex],
+        namespace_id: NamespaceId,
+        table_id: TableId,
         columns: Vec<String>,
         predicate: &Predicate,
         expected_schema: Arc<Schema>,
+        span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>>;
 
-    /// Returns the most recent partition sstatus info across all ingester(s) for the specified
+    /// Returns the most recent partition status info across all ingester(s) for the specified
     /// write token.
     async fn get_write_info(&self, write_token: &str) -> Result<GetWriteInfoResponse>;
 
-    /// Return backend as [`Any`] which can be used to downcast to a specifc implementation.
+    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -220,22 +223,36 @@ impl IngesterConnectionMetrics {
     }
 }
 
+/// Information about an OK/success ingester request.
+#[derive(Debug, Default)]
+struct IngesterResponseOk {
+    n_partitions: usize,
+    n_chunks: usize,
+    n_rows: usize,
+}
+
 /// Helper to observe a single ingester request.
 ///
 /// Use [`set_ok`](Self::set_ok) or [`set_err`](Self::set_err) if an ingester result was observered. Otherwise the
 /// request will count as "cancelled".
 struct ObserveIngesterRequest<'a> {
-    res: Option<Result<(), ()>>,
+    res: Option<Result<IngesterResponseOk, ()>>,
     t_start: Time,
     time_provider: Arc<dyn TimeProvider>,
     metrics: Arc<IngesterConnectionMetrics>,
     request: GetPartitionForIngester<'a>,
+    span_recorder: SpanRecorder,
 }
 
 impl<'a> ObserveIngesterRequest<'a> {
-    fn new(request: GetPartitionForIngester<'a>, metrics: Arc<IngesterConnectionMetrics>) -> Self {
+    fn new(
+        request: GetPartitionForIngester<'a>,
+        metrics: Arc<IngesterConnectionMetrics>,
+        span_recorder: &SpanRecorder,
+    ) -> Self {
         let time_provider = request.catalog_cache.time_provider();
         let t_start = time_provider.now();
+        let span_recorder = span_recorder.child("flight request");
 
         Self {
             res: None,
@@ -243,15 +260,22 @@ impl<'a> ObserveIngesterRequest<'a> {
             time_provider,
             metrics,
             request,
+            span_recorder,
         }
     }
 
-    fn set_ok(mut self) {
-        self.res = Some(Ok(()));
+    fn span_recorder(&self) -> &SpanRecorder {
+        &self.span_recorder
+    }
+
+    fn set_ok(mut self, ok_status: IngesterResponseOk) {
+        self.res = Some(Ok(ok_status));
+        self.span_recorder.ok("done");
     }
 
     fn set_err(mut self) {
         self.res = Some(Err(()));
+        self.span_recorder.error("failed");
     }
 }
 
@@ -260,18 +284,25 @@ impl<'a> Drop for ObserveIngesterRequest<'a> {
         let t_end = self.time_provider.now();
 
         if let Some(ingester_duration) = t_end.checked_duration_since(self.t_start) {
-            let (metric, status) = match self.res {
-                None => (&self.metrics.ingester_duration_cancelled, "cancelled"),
-                Some(Ok(())) => (&self.metrics.ingester_duration_success, "success"),
-                Some(Err(())) => (&self.metrics.ingester_duration_error, "error"),
+            let (metric, status, ok_status) = match self.res {
+                None => (&self.metrics.ingester_duration_cancelled, "cancelled", None),
+                Some(Ok(ref ok_status)) => (
+                    &self.metrics.ingester_duration_success,
+                    "success",
+                    Some(ok_status),
+                ),
+                Some(Err(())) => (&self.metrics.ingester_duration_error, "error", None),
             };
 
             metric.record(ingester_duration);
 
-            info!(
+            debug!(
                 predicate=?self.request.predicate,
-                namespace=%self.request.namespace_name,
-                table_name=%self.request.table_name,
+                namespace_id=self.request.namespace_id.get(),
+                table_id=self.request.table_id.get(),
+                n_partitions=?ok_status.map(|s| s.n_partitions),
+                n_chunks=?ok_status.map(|s| s.n_chunks),
+                n_rows=?ok_status.map(|s| s.n_rows),
                 ?ingester_duration,
                 status,
                 "Time spent in ingester"
@@ -280,81 +311,23 @@ impl<'a> Drop for ObserveIngesterRequest<'a> {
     }
 }
 
-/// This enum is temporary to support migration from `--ingester-addresses` to specifying the
-/// sequencer to ingesters mapping. This can be simplified to the HashMap inside the
-/// SequencerToIngestersMap variant when nothing is using `--ingester-addresses` anymore.
-#[derive(Debug)]
-enum TemporaryMigrationSupport {
-    SequencerToIngestersMap(HashMap<KafkaPartition, IngesterMapping>),
-    IngesterAddresses(Vec<Arc<str>>),
-}
-
-impl TemporaryMigrationSupport {
-    fn get(&self, key: &KafkaPartition) -> Option<Vec<IngesterMapping>> {
-        use TemporaryMigrationSupport::*;
-        match self {
-            SequencerToIngestersMap(map) => map.get(key).map(|ingester| vec![ingester.to_owned()]),
-            IngesterAddresses(list) => {
-                Some(list.iter().cloned().map(IngesterMapping::Addr).collect())
-            }
-        }
-    }
-}
-
 /// IngesterConnection that communicates with an ingester.
 #[derive(Debug)]
 pub struct IngesterConnectionImpl {
-    sequencer_to_ingesters: TemporaryMigrationSupport,
+    shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
     unique_ingester_addresses: HashSet<Arc<str>>,
     flight_client: Arc<dyn FlightClient>,
     catalog_cache: Arc<CatalogCache>,
     metrics: Arc<IngesterConnectionMetrics>,
+    backoff_config: BackoffConfig,
 }
 
 impl IngesterConnectionImpl {
-    /// Create a new connection given a Vec of `ingester_address` such as
-    /// "http://127.0.0.1:8083"
-    pub fn new(ingester_addresses: Vec<String>, catalog_cache: Arc<CatalogCache>) -> Self {
-        Self::new_with_flight_client(
-            ingester_addresses,
-            Arc::new(FlightClientImpl::new()),
-            catalog_cache,
-        )
-    }
-
-    /// Create new ingester connection with specific flight client implementation.
-    ///
-    /// This is helpful for testing, i.e. when the flight client should not be backed by normal
-    /// network communication.
-    pub fn new_with_flight_client(
-        ingester_addresses: Vec<String>,
-        flight_client: Arc<dyn FlightClient>,
-        catalog_cache: Arc<CatalogCache>,
-    ) -> Self {
-        let unique_ingester_addresses: HashSet<_> = ingester_addresses
-            .iter()
-            .map(|addr| Arc::from(addr.as_str()))
-            .collect();
-
-        let metric_registry = catalog_cache.metric_registry();
-        let metrics = Arc::new(IngesterConnectionMetrics::new(&metric_registry));
-
-        Self {
-            sequencer_to_ingesters: TemporaryMigrationSupport::IngesterAddresses(
-                unique_ingester_addresses.iter().cloned().collect(),
-            ),
-            unique_ingester_addresses,
-            flight_client,
-            catalog_cache,
-            metrics,
-        }
-    }
-
-    /// Create a new set of connections given a map of sequencer IDs to Ingester addresses, such as:
+    /// Create a new set of connections given a map of shard indexes to Ingester addresses, such as:
     ///
     /// ```json
     /// {
-    ///   "sequencers": {
+    ///   "shards": {
     ///     "0": {
     ///       "ingesters": [
     ///         {"addr": "http://ingester-0:8082"},
@@ -365,14 +338,24 @@ impl IngesterConnectionImpl {
     ///   }
     /// }
     /// ```
-    pub fn by_sequencer(
-        sequencer_to_ingesters: HashMap<i32, IngesterMapping>,
+    pub fn by_shard(
+        shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
         catalog_cache: Arc<CatalogCache>,
+        backoff_config: BackoffConfig,
+        open_circuit_after_n_errors: u64,
     ) -> Self {
-        Self::by_sequencer_with_flight_client(
-            sequencer_to_ingesters,
-            Arc::new(FlightClientImpl::new()),
+        let flight_client = Arc::new(FlightClientImpl::new());
+        let flight_client = Arc::new(CircuitBreakerFlightClient::new(
+            flight_client,
+            catalog_cache.time_provider(),
+            catalog_cache.metric_registry(),
+            open_circuit_after_n_errors,
+        ));
+        Self::by_shard_with_flight_client(
+            shard_to_ingesters,
+            flight_client,
             catalog_cache,
+            backoff_config,
         )
     }
 
@@ -380,12 +363,13 @@ impl IngesterConnectionImpl {
     ///
     /// This is helpful for testing, i.e. when the flight client should not be backed by normal
     /// network communication.
-    pub fn by_sequencer_with_flight_client(
-        sequencer_to_ingesters: HashMap<i32, IngesterMapping>,
+    pub fn by_shard_with_flight_client(
+        shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
         flight_client: Arc<dyn FlightClient>,
         catalog_cache: Arc<CatalogCache>,
+        backoff_config: BackoffConfig,
     ) -> Self {
-        let unique_ingester_addresses: HashSet<_> = sequencer_to_ingesters
+        let unique_ingester_addresses: HashSet<_> = shard_to_ingesters
             .values()
             .flat_map(|v| match v {
                 IngesterMapping::Addr(addr) => Some(addr),
@@ -393,24 +377,17 @@ impl IngesterConnectionImpl {
             })
             .cloned()
             .collect();
-        let sequencer_to_ingesters = TemporaryMigrationSupport::SequencerToIngestersMap(
-            sequencer_to_ingesters
-                .into_iter()
-                .map(|(sequencer_id, ingester_address)| {
-                    (KafkaPartition::new(sequencer_id), ingester_address)
-                })
-                .collect(),
-        );
 
         let metric_registry = catalog_cache.metric_registry();
         let metrics = Arc::new(IngesterConnectionMetrics::new(&metric_registry));
 
         Self {
-            sequencer_to_ingesters,
+            shard_to_ingesters,
             unique_ingester_addresses,
             flight_client,
             catalog_cache,
             metrics,
+            backoff_config,
         }
     }
 }
@@ -421,51 +398,68 @@ struct GetPartitionForIngester<'a> {
     flight_client: Arc<dyn FlightClient>,
     catalog_cache: Arc<CatalogCache>,
     ingester_address: Arc<str>,
-    namespace_name: Arc<str>,
-    table_name: Arc<str>,
+    namespace_id: NamespaceId,
+    table_id: TableId,
     columns: Vec<String>,
     predicate: &'a Predicate,
     expected_schema: Arc<Schema>,
 }
 
 /// Fetches the partitions for a single ingester
-async fn execute(request: GetPartitionForIngester<'_>) -> Result<Vec<IngesterPartition>> {
+async fn execute(
+    request: GetPartitionForIngester<'_>,
+    span_recorder: &SpanRecorder,
+) -> Result<Vec<IngesterPartition>> {
     let GetPartitionForIngester {
         flight_client,
         catalog_cache,
         ingester_address,
-        namespace_name,
-        table_name,
+        namespace_id,
+        table_id,
         columns,
         predicate,
         expected_schema,
     } = request;
 
     let ingester_query_request = IngesterQueryRequest {
-        namespace: namespace_name.to_string(),
-        table: table_name.to_string(),
+        namespace_id,
+        table_id,
         columns: columns.clone(),
         predicate: Some(predicate.clone()),
     };
 
     let query_res = flight_client
-        .query(Arc::clone(&ingester_address), ingester_query_request)
+        .query(
+            Arc::clone(&ingester_address),
+            ingester_query_request,
+            span_recorder.span().map(|span| span.ctx.clone()),
+        )
         .await;
 
-    if let Err(FlightClientError::Flight {
-        source: FlightError::GrpcError(status),
-    }) = &query_res
-    {
-        if status.code() == tonic::Code::NotFound {
+    match &query_res {
+        Err(FlightClientError::CircuitBroken { .. }) => {
+            warn!(
+                ingester_address = ingester_address.as_ref(),
+                namespace_id = namespace_id.get(),
+                table_id = table_id.get(),
+                "Could not connect to ingester,  circuit broken",
+            );
+            return Ok(vec![]);
+        }
+        Err(FlightClientError::Flight {
+            source: FlightError::GrpcError(status),
+        }) if status.code() == tonic::Code::NotFound => {
             debug!(
-                ingester_address=ingester_address.as_ref(),
-                %namespace_name,
-                %table_name,
+                ingester_address = ingester_address.as_ref(),
+                namespace_id = namespace_id.get(),
+                table_id = table_id.get(),
                 "Ingester does not know namespace or table, skipping",
             );
             return Ok(vec![]);
         }
+        _ => {}
     }
+
     let mut perform_query = query_res
         .context(RemoteQuerySnafu {
             ingester_address: ingester_address.as_ref(),
@@ -475,8 +469,8 @@ async fn execute(request: GetPartitionForIngester<'_>) -> Result<Vec<IngesterPar
             warn!(
                 e=%e,
                 ingester_address=ingester_address.as_ref(),
-                namespace=namespace_name.as_ref(),
-                table=table_name.as_ref(),
+                namespace_id=namespace_id.get(),
+                table_id=table_id.get(),
                 columns=columns.join(",").as_str(),
                 predicate_str=%predicate,
                 predicate_binary=encode_predicate_as_base64(predicate).as_str(),
@@ -502,8 +496,12 @@ async fn execute(request: GetPartitionForIngester<'_>) -> Result<Vec<IngesterPar
     }
 
     // reconstruct partitions
-    let mut decoder =
-        IngesterStreamDecoder::new(ingester_address, table_name, catalog_cache, expected_schema);
+    let mut decoder = IngesterStreamDecoder::new(
+        ingester_address,
+        catalog_cache,
+        expected_schema,
+        span_recorder.child_span("IngesterStreamDecoder"),
+    );
     for (msg, md) in messages {
         decoder.register(msg, md).await?;
     }
@@ -520,27 +518,27 @@ struct IngesterStreamDecoder {
     current_partition: Option<IngesterPartition>,
     current_chunk: Option<(Schema, Vec<RecordBatch>)>,
     ingester_address: Arc<str>,
-    table_name: Arc<str>,
     catalog_cache: Arc<CatalogCache>,
     expected_schema: Arc<Schema>,
+    span_recorder: SpanRecorder,
 }
 
 impl IngesterStreamDecoder {
     /// Create empty decoder.
     fn new(
         ingester_address: Arc<str>,
-        table_name: Arc<str>,
         catalog_cache: Arc<CatalogCache>,
         expected_schema: Arc<Schema>,
+        span: Option<Span>,
     ) -> Self {
         Self {
             finished_partitions: HashMap::new(),
             current_partition: None,
             current_chunk: None,
             ingester_address,
-            table_name,
             catalog_cache,
             expected_schema,
+            span_recorder: SpanRecorder::new(span),
         }
     }
 
@@ -571,14 +569,19 @@ impl IngesterStreamDecoder {
                 .map(|c| c.schema())
                 .collect();
             let primary_keys: Vec<_> = schemas.iter().map(|s| s.primary_key()).collect();
-            let primary_key: HashSet<_> = primary_keys
+            let primary_key: Vec<_> = primary_keys
                 .iter()
                 .flat_map(|pk| pk.iter().copied())
                 .collect();
             let partition_sort_key = self
                 .catalog_cache
                 .partition()
-                .sort_key(current_partition.partition_id(), &primary_key)
+                .sort_key(
+                    current_partition.partition_id(),
+                    &primary_key,
+                    self.span_recorder
+                        .child_span("cache GET partition sort key"),
+                )
                 .await;
             let current_partition = current_partition.with_partition_sort_key(partition_sort_key);
             self.finished_partitions
@@ -611,10 +614,14 @@ impl IngesterStreamDecoder {
                         ingester_address: self.ingester_address.as_ref()
                     },
                 );
-                let sequencer_id = self
+                let shard_id = self
                     .catalog_cache
                     .partition()
-                    .sequencer_id(partition_id)
+                    .shard_id(
+                        partition_id,
+                        self.span_recorder
+                            .child_span("cache GET partition shard ID"),
+                    )
                     .await;
 
                 // Use a temporary empty partition sort key. We are going to fetch this AFTER we know all chunks because
@@ -623,13 +630,10 @@ impl IngesterStreamDecoder {
 
                 let partition = IngesterPartition::new(
                     Arc::clone(&self.ingester_address),
-                    Arc::clone(&self.table_name),
                     partition_id,
-                    sequencer_id,
+                    shard_id,
                     status.parquet_max_sequence_number.map(SequenceNumber::new),
-                    status
-                        .tombstone_max_sequence_number
-                        .map(SequenceNumber::new),
+                    None,
                     partition_sort_key,
                 );
                 self.current_partition = Some(partition);
@@ -674,14 +678,16 @@ impl IngesterStreamDecoder {
         let mut ids: Vec<_> = self.finished_partitions.keys().copied().collect();
         ids.sort();
 
-        Ok(ids
+        let partitions = ids
             .into_iter()
             .map(|id| {
                 self.finished_partitions
                     .remove(&id)
                     .expect("just got key from this map")
             })
-            .collect())
+            .collect();
+        self.span_recorder.ok("finished");
+        Ok(partitions)
     }
 }
 
@@ -703,47 +709,73 @@ fn encode_predicate_as_base64(predicate: &Predicate) -> String {
 
 #[async_trait]
 impl IngesterConnection for IngesterConnectionImpl {
-    /// Retrieve chunks from the ingester for the particular table, sequencer, and predicate
+    /// Retrieve chunks from the ingester for the particular table, shard, and predicate
     async fn partitions(
         &self,
-        sequencer_ids: &[KafkaPartition],
-        namespace_name: Arc<str>,
-        table_name: Arc<str>,
+        shard_indexes: &[ShardIndex],
+        namespace_id: NamespaceId,
+        table_id: TableId,
         columns: Vec<String>,
         predicate: &Predicate,
         expected_schema: Arc<Schema>,
+        span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>> {
-        // If no sequencer IDs are specified, no ingester addresses can be found. This is a
+        // If no shard indexes are specified, no ingester addresses can be found. This is a
         // configuration problem somewhere.
         assert!(
-            !sequencer_ids.is_empty(),
-            "Called `IngesterConnection.partitions` with an empty `sequencer_ids` list",
+            !shard_indexes.is_empty(),
+            "Called `IngesterConnection.partitions` with an empty `shard_indexes` list",
         );
+        let mut span_recorder = SpanRecorder::new(span);
 
         let metrics = Arc::clone(&self.metrics);
 
-        let measured_ingester_request = |ingester_address| {
+        let measured_ingester_request = |ingester_address: Arc<str>| {
+            let metrics = Arc::clone(&metrics);
             let request = GetPartitionForIngester {
                 flight_client: Arc::clone(&self.flight_client),
                 catalog_cache: Arc::clone(&self.catalog_cache),
-                ingester_address,
-                namespace_name: Arc::clone(&namespace_name),
-                table_name: Arc::clone(&table_name),
+                ingester_address: Arc::clone(&ingester_address),
+                namespace_id,
+                table_id,
                 columns: columns.clone(),
                 predicate,
                 expected_schema: Arc::clone(&expected_schema),
             };
-            let metrics = Arc::clone(&metrics);
+
+            let backoff_config = self.backoff_config.clone();
 
             // wrap `execute` into an additional future so that we can measure the request time
             // INFO: create the measurement structure outside of the async block so cancellation is
             // always measured
-            let measure_me = ObserveIngesterRequest::new(request.clone(), metrics);
+            let measure_me = ObserveIngesterRequest::new(request.clone(), metrics, &span_recorder);
             async move {
-                let res = execute(request.clone()).await;
+                let span_recorder = measure_me
+                    .span_recorder()
+                    .child("ingester request (retry block)");
+
+                let res = Backoff::new(&backoff_config)
+                    .retry_all_errors("ingester request", move || {
+                        let request = request.clone();
+                        let span_recorder = span_recorder.child("ingester request (single try)");
+
+                        async move { execute(request, &span_recorder).await }
+                    })
+                    .await;
 
                 match &res {
-                    Ok(_) => measure_me.set_ok(),
+                    Ok(partitions) => {
+                        let mut status = IngesterResponseOk::default();
+                        for p in partitions {
+                            status.n_partitions += 1;
+                            for c in p.chunks() {
+                                status.n_chunks += 1;
+                                status.n_rows += c.rows();
+                            }
+                        }
+
+                        measure_me.set_ok(status);
+                    }
                     Err(_) => measure_me.set_err(),
                 }
 
@@ -751,38 +783,31 @@ impl IngesterConnection for IngesterConnectionImpl {
             }
         };
 
-        // Look up the ingesters needed for the sequencer. Collect into a HashSet to avoid making
+        // Look up the ingesters needed for the shard. Collect into a HashSet to avoid making
         // multiple requests to the same ingester if that ingester is responsible for multiple
-        // sequencer_ids relevant to this query.
+        // shard_indexes relevant to this query.
         let mut relevant_ingester_addresses = HashSet::new();
 
-        for sequencer_id in sequencer_ids {
-            match self.sequencer_to_ingesters.get(sequencer_id) {
+        for shard_index in shard_indexes {
+            match self.shard_to_ingesters.get(shard_index) {
                 None => {
-                    return NoIngesterFoundForSequencerSnafu {
-                        sequencer_id: *sequencer_id,
+                    return NoIngesterFoundForShardSnafu {
+                        shard_index: *shard_index,
                     }
                     .fail()
                 }
-                Some(list)
-                    if list.is_empty()
-                        || list.iter().all(|a| matches!(a, IngesterMapping::Ignore)) => {}
-                Some(list) => {
-                    for mapping in list {
-                        match mapping {
-                            IngesterMapping::Addr(addr) => {
-                                relevant_ingester_addresses.insert(Arc::clone(&addr));
-                            }
-                            IngesterMapping::Ignore => (),
-                            IngesterMapping::NotMapped => {
-                                return SequencerNotMappedSnafu {
-                                    sequencer_id: *sequencer_id,
-                                }
-                                .fail()
-                            }
-                        }
+                Some(mapping) => match mapping {
+                    IngesterMapping::Addr(addr) => {
+                        relevant_ingester_addresses.insert(Arc::clone(addr));
                     }
-                }
+                    IngesterMapping::Ignore => (),
+                    IngesterMapping::NotMapped => {
+                        return ShardNotMappedSnafu {
+                            shard_index: *shard_index,
+                        }
+                        .fail()
+                    }
+                },
             }
         }
 
@@ -791,13 +816,20 @@ impl IngesterConnection for IngesterConnectionImpl {
             .map(move |ingester_address| measured_ingester_request(ingester_address))
             .collect::<FuturesUnordered<_>>()
             .try_collect::<Vec<_>>()
-            .await?
+            .await
+            .map_err(|e| {
+                span_recorder.error("failed");
+                match e {
+                    BackoffError::DeadlineExceeded { source, .. } => source,
+                }
+            })?
             // We have a Vec<Vec<..>> flatten to Vec<_>
             .into_iter()
             .flatten()
             .collect();
 
         ingester_partitions.sort_by_key(|p| p.partition_id);
+        span_recorder.ok("done");
         Ok(ingester_partitions)
     }
 
@@ -842,18 +874,17 @@ async fn execute_get_write_infos(
 /// Given the catalog hierarchy:
 ///
 /// ```text
-/// (Catalog) Sequencer -> (Catalog) Table --> (Catalog) Partition
+/// (Catalog) Shard -> (Catalog) Table --> (Catalog) Partition
 /// ```
 ///
 /// An IngesterPartition contains the unpersisted data for a catalog
-/// partition from a sequencer. Thus, there can be more than one
+/// partition from a shard. Thus, there can be more than one
 /// IngesterPartition for each table the ingester knows about.
 #[derive(Debug, Clone)]
 pub struct IngesterPartition {
     ingester: Arc<str>,
-    table_name: Arc<str>,
     partition_id: PartitionId,
-    sequencer_id: SequencerId,
+    shard_id: ShardId,
 
     /// Maximum sequence number of parquet files the ingester has
     /// persisted for this partition
@@ -874,18 +905,16 @@ impl IngesterPartition {
     /// `RecordBatches` into the correct types
     pub fn new(
         ingester: Arc<str>,
-        table_name: Arc<str>,
         partition_id: PartitionId,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         parquet_max_sequence_number: Option<SequenceNumber>,
         tombstone_max_sequence_number: Option<SequenceNumber>,
         partition_sort_key: Arc<Option<SortKey>>,
     ) -> Self {
         Self {
             ingester,
-            table_name,
             partition_id,
-            sequencer_id,
+            shard_id,
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
             partition_sort_key,
@@ -928,7 +957,6 @@ impl IngesterPartition {
 
         let chunk = IngesterChunk {
             chunk_id,
-            table_name: Arc::clone(&self.table_name),
             partition_id: self.partition_id,
             schema: expected_schema,
             partition_sort_key: Arc::clone(&self.partition_sort_key),
@@ -963,8 +991,8 @@ impl IngesterPartition {
         self.partition_id
     }
 
-    pub(crate) fn sequencer_id(&self) -> SequencerId {
-        self.sequencer_id
+    pub(crate) fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     pub(crate) fn parquet_max_sequence_number(&self) -> Option<SequenceNumber> {
@@ -987,7 +1015,6 @@ impl IngesterPartition {
 #[derive(Debug, Clone)]
 pub struct IngesterChunk {
     chunk_id: ChunkId,
-    table_name: Arc<str>,
     partition_id: PartitionId,
     schema: Arc<Schema>,
 
@@ -1011,11 +1038,31 @@ impl IngesterChunk {
             ..self
         }
     }
+
+    pub(crate) fn estimate_size(&self) -> usize {
+        self.batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|array| array.get_array_memory_size())
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.batches
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>()
+    }
 }
 
 impl QueryChunkMeta for IngesterChunk {
-    fn summary(&self) -> Option<Arc<TableSummary>> {
-        Some(Arc::clone(&self.summary))
+    fn summary(&self) -> Arc<TableSummary> {
+        Arc::clone(&self.summary)
     }
 
     fn schema(&self) -> Arc<Schema> {
@@ -1027,22 +1074,17 @@ impl QueryChunkMeta for IngesterChunk {
         self.partition_sort_key.as_ref().as_ref()
     }
 
-    fn partition_id(&self) -> Option<PartitionId> {
-        Some(self.partition_id)
+    fn partition_id(&self) -> PartitionId {
+        self.partition_id
     }
 
     fn sort_key(&self) -> Option<&SortKey> {
-        //Some(&self.sort_key)
         // Data is not sorted
         None
     }
 
     fn delete_predicates(&self) -> &[Arc<data_types::DeletePredicate>] {
         &[]
-    }
-
-    fn timestamp_min_max(&self) -> Option<TimestampMinMax> {
-        Some(self.ts_min_max)
     }
 }
 
@@ -1051,22 +1093,17 @@ impl QueryChunk for IngesterChunk {
         self.chunk_id
     }
 
-    fn table_name(&self) -> &str {
-        self.table_name.as_ref()
-    }
-
     fn may_contain_pk_duplicates(&self) -> bool {
-        // ingester runs dedup before creating the record batches so
-        // when the querier gets them they have no duplicates
-        false
+        // ingester just dumps data, may contain duplicates!
+        true
     }
 
     fn column_names(
         &self,
         _ctx: IOxSessionContext,
         _predicate: &Predicate,
-        _columns: Selection<'_>,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+        _columns: Projection<'_>,
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // TODO maybe some special handling?
         Ok(None)
     }
@@ -1076,31 +1113,13 @@ impl QueryChunk for IngesterChunk {
         _ctx: IOxSessionContext,
         _column_name: &str,
         _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, QueryChunkError> {
+    ) -> Result<Option<StringSet>, DataFusionError> {
         // TODO maybe some special handling?
         Ok(None)
     }
 
-    fn read_filter(
-        &self,
-        _ctx: IOxSessionContext,
-        predicate: &Predicate,
-        selection: Selection<'_>,
-    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, QueryChunkError> {
-        trace!(?predicate, ?selection, input_batches=?self.batches, "Reading data");
-
-        // Apply selection to in-memory batch
-        let batches = match self.schema.df_projection(selection)? {
-            None => self.batches.clone(),
-            Some(projection) => self
-                .batches
-                .iter()
-                .map(|batch| batch.project(&projection))
-                .collect::<std::result::Result<Vec<_>, ArrowError>>()?,
-        };
-        trace!(?predicate, ?selection, output_batches=?batches, input_batches=?self.batches, "Reading data");
-
-        Ok(Box::pin(MemoryStream::new(batches)))
+    fn data(&self) -> QueryChunkData {
+        QueryChunkData::RecordBatches(self.batches.clone())
     }
 
     fn chunk_type(&self) -> &str {
@@ -1111,6 +1130,10 @@ impl QueryChunk for IngesterChunk {
         // since this is always the 'most recent' chunk for this
         // partition, put it at the end
         ChunkOrder::new(i64::MAX)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -1186,9 +1209,13 @@ mod tests {
     use metric::Attributes;
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
     use schema::{builder::SchemaBuilder, InfluxFieldType};
-    use std::collections::{BTreeSet, HashMap};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        time::Duration,
+    };
     use test_helpers::assert_error;
-    use tokio::sync::Mutex;
+    use tokio::{runtime::Handle, sync::Mutex};
+    use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector};
 
     #[tokio::test]
     async fn test_flight_handshake_error() {
@@ -1234,7 +1261,8 @@ mod tests {
             )])
             .await,
         );
-        let ingester_conn = mock_flight_client.ingester_conn().await;
+        let mut ingester_conn = mock_flight_client.ingester_conn().await;
+        ingester_conn.backoff_config = BackoffConfig::default();
         let partitions = get_partitions(&ingester_conn, &[1]).await.unwrap();
         assert!(partitions.is_empty());
     }
@@ -1274,10 +1302,10 @@ mod tests {
         );
         let ingester_conn = mock_flight_client.ingester_conn().await;
 
-        // Sequencer ID 0 doesn't have an associated ingester address in the test setup
+        // Shard index 0 doesn't have an associated ingester address in the test setup
         assert_error!(
             get_partitions(&ingester_conn, &[0]).await,
-            Error::NoIngesterFoundForSequencer { .. },
+            Error::NoIngesterFoundForShard { .. },
         );
     }
 
@@ -1293,7 +1321,6 @@ mod tests {
                             partition_id: 1,
                             status: Some(PartitionStatus {
                                 parquet_max_sequence_number: None,
-                                tombstone_max_sequence_number: None,
                             }),
                         },
                     ))],
@@ -1308,7 +1335,7 @@ mod tests {
 
         let p = &partitions[0];
         assert_eq!(p.partition_id.get(), 1);
-        assert_eq!(p.sequencer_id.get(), 1);
+        assert_eq!(p.shard_id.get(), 1);
         assert_eq!(p.parquet_max_sequence_number, None);
         assert_eq!(p.tombstone_max_sequence_number, None);
         assert_eq!(p.chunks.len(), 0);
@@ -1349,7 +1376,6 @@ mod tests {
                                 partition_id: 1,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1359,7 +1385,6 @@ mod tests {
                                 partition_id: 2,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1369,7 +1394,6 @@ mod tests {
                                 partition_id: 1,
                                 status: Some(PartitionStatus {
                                     parquet_max_sequence_number: None,
-                                    tombstone_max_sequence_number: None,
                                 }),
                             },
                         )),
@@ -1424,7 +1448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flight_many_batches_no_sequencer() {
+    async fn test_flight_many_batches_no_shard() {
         let record_batch_1_1_1 = lp_to_record_batch("table foo=1 1");
         let record_batch_1_1_2 = lp_to_record_batch("table foo=2 2");
         let record_batch_1_2 = lp_to_record_batch("table bar=20,foo=2 2");
@@ -1449,7 +1473,6 @@ mod tests {
                                     partition_id: 1,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(11),
-                                        tombstone_max_sequence_number: Some(12),
                                     }),
                                 },
                             )),
@@ -1479,7 +1502,6 @@ mod tests {
                                     partition_id: 2,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(21),
-                                        tombstone_max_sequence_number: Some(22),
                                     }),
                                 },
                             )),
@@ -1504,7 +1526,6 @@ mod tests {
                                     partition_id: 3,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(31),
-                                        tombstone_max_sequence_number: Some(32),
                                     }),
                                 },
                             )),
@@ -1529,15 +1550,12 @@ mod tests {
 
         let p1 = &partitions[0];
         assert_eq!(p1.partition_id.get(), 1);
-        assert_eq!(p1.sequencer_id.get(), 1);
+        assert_eq!(p1.shard_id.get(), 1);
         assert_eq!(
             p1.parquet_max_sequence_number,
             Some(SequenceNumber::new(11))
         );
-        assert_eq!(
-            p1.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(12))
-        );
+        assert_eq!(p1.tombstone_max_sequence_number, None);
         assert_eq!(p1.chunks.len(), 2);
         assert_eq!(p1.chunks[0].schema().as_arrow(), schema_1_1);
         assert_eq!(p1.chunks[0].batches.len(), 2);
@@ -1549,15 +1567,12 @@ mod tests {
 
         let p2 = &partitions[1];
         assert_eq!(p2.partition_id.get(), 2);
-        assert_eq!(p2.sequencer_id.get(), 1);
+        assert_eq!(p2.shard_id.get(), 1);
         assert_eq!(
             p2.parquet_max_sequence_number,
             Some(SequenceNumber::new(21))
         );
-        assert_eq!(
-            p2.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(22))
-        );
+        assert_eq!(p2.tombstone_max_sequence_number, None);
         assert_eq!(p2.chunks.len(), 1);
         assert_eq!(p2.chunks[0].schema().as_arrow(), schema_2_1);
         assert_eq!(p2.chunks[0].batches.len(), 1);
@@ -1565,15 +1580,12 @@ mod tests {
 
         let p3 = &partitions[2];
         assert_eq!(p3.partition_id.get(), 3);
-        assert_eq!(p3.sequencer_id.get(), 2);
+        assert_eq!(p3.shard_id.get(), 2);
         assert_eq!(
             p3.parquet_max_sequence_number,
             Some(SequenceNumber::new(31))
         );
-        assert_eq!(
-            p3.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(32))
-        );
+        assert_eq!(p3.tombstone_max_sequence_number, None);
         assert_eq!(p3.chunks.len(), 1);
         assert_eq!(p3.chunks[0].schema().as_arrow(), schema_3_1);
         assert_eq!(p3.chunks[0].batches.len(), 1);
@@ -1581,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingester_metrics() {
+    async fn test_ingester_metrics_and_tracing() {
         let mock_flight_client = Arc::new(
             MockFlightClient::new([
                 ("addr1", Ok(MockQueryData { results: vec![] })),
@@ -1605,7 +1617,14 @@ mod tests {
             .await,
         );
         let ingester_conn = mock_flight_client.ingester_conn().await;
-        get_partitions(&ingester_conn, &[1, 2, 3, 4, 5]).await.ok();
+        let traces = Arc::new(RingBufferTraceCollector::new(100));
+        get_partitions_with_span(
+            &ingester_conn,
+            &[1, 2, 3, 4, 5],
+            Some(Span::root("root", Arc::clone(&traces) as _)),
+        )
+        .await
+        .unwrap_err();
 
         let histogram_error = mock_flight_client
             .catalog
@@ -1644,10 +1663,33 @@ mod tests {
 
         // we don't know how errors are propagated because the futures are polled unordered
         assert_eq!(hit_count_success + hit_count_cancelled, 4);
+
+        // check spans
+        let root_span = traces
+            .spans()
+            .into_iter()
+            .find(|s| s.name == "root")
+            .expect("root span not found");
+        assert_eq!(root_span.status, SpanStatus::Err);
+        let n_spans_err = traces
+            .spans()
+            .into_iter()
+            .filter(|s| (s.name == "flight request") && (s.status == SpanStatus::Err))
+            .count();
+        assert_eq!(n_spans_err, 1);
+        let n_spans_ok_or_cancelled = traces
+            .spans()
+            .into_iter()
+            .filter(|s| {
+                (s.name == "flight request")
+                    && ((s.status == SpanStatus::Ok) || (s.status == SpanStatus::Unknown))
+            })
+            .count();
+        assert_eq!(n_spans_ok_or_cancelled, 4);
     }
 
     #[tokio::test]
-    async fn test_flight_per_sequencer_querying() {
+    async fn test_flight_per_shard_querying() {
         let record_batch_1_1 = lp_to_record_batch("table foo=1 1");
         let schema_1_1 = record_batch_1_1.schema();
 
@@ -1663,7 +1705,6 @@ mod tests {
                                     partition_id: 1,
                                     status: Some(PartitionStatus {
                                         parquet_max_sequence_number: Some(11),
-                                        tombstone_max_sequence_number: Some(12),
                                     }),
                                 },
                             )),
@@ -1691,46 +1732,46 @@ mod tests {
         );
         let ingester_conn = mock_flight_client.ingester_conn().await;
 
-        // Only use sequencer ID 1, which will correspond to only querying the ingester at
+        // Only use shard index 1, which will correspond to only querying the ingester at
         // "addr1"
         let partitions = get_partitions(&ingester_conn, &[1]).await.unwrap();
         assert_eq!(partitions.len(), 1);
 
         let p1 = &partitions[0];
         assert_eq!(p1.partition_id.get(), 1);
-        assert_eq!(p1.sequencer_id.get(), 1);
+        assert_eq!(p1.shard_id.get(), 1);
         assert_eq!(
             p1.parquet_max_sequence_number,
             Some(SequenceNumber::new(11))
         );
-        assert_eq!(
-            p1.tombstone_max_sequence_number,
-            Some(SequenceNumber::new(12))
-        );
+        assert_eq!(p1.tombstone_max_sequence_number, None);
         assert_eq!(p1.chunks.len(), 1);
     }
 
     async fn get_partitions(
         ingester_conn: &IngesterConnectionImpl,
-        sequencer_ids: &[i32],
+        shard_indexes: &[i32],
     ) -> Result<Vec<IngesterPartition>, Error> {
-        let sequencer_ids: Vec<_> = sequencer_ids
-            .iter()
-            .copied()
-            .map(KafkaPartition::new)
-            .collect();
-        let namespace = Arc::from("namespace");
-        let table = Arc::from("table");
+        get_partitions_with_span(ingester_conn, shard_indexes, None).await
+    }
+
+    async fn get_partitions_with_span(
+        ingester_conn: &IngesterConnectionImpl,
+        shard_indexes: &[i32],
+        span: Option<Span>,
+    ) -> Result<Vec<IngesterPartition>, Error> {
         let columns = vec![String::from("col")];
         let schema = schema();
+        let shard_indexes: Vec<_> = shard_indexes.iter().copied().map(ShardIndex::new).collect();
         ingester_conn
             .partitions(
-                &sequencer_ids,
-                namespace,
-                table,
+                &shard_indexes,
+                NamespaceId::new(1),
+                TableId::new(2),
                 columns,
                 &Predicate::default(),
                 schema,
+                span,
             )
             .await
     }
@@ -1748,7 +1789,7 @@ mod tests {
     }
 
     fn lp_to_record_batch(lp: &str) -> RecordBatch {
-        lp_to_mutable_batch(lp).1.to_arrow(Selection::All).unwrap()
+        lp_to_mutable_batch(lp).1.to_arrow(Projection::All).unwrap()
     }
 
     #[derive(Debug)]
@@ -1780,15 +1821,15 @@ mod tests {
             responses: [(&'static str, Result<MockQueryData, FlightClientError>); N],
         ) -> Self {
             let catalog = TestCatalog::new();
-            let ns = catalog.create_namespace("namespace").await;
+            let ns = catalog.create_namespace_1hr_retention("namespace").await;
             let table = ns.create_table("table").await;
 
-            let s0 = ns.create_sequencer(0).await;
-            let s1 = ns.create_sequencer(1).await;
+            let s0 = ns.create_shard(0).await;
+            let s1 = ns.create_shard(1).await;
 
-            table.with_sequencer(&s0).create_partition("k1").await;
-            table.with_sequencer(&s0).create_partition("k2").await;
-            table.with_sequencer(&s1).create_partition("k3").await;
+            table.with_shard(&s0).create_partition("k1").await;
+            table.with_shard(&s0).create_partition("k2").await;
+            table.with_shard(&s1).create_partition("k3").await;
 
             Self {
                 catalog,
@@ -1801,32 +1842,39 @@ mod tests {
             }
         }
 
-        // Assign one sequencer per address, sorted consistently.
-        // Don't assign any addresses to sequencer ID 0 to test error case
+        // Assign one shard per address, sorted consistently.
+        // Don't assign any addresses to shard index 0 to test error case
         async fn ingester_conn(self: &Arc<Self>) -> IngesterConnectionImpl {
             let ingester_addresses: BTreeSet<_> =
                 self.responses.lock().await.keys().cloned().collect();
 
-            let sequencer_to_ingesters = ingester_addresses
+            let shard_to_ingesters = ingester_addresses
                 .into_iter()
                 .enumerate()
-                .map(|(sequencer_id, ingester_address)| {
+                .map(|(shard_index, ingester_address)| {
                     (
-                        sequencer_id as i32 + 1,
+                        ShardIndex::new(shard_index as i32 + 1),
                         IngesterMapping::Addr(Arc::from(ingester_address.as_str())),
                     )
                 })
                 .collect();
 
-            IngesterConnectionImpl::by_sequencer_with_flight_client(
-                sequencer_to_ingesters,
+            IngesterConnectionImpl::by_shard_with_flight_client(
+                shard_to_ingesters,
                 Arc::clone(self) as _,
                 Arc::new(CatalogCache::new_testing(
                     self.catalog.catalog(),
                     self.catalog.time_provider(),
                     self.catalog.metric_registry(),
-                    usize::MAX,
+                    self.catalog.object_store(),
+                    &Handle::current(),
                 )),
+                BackoffConfig {
+                    init_backoff: Duration::from_secs(1),
+                    max_backoff: Duration::from_secs(2),
+                    base: 1.1,
+                    deadline: Some(Duration::from_millis(500)),
+                },
             )
         }
     }
@@ -1837,6 +1885,7 @@ mod tests {
             &self,
             ingester_address: Arc<str>,
             _request: IngesterQueryRequest,
+            _span_context: Option<SpanContext>,
         ) -> Result<Box<dyn QueryData>, FlightClientError> {
             self.responses
                 .lock()
@@ -1864,9 +1913,8 @@ mod tests {
             // Construct a partition and ensure it doesn't error
             let ingester_partition = IngesterPartition::new(
                 "ingester".into(),
-                "table".into(),
                 PartitionId::new(1),
-                SequencerId::new(1),
+                ShardId::new(1),
                 parquet_max_sequence_number,
                 tombstone_max_sequence_number,
                 Arc::new(None),
@@ -1885,6 +1933,7 @@ mod tests {
         let expected_schema = Arc::new(
             SchemaBuilder::new()
                 .field("b", DataType::Boolean)
+                .unwrap()
                 .timestamp()
                 .build()
                 .unwrap(),
@@ -1897,9 +1946,8 @@ mod tests {
         let tombstone_max_sequence_number = None;
         let err = IngesterPartition::new(
             "ingester".into(),
-            "table".into(),
             PartitionId::new(1),
-            SequencerId::new(1),
+            ShardId::new(1),
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
             Arc::new(None),

@@ -32,12 +32,6 @@ type Dictionary = arrow_util::dictionary::StringDictionary<DID>;
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
-    #[snafu(display("Unable to insert {} type into a column of {}", inserted, existing,))]
-    TypeMismatch {
-        existing: InfluxColumnType,
-        inserted: InfluxColumnType,
-    },
-
     #[snafu(display(
         "Invalid null mask, expected to be {} bytes but was {}",
         expected_bytes,
@@ -79,12 +73,12 @@ pub enum ColumnData {
 impl std::fmt::Display for ColumnData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ColumnData::F64(col_data, _) => write!(f, "F64({})", col_data.len()),
-            ColumnData::I64(col_data, _) => write!(f, "I64({})", col_data.len()),
-            ColumnData::U64(col_data, _) => write!(f, "U64({})", col_data.len()),
-            ColumnData::String(col_data, _) => write!(f, "String({})", col_data.len()),
-            ColumnData::Bool(col_data, _) => write!(f, "Bool({})", col_data.len()),
-            ColumnData::Tag(col_data, dictionary, _) => write!(
+            Self::F64(col_data, _) => write!(f, "F64({})", col_data.len()),
+            Self::I64(col_data, _) => write!(f, "I64({})", col_data.len()),
+            Self::U64(col_data, _) => write!(f, "U64({})", col_data.len()),
+            Self::String(col_data, _) => write!(f, "String({})", col_data.len()),
+            Self::Bool(col_data, _) => write!(f, "Bool({})", col_data.len()),
+            Self::Tag(col_data, dictionary, _) => write!(
                 f,
                 "Tag(keys:{},values:{})",
                 col_data.len(),

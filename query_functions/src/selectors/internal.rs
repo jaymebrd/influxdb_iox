@@ -11,15 +11,18 @@ use std::fmt::Debug;
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-        TimestampNanosecondArray,
+        TimestampNanosecondArray, UInt64Array,
     },
     compute::kernels::aggregate::{
         max as array_max, max_boolean as array_max_boolean, max_string as array_max_string,
         min as array_min, min_boolean as array_min_boolean, min_string as array_min_string,
     },
-    datatypes::DataType,
+    datatypes::{DataType, Field},
 };
-use datafusion::{error::Result as DataFusionResult, scalar::ScalarValue};
+use datafusion::{
+    error::Result as DataFusionResult, logical_expr::AggregateState, scalar::ScalarValue,
+};
+
 use observability_deps::tracing::debug;
 
 use super::{Selector, SelectorOutput};
@@ -41,6 +44,12 @@ impl LtVal<Self> for f64 {
 }
 
 impl LtVal<Self> for i64 {
+    fn lt_val(&self, v: &Self) -> bool {
+        self < v
+    }
+}
+
+impl LtVal<Self> for u64 {
     fn lt_val(&self, v: &Self) -> bool {
         self < v
     }
@@ -82,6 +91,12 @@ impl ToState<Self> for i64 {
     }
 }
 
+impl ToState<Self> for u64 {
+    fn to_state(&self) -> Self {
+        *self
+    }
+}
+
 impl ToState<Self> for bool {
     fn to_state(&self) -> Self {
         *self
@@ -92,6 +107,15 @@ impl ToState<String> for &str {
     fn to_state(&self) -> String {
         (*self).to_owned()
     }
+}
+
+fn make_scalar_struct(data_fields: Vec<ScalarValue>) -> ScalarValue {
+    let fields = vec![
+        Field::new("value", data_fields[0].get_datatype(), true),
+        Field::new("time", data_fields[1].get_datatype(), true),
+    ];
+
+    ScalarValue::Struct(Some(data_fields), Box::new(fields))
 }
 
 macro_rules! make_first_selector {
@@ -116,10 +140,10 @@ macro_rules! make_first_selector {
                 $ARROWTYPE
             }
 
-            fn datafusion_state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+            fn datafusion_state(&self) -> DataFusionResult<Vec<AggregateState>> {
                 Ok(vec![
-                    $TO_SCALARVALUE(self.value.clone()),
-                    ScalarValue::TimestampNanosecond(self.time, None),
+                    AggregateState::Scalar($TO_SCALARVALUE(self.value.clone())),
+                    AggregateState::Scalar(ScalarValue::TimestampNanosecond(self.time, None)),
                 ])
             }
 
@@ -127,6 +151,10 @@ macro_rules! make_first_selector {
                 match output {
                     SelectorOutput::Value => Ok($TO_SCALARVALUE(self.value.clone())),
                     SelectorOutput::Time => Ok(ScalarValue::TimestampNanosecond(self.time, None)),
+                    SelectorOutput::Struct => Ok(make_scalar_struct(vec![
+                        $TO_SCALARVALUE(self.value.clone()),
+                        ScalarValue::TimestampNanosecond(self.time, None),
+                    ])),
                 }
             }
 
@@ -223,10 +251,10 @@ macro_rules! make_last_selector {
                 $ARROWTYPE
             }
 
-            fn datafusion_state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+            fn datafusion_state(&self) -> DataFusionResult<Vec<AggregateState>> {
                 Ok(vec![
-                    $TO_SCALARVALUE(self.value.clone()),
-                    ScalarValue::TimestampNanosecond(self.time, None),
+                    AggregateState::Scalar($TO_SCALARVALUE(self.value.clone())),
+                    AggregateState::Scalar(ScalarValue::TimestampNanosecond(self.time, None)),
                 ])
             }
 
@@ -234,6 +262,10 @@ macro_rules! make_last_selector {
                 match output {
                     SelectorOutput::Value => Ok($TO_SCALARVALUE(self.value.clone())),
                     SelectorOutput::Time => Ok(ScalarValue::TimestampNanosecond(self.time, None)),
+                    SelectorOutput::Struct => Ok(make_scalar_struct(vec![
+                        $TO_SCALARVALUE(self.value.clone()),
+                        ScalarValue::TimestampNanosecond(self.time, None),
+                    ])),
                 }
             }
 
@@ -354,10 +386,10 @@ macro_rules! make_min_selector {
                 $ARROWTYPE
             }
 
-            fn datafusion_state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+            fn datafusion_state(&self) -> DataFusionResult<Vec<AggregateState>> {
                 Ok(vec![
-                    $TO_SCALARVALUE(self.value.clone()),
-                    ScalarValue::TimestampNanosecond(self.time, None),
+                    AggregateState::Scalar($TO_SCALARVALUE(self.value.clone())),
+                    AggregateState::Scalar(ScalarValue::TimestampNanosecond(self.time, None)),
                 ])
             }
 
@@ -365,6 +397,10 @@ macro_rules! make_min_selector {
                 match output {
                     SelectorOutput::Value => Ok($TO_SCALARVALUE(self.value.clone())),
                     SelectorOutput::Time => Ok(ScalarValue::TimestampNanosecond(self.time, None)),
+                    SelectorOutput::Struct => Ok(make_scalar_struct(vec![
+                        $TO_SCALARVALUE(self.value.clone()),
+                        ScalarValue::TimestampNanosecond(self.time, None),
+                    ])),
                 }
             }
 
@@ -466,10 +502,10 @@ macro_rules! make_max_selector {
                 $ARROWTYPE
             }
 
-            fn datafusion_state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+            fn datafusion_state(&self) -> DataFusionResult<Vec<AggregateState>> {
                 Ok(vec![
-                    $TO_SCALARVALUE(self.value.clone()),
-                    ScalarValue::TimestampNanosecond(self.time, None),
+                    AggregateState::Scalar($TO_SCALARVALUE(self.value.clone())),
+                    AggregateState::Scalar(ScalarValue::TimestampNanosecond(self.time, None)),
                 ])
             }
 
@@ -477,6 +513,10 @@ macro_rules! make_max_selector {
                 match output {
                     SelectorOutput::Value => Ok($TO_SCALARVALUE(self.value.clone())),
                     SelectorOutput::Time => Ok(ScalarValue::TimestampNanosecond(self.time, None)),
+                    SelectorOutput::Struct => Ok(make_scalar_struct(vec![
+                        $TO_SCALARVALUE(self.value.clone()),
+                        ScalarValue::TimestampNanosecond(self.time, None),
+                    ])),
                 }
             }
 
@@ -576,6 +616,14 @@ make_first_selector!(
     ScalarValue::Int64
 );
 make_first_selector!(
+    U64FirstSelector,
+    u64,
+    DataType::UInt64,
+    UInt64Array,
+    array_min,
+    ScalarValue::UInt64
+);
+make_first_selector!(
     Utf8FirstSelector,
     String,
     DataType::Utf8,
@@ -609,6 +657,14 @@ make_last_selector!(
     Int64Array,
     array_max,
     ScalarValue::Int64
+);
+make_last_selector!(
+    U64LastSelector,
+    u64,
+    DataType::UInt64,
+    UInt64Array,
+    array_max,
+    ScalarValue::UInt64
 );
 make_last_selector!(
     Utf8LastSelector,
@@ -646,6 +702,14 @@ make_min_selector!(
     ScalarValue::Int64
 );
 make_min_selector!(
+    U64MinSelector,
+    u64,
+    DataType::UInt64,
+    UInt64Array,
+    array_min,
+    ScalarValue::UInt64
+);
+make_min_selector!(
     Utf8MinSelector,
     String,
     DataType::Utf8,
@@ -679,6 +743,14 @@ make_max_selector!(
     Int64Array,
     array_max,
     ScalarValue::Int64
+);
+make_max_selector!(
+    U64MaxSelector,
+    u64,
+    DataType::UInt64,
+    UInt64Array,
+    array_max,
+    ScalarValue::UInt64
 );
 make_max_selector!(
     Utf8MaxSelector,

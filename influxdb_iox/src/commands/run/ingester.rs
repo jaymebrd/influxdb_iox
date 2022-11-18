@@ -67,7 +67,7 @@ pub struct Config {
 
     /// Number of threads to use for the ingester query execution, compaction and persistence.
     #[clap(
-        long = "--query-exec-thread-count",
+        long = "query-exec-thread-count",
         env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
         default_value = "4",
         action
@@ -93,7 +93,7 @@ pub async fn command(config: Config) -> Result<()> {
     let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
         Arc::clone(&time_provider),
-        &*metric_registry,
+        &metric_registry,
     ));
 
     let exec = Arc::new(Executor::new(config.query_exec_thread_count));

@@ -1,3 +1,5 @@
+use client_util::connection::GrpcConnection;
+
 use self::generated_types::{write_info_service_client::WriteInfoServiceClient, *};
 
 use crate::connection::Connection;
@@ -7,7 +9,7 @@ use crate::error::Error;
 pub mod generated_types {
     pub use generated_types::influxdata::iox::ingester::v1::{
         write_info_service_client, write_info_service_server, GetWriteInfoRequest,
-        GetWriteInfoResponse, KafkaPartitionInfo, KafkaPartitionStatus,
+        GetWriteInfoResponse, ShardInfo, ShardStatus,
     };
     pub use generated_types::write_info::merge_responses;
 }
@@ -22,14 +24,14 @@ pub mod generated_types {
 /// <https://github.com/influxdata/influxdb_iox/issues/4354>
 #[derive(Debug, Clone)]
 pub struct Client {
-    inner: WriteInfoServiceClient<Connection>,
+    inner: WriteInfoServiceClient<GrpcConnection>,
 }
 
 impl Client {
     /// Creates a new client with the provided connection
-    pub fn new(channel: Connection) -> Self {
+    pub fn new(connection: Connection) -> Self {
         Self {
-            inner: WriteInfoServiceClient::new(channel),
+            inner: WriteInfoServiceClient::new(connection.into_grpc_connection()),
         }
     }
 

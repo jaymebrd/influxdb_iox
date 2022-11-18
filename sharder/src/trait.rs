@@ -1,5 +1,5 @@
-use data_types::DatabaseName;
-use std::fmt::Debug;
+use data_types::NamespaceName;
+use std::{fmt::Debug, sync::Arc};
 
 /// A [`Sharder`] implementation is responsible for mapping an opaque payload
 /// for a given table name & namespace to an output type.
@@ -10,14 +10,46 @@ use std::fmt::Debug;
 /// sharding.
 ///
 /// NOTE: It is a system invariant that deletes are routed to (all of) the same
-/// sequencers as a write for the same table.
+/// shards as a write for the same table.
 pub trait Sharder<P>: Debug + Send + Sync {
     /// The type returned by a sharder.
     ///
-    /// This could be a shard ID, a sequencer, an array of multiple sequencers,
+    /// This could be a shard ID, a shard index, an array of multiple shards,
     /// etc.
     type Item: Debug + Send + Sync;
 
     /// Map the specified `payload` to a shard.
-    fn shard(&self, table: &str, namespace: &DatabaseName<'_>, payload: &P) -> Self::Item;
+    fn shard(&self, table: &str, namespace: &NamespaceName<'_>, payload: &P) -> Self::Item;
+}
+
+impl<T, P> Sharder<P> for Arc<T>
+where
+    T: Sharder<P>,
+{
+    type Item = T::Item;
+
+    fn shard(&self, table: &str, namespace: &NamespaceName<'_>, payload: &P) -> Self::Item {
+        (**self).shard(table, namespace, payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mutable_batch::MutableBatch;
+
+    use crate::JumpHash;
+
+    use super::*;
+
+    #[test]
+    fn test_arc_wrapped_sharder() {
+        let hasher: Arc<dyn Sharder<MutableBatch, Item = Arc<u32>>> =
+            Arc::new(JumpHash::new((0..10_u32).map(Arc::new)));
+
+        let _ = hasher.shard(
+            "table",
+            &NamespaceName::try_from("namespace").unwrap(),
+            &MutableBatch::default(),
+        );
+    }
 }

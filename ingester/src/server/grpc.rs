@@ -1,8 +1,8 @@
 //! gRPC service implementations for `ingester`.
 
 use crate::{
-    data::{FlatIngesterQueryResponse, FlatIngesterQueryResponseStream},
     handler::IngestHandler,
+    querier_handler::{FlatIngesterQueryResponse, FlatIngesterQueryResponseStream},
 };
 use arrow::error::ArrowError;
 use arrow_flight::{
@@ -10,15 +10,21 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, IpcMessage, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
+use data_types::{NamespaceId, TableId};
 use flatbuffers::FlatBufferBuilder;
 use futures::Stream;
-use generated_types::influxdata::iox::ingester::v1::{
-    self as proto,
-    write_info_service_server::{WriteInfoService, WriteInfoServiceServer},
+use generated_types::influxdata::iox::{
+    catalog::v1::*,
+    ingester::v1::{
+        self as proto,
+        write_info_service_server::{WriteInfoService, WriteInfoServiceServer},
+    },
 };
-use observability_deps::tracing::{info, warn};
+use iox_catalog::interface::Catalog;
+use observability_deps::tracing::*;
 use pin_project::pin_project;
 use prost::Message;
+use service_grpc_catalog::CatalogService;
 use snafu::{ResultExt, Snafu};
 use std::{
     pin::Pin,
@@ -29,13 +35,13 @@ use std::{
     task::Poll,
 };
 use tonic::{Request, Response, Streaming};
-use trace::ctx::SpanContext;
+use trace::{ctx::SpanContext, span::SpanExt};
 use write_summary::WriteSummary;
 
-/// This type is responsible for managing all gRPC services exposed by
-/// `ingester`.
-#[derive(Debug, Default)]
+/// This type is responsible for managing all gRPC services exposed by `ingester`.
+#[derive(Debug)]
 pub struct GrpcDelegate<I: IngestHandler> {
+    catalog: Arc<dyn Catalog>,
     ingest_handler: Arc<I>,
 
     /// How many `do_get` flight requests should panic for testing purposes.
@@ -45,10 +51,14 @@ pub struct GrpcDelegate<I: IngestHandler> {
 }
 
 impl<I: IngestHandler + Send + Sync + 'static> GrpcDelegate<I> {
-    /// Initialise a new [`GrpcDelegate`] passing valid requests to the
-    /// specified `ingest_handler`.
-    pub fn new(ingest_handler: Arc<I>, test_flight_do_get_panic: Arc<AtomicU64>) -> Self {
+    /// Initialise a new [`GrpcDelegate`] passing valid requests to the specified `ingest_handler`.
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        ingest_handler: Arc<I>,
+        test_flight_do_get_panic: Arc<AtomicU64>,
+    ) -> Self {
         Self {
+            catalog,
             ingest_handler,
             test_flight_do_get_panic,
         }
@@ -67,6 +77,18 @@ impl<I: IngestHandler + Send + Sync + 'static> GrpcDelegate<I> {
         WriteInfoServiceServer::new(WriteInfoServiceImpl::new(
             Arc::clone(&self.ingest_handler) as _
         ))
+    }
+
+    /// Acquire a [`CatalogService`] gRPC service implementation.
+    ///
+    /// [`CatalogService`]: generated_types::influxdata::iox::catalog::v1::catalog_service_server::CatalogService.
+    pub fn catalog_service(
+        &self,
+    ) -> catalog_service_server::CatalogServiceServer<impl catalog_service_server::CatalogService>
+    {
+        catalog_service_server::CatalogServiceServer::new(CatalogService::new(Arc::clone(
+            &self.catalog,
+        )))
     }
 }
 
@@ -92,27 +114,27 @@ impl WriteInfoService for WriteInfoServiceImpl {
         let write_summary =
             WriteSummary::try_from_token(&write_token).map_err(tonic::Status::invalid_argument)?;
 
-        let progresses = self
-            .handler
-            .progresses(write_summary.kafka_partitions())
-            .await;
+        let progresses = self.handler.progresses(write_summary.shard_indexes()).await;
 
-        let kafka_partition_infos = progresses
+        let shard_infos = progresses
             .into_iter()
-            .map(|(kafka_partition_id, progress)| {
+            .map(|(shard_index, progress)| {
                 let status = write_summary
-                    .write_status(kafka_partition_id, &progress)
+                    .write_status(shard_index, &progress)
                     .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
-                Ok(proto::KafkaPartitionInfo {
-                    kafka_partition_id: kafka_partition_id.get(),
-                    status: proto::KafkaPartitionStatus::from(status).into(),
+                let shard_index = shard_index.get();
+                let status = proto::ShardStatus::from(status);
+                debug!(shard_index, ?status, "write info status",);
+                Ok(proto::ShardInfo {
+                    shard_index,
+                    status: status.into(),
                 })
             })
             .collect::<Result<Vec<_>, tonic::Status>>()?;
 
         Ok(tonic::Response::new(proto::GetWriteInfoResponse {
-            kafka_partition_infos,
+            shard_infos,
         }))
     }
 }
@@ -136,20 +158,17 @@ pub enum Error {
         source: Box<crate::querier_handler::Error>,
     },
 
-    #[snafu(display(
-        "No Namespace Data found for the given namespace name {}",
-        namespace_name,
-    ))]
-    NamespaceNotFound { namespace_name: String },
+    #[snafu(display("No Namespace Data found for the given namespace ID {}", namespace_id,))]
+    NamespaceNotFound { namespace_id: NamespaceId },
 
     #[snafu(display(
-        "No Table Data found for the given namespace name {}, table name {}",
-        namespace_name,
-        table_name
+        "No Table Data found for the given namespace ID {}, table ID {}",
+        namespace_id,
+        table_id
     ))]
     TableNotFound {
-        namespace_name: String,
-        table_name: String,
+        namespace_id: NamespaceId,
+        table_id: TableId,
     },
 
     #[snafu(display("Error while streaming query results: {}", source))]
@@ -171,12 +190,10 @@ impl From<Error> for tonic::Status {
             | Error::Query { .. }
             | Error::NamespaceNotFound { .. }
             | Error::TableNotFound { .. } => {
-                // TODO(edd): this should be `debug`. Keeping at info whilst IOx still in early
-                // development
-                info!(?err, msg)
+                debug!(e=%err, msg)
             }
             Error::QueryStream { .. } | Error::Serialization { .. } => {
-                warn!(?err, msg)
+                warn!(e=%err, msg)
             }
         }
         err.to_status()
@@ -258,7 +275,7 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
-        let _span_ctx: Option<SpanContext> = request.extensions().get().cloned();
+        let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let ticket = request.into_inner();
 
         let proto_query_request =
@@ -270,25 +287,25 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
 
         self.maybe_panic_in_flight_do_get();
 
-        let query_response =
-            self.ingest_handler
-                .query(query_request)
-                .await
-                .map_err(|e| match e {
-                    crate::querier_handler::Error::NamespaceNotFound { namespace_name } => {
-                        Error::NamespaceNotFound { namespace_name }
-                    }
-                    crate::querier_handler::Error::TableNotFound {
-                        namespace_name,
-                        table_name,
-                    } => Error::TableNotFound {
-                        namespace_name,
-                        table_name,
-                    },
-                    _ => Error::Query {
-                        source: Box::new(e),
-                    },
-                })?;
+        let query_response = self
+            .ingest_handler
+            .query(query_request, span_ctx.child_span("ingest handler query"))
+            .await
+            .map_err(|e| match e {
+                crate::querier_handler::Error::NamespaceNotFound { namespace_id } => {
+                    Error::NamespaceNotFound { namespace_id }
+                }
+                crate::querier_handler::Error::TableNotFound {
+                    namespace_id,
+                    table_id,
+                } => Error::TableNotFound {
+                    namespace_id,
+                    table_id,
+                },
+                _ => Error::Query {
+                    source: Box::new(e),
+                },
+            })?;
 
         let output = GetStream::new(query_response.flatten());
 
@@ -408,9 +425,6 @@ impl Stream for GetStream {
                             parquet_max_sequence_number: status
                                 .parquet_max_sequence_number
                                 .map(|x| x.get()),
-                            tombstone_max_sequence_number: status
-                                .tombstone_max_sequence_number
-                                .map(|x| x.get()),
                         }),
                     };
                     prost::Message::encode(&app_metadata, &mut bytes)
@@ -463,9 +477,9 @@ mod tests {
     use data_types::PartitionId;
     use futures::StreamExt;
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
-    use schema::selection::Selection;
+    use schema::Projection;
 
-    use crate::data::PartitionStatus;
+    use crate::querier_handler::PartitionStatus;
 
     use super::*;
 
@@ -478,7 +492,7 @@ mod tests {
     async fn test_get_stream_all_types() {
         let batch = lp_to_mutable_batch("table z=1 0")
             .1
-            .to_arrow(Selection::All)
+            .to_arrow(Projection::All)
             .unwrap();
         let schema = batch.schema();
 
@@ -488,7 +502,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
                 Ok(FlatIngesterQueryResponse::StartSnapshot { schema }),
@@ -501,7 +514,6 @@ mod tests {
                         partition_id: 1,
                         status: Some(proto::PartitionStatus {
                             parquet_max_sequence_number: None,
-                            tombstone_max_sequence_number: None,
                         }),
                     },
                 }),
@@ -526,7 +538,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
                 Err(ArrowError::IoError("foo".into())),
@@ -534,7 +545,6 @@ mod tests {
                     partition_id: PartitionId::new(1),
                     status: PartitionStatus {
                         parquet_max_sequence_number: None,
-                        tombstone_max_sequence_number: None,
                     },
                 }),
             ],
@@ -545,7 +555,6 @@ mod tests {
                         partition_id: 1,
                         status: Some(proto::PartitionStatus {
                             parquet_max_sequence_number: None,
-                            tombstone_max_sequence_number: None,
                         }),
                     },
                 }),
@@ -559,7 +568,7 @@ mod tests {
     async fn test_get_stream_dictionary_batches() {
         let batch = lp_to_mutable_batch("table,x=\"foo\",y=\"bar\" z=1 0")
             .1
-            .to_arrow(Selection::All)
+            .to_arrow(Projection::All)
             .unwrap();
 
         assert_get_stream(

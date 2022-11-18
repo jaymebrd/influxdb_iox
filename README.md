@@ -74,22 +74,9 @@ Follow the instructions for your operating system on the `rustup` site.
 
 `rustup` will check the [`rust-toolchain`](./rust-toolchain.toml) file and automatically install and use the correct Rust version for you.
 
-#### Clang
+#### C/C++ Compiler
 
-Building InfluxDB IOx requires `clang` (for the [`croaring`] dependency).
-Check for `clang` by running `clang --version`.
-
-```shell
-clang --version
-Apple clang version 12.0.0 (clang-1200.0.32.27)
-Target: x86_64-apple-darwin20.1.0
-Thread model: posix
-InstalledDir: /Library/Developer/CommandLineTools/usr/bin
-```
-
-If `clang` is not already present, it can typically be installed with the system package manager.
-
-[`croaring`]: https://github.com/saulius/croaring-rs
+You need some C/C++ compiler for some non-Rust dependencies like [`zstd`](https://crates.io/crates/zstd).
 
 #### lld
 
@@ -106,34 +93,8 @@ If `lld` is not already present, it can typically be installed with the system p
 
 #### protoc
 
-If you are building InfluxDB IOx on Apple Silicon you may find that the build fails with an error containing:
-
-```shell
-failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): Bad CPU type in executable (os error 86)
-```
-
-Prost bundles a `protoc` binary, which it uses if it cannot find a system alternative.
-Prior to version 0.9, the binary it chooses with the above error is an `x86` one, which won't work if you do not have Rosetta installed on your system.
-
-You can install Rosetta by running:
-
-```shell
-softwareupdate --install-rosetta
-```
-
-An alternative to installing Rosetta is to point Prost at an `arm` build of `protoc`.
-First, install `protoc`, e.g., via Homebrew:
-
-```shell
-brew update && brew install protobuf
-```
-
-Then set the following environment variables to point Prost at your system install:
-
-```shell
-PROTOC=/opt/homebrew/bin/protoc
-PROTOC_INCLUDE=/opt/homebrew/include
-```
+Prost no longer bundles a `protoc` binary.
+For instructions on how to install `protoc`, refer to the [official gRPC documentation](https://grpc.io/docs/protoc-installation/).
 
 IOx should then build correctly.
 
@@ -274,15 +235,15 @@ See  [docs/testing.md] for more information
 
 Data can be written to InfluxDB IOx by sending [line protocol] format to the `/api/v2/write` endpoint or using the CLI.
 
-For example, assuming you are running in local mode, this command will send data in the `test_fixtures/lineproto/metrics.lp` file to the `company_sensors` database.
+For example, assuming you are running in local mode, this command will send data in the `test_fixtures/lineproto/metrics.lp` file to the `company_sensors` namespace.
 
 ```shell
-./target/debug/influxdb_iox -vv write company_sensors test_fixtures/lineproto/metrics.lp --host http://localhost:8081
+./target/debug/influxdb_iox -vv write company_sensors test_fixtures/lineproto/metrics.lp --host http://localhost:8080
 ```
 
-Note that `--host http://localhost:8081` is required because the router and query services run on different gRPC ports and the CLI defaults to the querier's port, `8082`.
+Note that `--host http://localhost:8080` is required as the `/v2/api` endpoint is hosted on port `8080` while the default is the querier gRPC port `8082`.
 
-To query the data stored in the `company_sensors` database:
+To query the data stored in the `company_sensors` namespace:
 
 ```shell
 ./target/debug/influxdb_iox query company_sensors "SELECT * FROM cpu LIMIT 10"

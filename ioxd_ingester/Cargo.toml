@@ -1,7 +1,9 @@
 [package]
 name = "ioxd_ingester"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # Workspace dependencies, in alphabetical order
@@ -11,7 +13,7 @@ ingester = { path = "../ingester" }
 iox_catalog = { path = "../iox_catalog" }
 ioxd_common = { path = "../ioxd_common" }
 metric = { path = "../metric" }
-object_store = "0.3.0"
+object_store = "0.5.1"
 iox_query = { path = "../iox_query" }
 trace = { path = "../trace" }
 write_buffer = { path = "../write_buffer" }
@@ -19,5 +21,5 @@ write_buffer = { path = "../write_buffer" }
 # Crates.io dependencies, in alphabetical order
 async-trait = "0.1"
 hyper = "0.14"
-thiserror = "1.0.31"
+thiserror = "1.0.37"
 workspace-hack = { path = "../workspace-hack"}

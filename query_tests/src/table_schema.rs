@@ -2,7 +2,7 @@
 
 use arrow::datatypes::DataType;
 use iox_query::QueryChunk;
-use schema::selection::Selection;
+use schema::Projection;
 use schema::{builder::SchemaBuilder, sort::SortKey, Schema, TIME_COLUMN_NAME};
 
 use super::scenarios::*;
@@ -14,7 +14,7 @@ use super::scenarios::*;
 /// output
 async fn run_table_schema_test_case<D>(
     db_setup: D,
-    selection: Selection<'_>,
+    selection: Projection<'_>,
     table_name: &str,
     expected_schema: Schema,
     expected_sort_key: Option<&SortKey>,
@@ -33,40 +33,31 @@ async fn run_table_schema_test_case<D>(
             table_name, selection
         );
 
-        // Make sure at least one table has data
-        let mut chunks_with_table = 0;
-
+        let ctx = db.new_query_context(None);
         let chunks = db
-            .chunks(table_name, &Default::default())
+            .chunks(table_name, &Default::default(), &None, ctx)
             .await
             .expect("error getting chunks");
         for chunk in chunks {
-            if chunk.table_name() == table_name {
-                chunks_with_table += 1;
-                let actual_schema = chunk.schema().select(selection).unwrap();
+            let actual_schema = chunk.schema().select(selection).unwrap();
 
-                assert_eq!(
-                    expected_schema,
-                    actual_schema,
-                    "Mismatch in chunk {}\nExpected:\n{:#?}\nActual:\n{:#?}\n",
-                    chunk.id(),
-                    expected_schema,
-                    actual_schema
-                );
+            assert_eq!(
+                expected_schema,
+                actual_schema,
+                "Mismatch in chunk {}\nExpected:\n{:#?}\nActual:\n{:#?}\n",
+                chunk.id(),
+                expected_schema,
+                actual_schema
+            );
 
-                // There are a few cases where we don't care about the sort key:
-                // - no "expected" value was provided which is interpreted as "don't care"; some
-                //   chunk representations are always sorted
-                // - the chunk is in some known-to-be-always-unsorted stage
-                if expected_sort_key.is_some() && !is_unsorted_chunk_type(chunk.as_ref()) {
-                    assert_eq!(chunk.sort_key(), expected_sort_key);
-                }
+            // There are a few cases where we don't care about the sort key:
+            // - no "expected" value was provided which is interpreted as "don't care"; some
+            //   chunk representations are always sorted
+            // - the chunk is in some known-to-be-always-unsorted stage
+            if expected_sort_key.is_some() && !is_unsorted_chunk_type(chunk.as_ref()) {
+                assert_eq!(chunk.sort_key(), expected_sort_key);
             }
         }
-        assert!(
-            chunks_with_table > 0,
-            "Expected at least one chunk to have data, but none did"
-        );
     }
 }
 
@@ -84,12 +75,13 @@ async fn list_schema_cpu_all() {
         .tag("region")
         .timestamp()
         .field("user", DataType::Float64)
+        .unwrap()
         .build()
         .unwrap();
 
     run_table_schema_test_case(
         TwoMeasurements {},
-        Selection::All,
+        Projection::All,
         "cpu",
         expected_schema,
         Some(&sort_key),
@@ -106,12 +98,13 @@ async fn list_schema_cpu_all_set_sort_key() {
         .tag("region")
         .timestamp()
         .field("user", DataType::Float64)
+        .unwrap()
         .build()
         .unwrap();
 
     run_table_schema_test_case(
         TwoMeasurements {},
-        Selection::All,
+        Projection::All,
         "cpu",
         expected_schema,
         Some(&sort_key),
@@ -126,6 +119,7 @@ async fn list_schema_disk_all() {
     // we expect columns to come out in lexicographic order by name
     let expected_schema = SchemaBuilder::new()
         .field("bytes", DataType::Int64)
+        .unwrap()
         .tag("region")
         .timestamp()
         .build()
@@ -133,7 +127,7 @@ async fn list_schema_disk_all() {
 
     run_table_schema_test_case(
         TwoMeasurements {},
-        Selection::All,
+        Projection::All,
         "disk",
         expected_schema,
         None,
@@ -145,12 +139,13 @@ async fn list_schema_disk_all() {
 async fn list_schema_cpu_selection() {
     let expected_schema = SchemaBuilder::new()
         .field("user", DataType::Float64)
+        .unwrap()
         .tag("region")
         .build()
         .unwrap();
 
     // Pick an order that is not lexographic
-    let selection = Selection::Some(&["user", "region"]);
+    let selection = Projection::Some(&["user", "region"]);
 
     run_table_schema_test_case(TwoMeasurements {}, selection, "cpu", expected_schema, None).await;
 }
@@ -161,11 +156,12 @@ async fn list_schema_disk_selection() {
     let expected_schema = SchemaBuilder::new()
         .timestamp()
         .field("bytes", DataType::Int64)
+        .unwrap()
         .build()
         .unwrap();
 
     // Pick an order that is not lexicographic
-    let selection = Selection::Some(&["time", "bytes"]);
+    let selection = Projection::Some(&["time", "bytes"]);
 
     run_table_schema_test_case(TwoMeasurements {}, selection, "disk", expected_schema, None).await;
 }
@@ -175,6 +171,7 @@ async fn list_schema_location_all() {
     // we expect columns to come out in lexicographic order by name
     let expected_schema = SchemaBuilder::new()
         .field("count", DataType::UInt64)
+        .unwrap()
         .timestamp()
         .tag("town")
         .build()
@@ -182,7 +179,7 @@ async fn list_schema_location_all() {
 
     run_table_schema_test_case(
         TwoMeasurementsUnsignedType {},
-        Selection::All,
+        Projection::All,
         "restaurant",
         expected_schema,
         None,

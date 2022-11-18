@@ -7,7 +7,9 @@
     missing_docs,
     clippy::explicit_iter_loop,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 //! # influxdb2_client
@@ -43,7 +45,9 @@
 //!
 //!     let client = Client::new("http://localhost:8888", "some-token");
 //!
-//!     client.create_bucket(Some(PostBucketRequest::new(org_id.to_string(), bucket.to_string()))).await?;
+//!     client.create_bucket(
+//!         Some(PostBucketRequest::new(org_id.to_string(), bucket.to_string()))
+//!     ).await?;
 //!
 //!     let points = vec![
 //!         DataPoint::builder("cpu")
@@ -92,6 +96,29 @@ pub enum RequestError {
         /// The underlying error object from `serde_json`.
         source: serde_json::error::Error,
     },
+
+    /// While deserializing the response as JSON, something went wrong.
+    #[snafu(display("Could not deserialize as JSON. Error: {source}\nText: `{text}`"))]
+    DeserializingJsonResponse {
+        /// The text of the response
+        text: String,
+        /// The underlying error object from serde
+        source: serde_json::Error,
+    },
+
+    /// Something went wrong getting the raw bytes of the response
+    #[snafu(display("Could not get response bytes: {source}"))]
+    ResponseBytes {
+        /// The underlying error object from reqwest
+        source: reqwest::Error,
+    },
+
+    /// Something went wrong converting the raw bytes of the response to a UTF-8 string
+    #[snafu(display("Invalid UTF-8: {source}"))]
+    ResponseString {
+        /// The underlying error object from std
+        source: std::string::FromUtf8Error,
+    },
 }
 
 /// Client to a server supporting the InfluxData 2.0 API.
@@ -105,7 +132,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// Default [jaeger debug header](Self::with_jaeger_debug) that should work in many environments.
+    /// Default [jaeger debug header](Self::with_jaeger_debug) that should work in many
+    /// environments.
     pub const DEFAULT_JAEGER_DEBUG_HEADER: &'static str = "jaeger-debug-id";
 
     /// Create a new client pointing to the URL specified in
@@ -128,7 +156,10 @@ impl Client {
         Self {
             url: url.into(),
             auth_header,
-            reqwest: reqwest::Client::new(),
+            reqwest: reqwest::Client::builder()
+                .connection_verbose(true)
+                .build()
+                .expect("reqwest::Client should have built"),
             jaeger_debug_header: None,
         }
     }

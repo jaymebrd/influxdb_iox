@@ -1,5 +1,5 @@
 ///! Common CLI flags for logging and tracing
-use crate::{config::*, Builder, Result, TroggingGuard};
+use crate::{config::*, Builder};
 use tracing_subscriber::fmt::{writer::BoxMakeWriter, MakeWriter};
 
 /// CLI config for the logging related subset of options.
@@ -23,7 +23,7 @@ pub struct LoggingConfig {
     ///
     /// If None, [`crate::Builder`] sets a default, by default [`crate::Builder::DEFAULT_LOG_FILTER`],
     /// but overrideable with [`crate::Builder::with_default_log_filter`].
-    #[clap(long = "--log-filter", env = "LOG_FILTER", action)]
+    #[clap(long = "log-filter", env = "LOG_FILTER", action)]
     pub log_filter: Option<String>,
 
     /// Logs: filter short-hand
@@ -38,8 +38,7 @@ pub struct LoggingConfig {
     /// -vvv 'trace,hyper::proto::h1=info,h2=info'
     #[clap(
         short = 'v',
-        long = "--verbose",
-        takes_value = false,
+        long = "verbose",
         action = clap::ArgAction::Count,
     )]
     pub log_verbose_count: u8,
@@ -50,7 +49,7 @@ pub struct LoggingConfig {
     //
     // TODO(jacobmarble): consider adding file path, file rotation, syslog, ?
     #[clap(
-        long = "--log-destination",
+        long = "log-destination",
         env = "LOG_DESTINATION",
         default_value = "stdout",
         verbatim_doc_comment,
@@ -94,7 +93,7 @@ pub struct LoggingConfig {
     ///   level=debug msg="This is a debug message" target="logging" location="logfmt/tests/logging.rs:37" time=1612181556329618000
     ///   level=trace msg="This is a trace message" target="logging" location="logfmt/tests/logging.rs:38" time=1612181556329634000
     #[clap(
-        long = "--log-format",
+        long = "log-format",
         env = "LOG_FORMAT",
         default_value = "full",
         verbatim_doc_comment,
@@ -119,10 +118,6 @@ impl LoggingConfig {
             .with_log_verbose_count(self.log_verbose_count)
             .with_log_destination(self.log_destination)
             .with_log_format(self.log_format)
-    }
-
-    pub fn install_global_subscriber(&self) -> Result<TroggingGuard> {
-        self.to_builder().install_global()
     }
 }
 
@@ -149,15 +144,14 @@ impl From<LoggingConfig> for Builder<BoxMakeWriter> {
 
 #[cfg(test)]
 mod tests {
-    use clap::StructOpt;
-
     use super::*;
     use crate::test_util::simple_test;
+    use clap::Parser;
 
     #[ignore] // REVERT THIS WHEN REVERTING CIRCLECI LOGGING CONFIG
     #[test]
     fn test_log_verbose_count() {
-        let cfg = LoggingConfig::try_parse_from(&["cli"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli"]).unwrap();
         assert_eq!(cfg.log_verbose_count, 0);
 
         assert_eq!(
@@ -169,7 +163,7 @@ WARN woo
             .trim_start(),
         );
 
-        let cfg = LoggingConfig::try_parse_from(&["cli", "-v"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli", "-v"]).unwrap();
         assert_eq!(cfg.log_verbose_count, 1);
 
         assert_eq!(
@@ -182,7 +176,7 @@ INFO bar
             .trim_start(),
         );
 
-        let cfg = LoggingConfig::try_parse_from(&["cli", "-vv"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli", "-vv"]).unwrap();
         assert_eq!(cfg.log_verbose_count, 2);
 
         assert_eq!(
@@ -196,7 +190,7 @@ DEBUG baz
             .trim_start(),
         );
 
-        let cfg = LoggingConfig::try_parse_from(&["cli", "-vvv"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli", "-vvv"]).unwrap();
         assert_eq!(cfg.log_verbose_count, 3);
 
         assert_eq!(
@@ -214,7 +208,7 @@ TRACE trax
 
     #[test]
     fn test_custom_default_log_level() {
-        let cfg = LoggingConfig::try_parse_from(&["cli"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli"]).unwrap();
 
         assert_eq!(
             simple_test(
@@ -232,7 +226,7 @@ DEBUG baz
             .trim_start(),
         );
 
-        let cfg = LoggingConfig::try_parse_from(&["cli", "--log-filter=info"]).unwrap();
+        let cfg = LoggingConfig::try_parse_from(["cli", "--log-filter=info"]).unwrap();
 
         assert_eq!(
             simple_test(

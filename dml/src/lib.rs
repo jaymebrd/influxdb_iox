@@ -8,12 +8,17 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 use std::time::Duration;
 
-use data_types::{DeletePredicate, NonEmptyString, PartitionKey, Sequence, StatValues, Statistics};
+use data_types::{
+    DeletePredicate, NamespaceId, NonEmptyString, PartitionKey, Sequence, StatValues, Statistics,
+    TableId,
+};
 use hashbrown::HashMap;
 use iox_time::{Time, TimeProvider};
 use mutable_batch::MutableBatch;
@@ -119,16 +124,16 @@ impl DmlOperation {
     /// Gets the metadata associated with this operation
     pub fn meta(&self) -> &DmlMeta {
         match &self {
-            DmlOperation::Write(w) => w.meta(),
-            DmlOperation::Delete(d) => d.meta(),
+            Self::Write(w) => w.meta(),
+            Self::Delete(d) => d.meta(),
         }
     }
 
     /// Sets the metadata for this operation
     pub fn set_meta(&mut self, meta: DmlMeta) {
         match self {
-            DmlOperation::Write(w) => w.set_meta(meta),
-            DmlOperation::Delete(d) => d.set_meta(meta),
+            Self::Write(w) => w.set_meta(meta),
+            Self::Delete(d) => d.set_meta(meta),
         }
     }
 
@@ -146,11 +151,11 @@ impl DmlOperation {
         }
     }
 
-    /// Namespace associated with this operation
-    pub fn namespace(&self) -> &str {
+    /// Namespace catalog ID associated with this operation
+    pub fn namespace_id(&self) -> NamespaceId {
         match self {
-            DmlOperation::Write(w) => w.namespace(),
-            DmlOperation::Delete(d) => d.namespace(),
+            Self::Write(w) => w.namespace_id(),
+            Self::Delete(d) => d.namespace_id(),
         }
     }
 }
@@ -167,22 +172,19 @@ impl From<DmlDelete> for DmlOperation {
     }
 }
 
-/// A collection of writes to potentially multiple tables within the same database
+/// A collection of writes to potentially multiple tables within the same namespace
 #[derive(Debug, Clone)]
 pub struct DmlWrite {
     /// The namespace being written to
-    namespace: String,
-    /// Writes to individual tables keyed by table name
-    tables: HashMap<String, MutableBatch>,
+    namespace_id: NamespaceId,
+    /// Writes to individual tables keyed by table ID
+    table_ids: HashMap<TableId, MutableBatch>,
     /// Write metadata
     meta: DmlMeta,
     min_timestamp: i64,
     max_timestamp: i64,
-    /// An optional partition key for this write.
-    ///
-    /// NOTE: all rows in this batch MUST map to this partition key if
-    /// specified.
-    partition_key: Option<PartitionKey>,
+    /// The partition key derived for this write.
+    partition_key: PartitionKey,
 }
 
 impl DmlWrite {
@@ -192,19 +194,19 @@ impl DmlWrite {
     ///
     /// Panics if
     ///
-    /// - `tables` is empty
+    /// - `table_ids` is empty
     /// - a MutableBatch is empty
     /// - a MutableBatch lacks an i64 "time" column
     pub fn new(
-        namespace: impl Into<String>,
-        tables: HashMap<String, MutableBatch>,
-        partition_key: Option<PartitionKey>,
+        namespace_id: NamespaceId,
+        table_ids: HashMap<TableId, MutableBatch>,
+        partition_key: PartitionKey,
         meta: DmlMeta,
     ) -> Self {
-        assert_ne!(tables.len(), 0);
+        assert_ne!(table_ids.len(), 0);
 
         let mut stats = StatValues::new_empty();
-        for (table_name, table) in &tables {
+        for (table_id, table) in &table_ids {
             match table
                 .column(schema::TIME_COLUMN_NAME)
                 .expect("time")
@@ -213,25 +215,20 @@ impl DmlWrite {
                 Statistics::I64(col_stats) => stats.update_from(&col_stats),
                 s => unreachable!(
                     "table \"{}\" has unexpected type for time column: {}",
-                    table_name,
+                    table_id,
                     s.type_name()
                 ),
             };
         }
 
         Self {
-            namespace: namespace.into(),
-            tables,
+            table_ids,
             partition_key,
             meta,
             min_timestamp: stats.min.unwrap(),
             max_timestamp: stats.max.unwrap(),
+            namespace_id,
         }
-    }
-
-    /// Namespace associated with this write
-    pub fn namespace(&self) -> &str {
-        &self.namespace
     }
 
     /// Metadata associated with this write
@@ -246,23 +243,23 @@ impl DmlWrite {
 
     /// Returns an iterator over the per-table writes within this [`DmlWrite`]
     /// in no particular order
-    pub fn tables(&self) -> impl Iterator<Item = (&str, &MutableBatch)> + '_ {
-        self.tables.iter().map(|(k, v)| (k.as_str(), v))
+    pub fn tables(&self) -> impl Iterator<Item = (&TableId, &MutableBatch)> + '_ {
+        self.table_ids.iter()
     }
 
-    /// Moves the table names and mutable batches out of the map
-    pub fn into_tables(self) -> impl Iterator<Item = (String, MutableBatch)> {
-        self.tables.into_iter()
+    /// Consumes `self`, returning an iterator of the table ID and data contained within it.
+    pub fn into_tables(self) -> impl Iterator<Item = (TableId, MutableBatch)> {
+        self.table_ids.into_iter()
     }
 
     /// Gets the write for a given table
-    pub fn table(&self, name: &str) -> Option<&MutableBatch> {
-        self.tables.get(name)
+    pub fn table(&self, id: &TableId) -> Option<&MutableBatch> {
+        self.table_ids.get(id)
     }
 
     /// Returns the number of tables within this write
     pub fn table_count(&self) -> usize {
-        self.tables.len()
+        self.table_ids.len()
     }
 
     /// Returns the minimum timestamp in the write
@@ -281,25 +278,31 @@ impl DmlWrite {
     pub fn size(&self) -> usize {
         std::mem::size_of::<Self>()
             + self
-                .tables
-                .iter()
-                .map(|(k, v)| std::mem::size_of_val(k) + k.capacity() + v.size())
+                .table_ids
+                .values()
+                .map(|v| std::mem::size_of::<TableId>() + v.size())
                 .sum::<usize>()
             + self.meta.size()
+            + std::mem::size_of::<NamespaceId>()
             + std::mem::size_of::<PartitionKey>()
             - std::mem::size_of::<DmlMeta>()
     }
 
     /// Return the partition key derived for this op.
-    pub fn partition_key(&self) -> Option<&PartitionKey> {
-        self.partition_key.as_ref()
+    pub fn partition_key(&self) -> &PartitionKey {
+        &self.partition_key
+    }
+
+    /// Return the [`NamespaceId`] to which this [`DmlWrite`] should be applied.
+    pub fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
     }
 }
 
 /// A delete operation
 #[derive(Debug, Clone, PartialEq)]
 pub struct DmlDelete {
-    namespace: String,
+    namespace_id: NamespaceId,
     predicate: DeletePredicate,
     table_name: Option<NonEmptyString>,
     meta: DmlMeta,
@@ -308,22 +311,17 @@ pub struct DmlDelete {
 impl DmlDelete {
     /// Create a new [`DmlDelete`]
     pub fn new(
-        namespace: impl Into<String>,
+        namespace_id: NamespaceId,
         predicate: DeletePredicate,
         table_name: Option<NonEmptyString>,
         meta: DmlMeta,
     ) -> Self {
         Self {
-            namespace: namespace.into(),
+            namespace_id,
             predicate,
             table_name,
             meta,
         }
-    }
-
-    /// Namespace associated with this delete
-    pub fn namespace(&self) -> &str {
-        &self.namespace
     }
 
     /// Returns the table_name for this delete
@@ -359,12 +357,17 @@ impl DmlDelete {
             + self.meta.size()
             - std::mem::size_of::<DmlMeta>()
     }
+
+    /// Return the [`NamespaceId`] to which this operation should be applied.
+    pub fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
 }
 
 /// Test utilities
 pub mod test_util {
     use arrow_util::display::pretty_format_batches;
-    use schema::selection::Selection;
+    use schema::Projection;
 
     use super::*;
 
@@ -387,20 +390,29 @@ pub mod test_util {
 
     /// Asserts two writes are equal
     pub fn assert_writes_eq(a: &DmlWrite, b: &DmlWrite) {
-        assert_eq!(a.namespace, b.namespace);
-        assert_eq!(a.meta(), b.meta());
+        assert_eq!(a.namespace_id, b.namespace_id);
         assert_eq!(a.partition_key(), b.partition_key());
+
+        // Depending on what implementation is under test ( :( ) different
+        // timestamp precisions may be used.
+        //
+        // Truncate them all to milliseconds (the lowest common denominator) so
+        // they are comparable.
+        assert_eq!(
+            truncate_timestamp_to_millis(a.meta()),
+            truncate_timestamp_to_millis(b.meta())
+        );
 
         assert_eq!(a.table_count(), b.table_count());
 
-        for (table_name, a_batch) in a.tables() {
-            let b_batch = b.table(table_name).expect("table not found");
+        for (table_id, a_batch) in a.tables() {
+            let b_batch = b.table(table_id).expect("table not found");
 
             assert_eq!(
-                pretty_format_batches(&[a_batch.to_arrow(Selection::All).unwrap()]).unwrap(),
-                pretty_format_batches(&[b_batch.to_arrow(Selection::All).unwrap()]).unwrap(),
+                pretty_format_batches(&[a_batch.to_arrow(Projection::All).unwrap()]).unwrap(),
+                pretty_format_batches(&[b_batch.to_arrow(Projection::All).unwrap()]).unwrap(),
                 "batches for table \"{}\" differ",
-                table_name
+                table_id
             );
         }
     }
@@ -411,5 +423,26 @@ pub mod test_util {
             DmlOperation::Delete(a) => assert_eq!(a, b),
             _ => panic!("unexpected operation: {:?}", a),
         }
+    }
+
+    fn truncate_timestamp_to_millis(m: &DmlMeta) -> DmlMeta {
+        // Kafka supports millisecond precision in timestamps, so drop some
+        // precision from this producer timestamp in the metadata (which has
+        // nanosecond precision) to ensure the returned write is directly
+        // comparable to a write that has come through the write buffer.
+        //
+        // This mangling is to support testing comparisons only.
+        let timestamp = m
+            .producer_ts()
+            .expect("no producer timestamp in de-aggregated metadata");
+        let timestamp =
+            Time::from_timestamp_millis(timestamp.timestamp_millis()).expect("ts in range");
+
+        DmlMeta::sequenced(
+            *m.sequence().unwrap(),
+            timestamp,
+            m.span_context().cloned(),
+            m.bytes_read().unwrap(),
+        )
     }
 }

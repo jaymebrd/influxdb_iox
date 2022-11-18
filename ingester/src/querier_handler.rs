@@ -1,76 +1,39 @@
 //! Handle all requests from Querier
 
-use crate::data::{
-    IngesterData, IngesterQueryPartition, IngesterQueryResponse, QueryableBatch,
-    UnpersistedPartitionData,
-};
-use arrow::error::ArrowError;
-use datafusion::{
-    error::DataFusionError, logical_plan::LogicalPlanBuilder,
-    physical_plan::SendableRecordBatchStream,
-};
-use futures::StreamExt;
+use std::{pin::Pin, sync::Arc};
+
+use arrow::{array::new_null_array, error::ArrowError, record_batch::RecordBatch};
+use arrow_util::optimize::{optimize_record_batch, optimize_schema};
+use data_types::{NamespaceId, PartitionId, SequenceNumber, TableId};
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion_util::MemoryStream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use generated_types::ingester::IngesterQueryRequest;
-use iox_query::{
-    exec::{Executor, ExecutorType},
-    QueryChunk, QueryChunkMeta, ScanPlanBuilder,
-};
-use observability_deps::tracing::debug;
-use predicate::Predicate;
-use schema::selection::Selection;
-use snafu::{ensure, ResultExt, Snafu};
-use std::sync::Arc;
+use observability_deps::tracing::*;
+use schema::{merge::SchemaMerger, Projection};
+use snafu::{ensure, Snafu};
+use trace::span::{Span, SpanRecorder};
+
+use crate::data::IngesterData;
+
+/// Number of table data read locks that shall be acquired in parallel
+const CONCURRENT_TABLE_DATA_LOCKS: usize = 10;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
-    #[snafu(display("Error creating plan for querying Ingester data to send to Querier"))]
-    FrontendError {
-        source: iox_query::frontend::common::Error,
-    },
-
-    #[snafu(display("Error building logical plan for querying Ingester data to send to Querier"))]
-    LogicalPlan { source: DataFusionError },
+    #[snafu(display("No Namespace Data found for the given namespace ID {}", namespace_id,))]
+    NamespaceNotFound { namespace_id: NamespaceId },
 
     #[snafu(display(
-        "Error building physical plan for querying Ingester data to send to Querier: {}",
-        source
-    ))]
-    PhysicalPlan { source: DataFusionError },
-
-    #[snafu(display(
-        "Error executing the query for getting Ingester data to send to Querier: {}",
-        source
-    ))]
-    ExecutePlan { source: DataFusionError },
-
-    #[snafu(display("Error collecting a stream of record batches: {}", source))]
-    CollectStream { source: DataFusionError },
-
-    #[snafu(display(
-        "No Namespace Data found for the given namespace name {}",
-        namespace_name,
-    ))]
-    NamespaceNotFound { namespace_name: String },
-
-    #[snafu(display(
-        "No Table Data found for the given namespace name {}, table name {}",
-        namespace_name,
-        table_name
+        "No Table Data found for the given namespace ID {}, table ID {}",
+        namespace_id,
+        table_id
     ))]
     TableNotFound {
-        namespace_name: String,
-        table_name: String,
+        namespace_id: NamespaceId,
+        table_id: TableId,
     },
-
-    #[snafu(display("Error concating same-schema record batches: {}", source))]
-    ConcatBatches { source: arrow::error::ArrowError },
-
-    #[snafu(display(
-        "Cannot apply identical schema to record batches of all partitions: {}",
-        source
-    ))]
-    InterPartitionSchemaApplication { source: arrow::error::ArrowError },
 
     #[snafu(display("Concurrent query request limit exceeded"))]
     RequestLimit,
@@ -79,19 +42,234 @@ pub enum Error {
 /// A specialized `Error` for Ingester's Query errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Stream of snapshots.
+///
+/// Every snapshot is a dedicated [`SendableRecordBatchStream`].
+pub(crate) type SnapshotStream =
+    Pin<Box<dyn Stream<Item = Result<SendableRecordBatchStream, ArrowError>> + Send>>;
+
+/// Status of a partition that has unpersisted data.
+///
+/// Note that this structure is specific to a partition (which itself is bound to a table and
+/// shard)!
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_copy_implementations)]
+pub struct PartitionStatus {
+    /// Max sequence number persisted
+    pub parquet_max_sequence_number: Option<SequenceNumber>,
+}
+
+/// Response data for a single partition.
+pub(crate) struct IngesterQueryPartition {
+    /// Stream of snapshots.
+    snapshots: SnapshotStream,
+
+    /// Partition ID.
+    id: PartitionId,
+
+    /// Partition persistence status.
+    status: PartitionStatus,
+}
+
+impl std::fmt::Debug for IngesterQueryPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngesterQueryPartition")
+            .field("snapshots", &"<SNAPSHOT STREAM>")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl IngesterQueryPartition {
+    pub(crate) fn new(snapshots: SnapshotStream, id: PartitionId, status: PartitionStatus) -> Self {
+        Self {
+            snapshots,
+            id,
+            status,
+        }
+    }
+}
+
+/// Stream of partitions in this response.
+pub(crate) type IngesterQueryPartitionStream =
+    Pin<Box<dyn Stream<Item = Result<IngesterQueryPartition, ArrowError>> + Send>>;
+
+/// Response streams for querier<>ingester requests.
+///
+/// The data structure is constructed to allow lazy/streaming data generation. For easier
+/// consumption according to the wire protocol, use the [`flatten`](Self::flatten) method.
+pub struct IngesterQueryResponse {
+    /// Stream of partitions.
+    partitions: IngesterQueryPartitionStream,
+}
+
+impl std::fmt::Debug for IngesterQueryResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngesterQueryResponse")
+            .field("partitions", &"<PARTITION STREAM>")
+            .finish()
+    }
+}
+
+impl IngesterQueryResponse {
+    /// Make a response
+    pub(crate) fn new(partitions: IngesterQueryPartitionStream) -> Self {
+        Self { partitions }
+    }
+
+    /// Flattens the data according to the wire protocol.
+    pub fn flatten(self) -> FlatIngesterQueryResponseStream {
+        self.partitions
+            .flat_map(|partition_res| match partition_res {
+                Ok(partition) => {
+                    let head = futures::stream::once(async move {
+                        Ok(FlatIngesterQueryResponse::StartPartition {
+                            partition_id: partition.id,
+                            status: partition.status,
+                        })
+                    });
+                    let tail = partition
+                        .snapshots
+                        .flat_map(|snapshot_res| match snapshot_res {
+                            Ok(snapshot) => {
+                                let schema = Arc::new(optimize_schema(&snapshot.schema()));
+
+                                let schema_captured = Arc::clone(&schema);
+                                let head = futures::stream::once(async {
+                                    Ok(FlatIngesterQueryResponse::StartSnapshot {
+                                        schema: schema_captured,
+                                    })
+                                });
+
+                                let tail = snapshot.map(move |batch_res| match batch_res {
+                                    Ok(batch) => Ok(FlatIngesterQueryResponse::RecordBatch {
+                                        batch: optimize_record_batch(&batch, Arc::clone(&schema))?,
+                                    }),
+                                    Err(e) => Err(e),
+                                });
+
+                                head.chain(tail).boxed()
+                            }
+                            Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+                        });
+
+                    head.chain(tail).boxed()
+                }
+                Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+            })
+            .boxed()
+    }
+
+    /// Convert [`IngesterQueryResponse`] to a set of [`RecordBatch`]es.
+    ///
+    /// If the response contains multiple snapshots, this will merge the schemas into a single one
+    /// and create NULL-columns for snapshots that miss columns.
+    ///
+    /// # Panic
+    ///
+    /// Panics if there are no batches returned at all. Also panics if the snapshot-scoped schemas
+    /// do not line up with the snapshot-scoped record batches.
+    pub async fn into_record_batches(self) -> Vec<RecordBatch> {
+        let mut snapshot_schema = None;
+        let mut schema_merger = SchemaMerger::new();
+        let mut batches = vec![];
+
+        let mut stream = self.flatten();
+        while let Some(msg) = stream.try_next().await.unwrap() {
+            match msg {
+                FlatIngesterQueryResponse::StartPartition { .. } => (),
+                FlatIngesterQueryResponse::RecordBatch { batch } => {
+                    let last_schema = snapshot_schema.as_ref().unwrap();
+                    assert_eq!(&batch.schema(), last_schema);
+                    batches.push(batch);
+                }
+                FlatIngesterQueryResponse::StartSnapshot { schema } => {
+                    snapshot_schema = Some(Arc::clone(&schema));
+
+                    schema_merger = schema_merger
+                        .merge(&schema::Schema::try_from(schema).unwrap())
+                        .unwrap();
+                }
+            }
+        }
+
+        assert!(!batches.is_empty());
+
+        // equalize schemas
+        let common_schema = schema_merger.build().as_arrow();
+        batches
+            .into_iter()
+            .map(|batch| {
+                let batch_schema = batch.schema();
+                let columns = common_schema
+                    .fields()
+                    .iter()
+                    .map(|field| match batch_schema.index_of(field.name()) {
+                        Ok(idx) => Arc::clone(batch.column(idx)),
+                        Err(_) => new_null_array(field.data_type(), batch.num_rows()),
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&common_schema), columns).unwrap()
+            })
+            .collect()
+    }
+}
+
+/// Flattened version of [`IngesterQueryResponse`].
+pub type FlatIngesterQueryResponseStream =
+    Pin<Box<dyn Stream<Item = Result<FlatIngesterQueryResponse, ArrowError>> + Send>>;
+
+/// Element within the flat wire protocol.
+#[derive(Debug, PartialEq)]
+pub enum FlatIngesterQueryResponse {
+    /// Start a new partition.
+    StartPartition {
+        /// Partition ID.
+        partition_id: PartitionId,
+
+        /// Partition persistence status.
+        status: PartitionStatus,
+    },
+
+    /// Start a new snapshot.
+    ///
+    /// The snapshot belongs to the partition of the last [`StartPartition`](Self::StartPartition)
+    /// message.
+    StartSnapshot {
+        /// Snapshot schema.
+        schema: Arc<arrow::datatypes::Schema>,
+    },
+
+    /// Add a record batch to the snapshot that was announced by the last
+    /// [`StartSnapshot`](Self::StartSnapshot) message.
+    RecordBatch {
+        /// Record batch.
+        batch: RecordBatch,
+    },
+}
+
 /// Return data to send as a response back to the Querier per its request
 pub async fn prepare_data_to_querier(
     ingest_data: &Arc<IngesterData>,
     request: &Arc<IngesterQueryRequest>,
+    span: Option<Span>,
 ) -> Result<IngesterQueryResponse> {
     debug!(?request, "prepare_data_to_querier");
-    let mut unpersisted_partitions = vec![];
+
+    let mut span_recorder = SpanRecorder::new(span);
+
+    let mut table_refs = vec![];
     let mut found_namespace = false;
-    for (sequencer_id, sequencer_data) in ingest_data.sequencers() {
-        debug!(sequencer_id=%sequencer_id.get());
-        let namespace_data = match sequencer_data.namespace(&request.namespace) {
+
+    for (shard_id, shard_data) in ingest_data.shards() {
+        let namespace_data = match shard_data.namespace(request.namespace_id) {
             Some(namespace_data) => {
-                debug!(namespace=%request.namespace, "found namespace");
+                trace!(
+                    shard_id=%shard_id.get(),
+                    namespace_id=%request.namespace_id,
+                    "found namespace"
+                );
                 found_namespace = true;
                 namespace_data
             }
@@ -100,304 +278,203 @@ pub async fn prepare_data_to_querier(
             }
         };
 
-        let table_data = match namespace_data.table_data(&request.table) {
-            Some(table_data) => {
-                debug!(table_name=%request.table, "found table");
-                table_data
-            }
-            None => {
-                continue;
-            }
-        };
-
-        let mut unpersisted_partition_data = {
-            let table_data = table_data.read().await;
-            table_data.unpersisted_partition_data()
-        };
-        debug!(?unpersisted_partition_data);
-
-        unpersisted_partitions.append(&mut unpersisted_partition_data);
+        if let Some(table_data) = namespace_data.table(request.table_id) {
+            trace!(
+                shard_id=%shard_id.get(),
+                namespace_id=%request.namespace_id,
+                table_id=%request.table_id,
+                "found table"
+            );
+            table_refs.push(table_data);
+        }
     }
 
     ensure!(
         found_namespace,
         NamespaceNotFoundSnafu {
-            namespace_name: &request.namespace,
+            namespace_id: request.namespace_id,
         },
     );
+
     ensure!(
-        !unpersisted_partitions.is_empty(),
+        !table_refs.is_empty(),
         TableNotFoundSnafu {
-            namespace_name: &request.namespace,
-            table_name: &request.table
+            namespace_id: request.namespace_id,
+            table_id: request.table_id
         },
     );
 
-    let ingest_data = Arc::clone(ingest_data);
+    // acquire locks and read table data in parallel
+    let unpersisted_partitions: Vec<_> = futures::stream::iter(table_refs)
+        .map(|table_data| async move {
+            table_data
+                .partitions()
+                .into_iter()
+                .map(|p| {
+                    let mut p = p.lock();
+                    (
+                        p.partition_id(),
+                        p.get_query_data(),
+                        p.max_persisted_sequence_number(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        // Note: the order doesn't matter
+        .buffer_unordered(CONCURRENT_TABLE_DATA_LOCKS)
+        .concat()
+        .await;
+
     let request = Arc::clone(request);
-    let partitions = futures::stream::iter(unpersisted_partitions).then(move |partition| {
-        let ingest_data = Arc::clone(&ingest_data);
-        let request = Arc::clone(&request);
+    let partitions = futures::stream::iter(unpersisted_partitions.into_iter().map(
+        move |(partition_id, data, max_persisted_sequence_number)| {
+            let snapshots = match data {
+                None => Box::pin(futures::stream::empty()) as SnapshotStream,
 
-        async move {
-            // extract payload
-            let partition_id = partition.partition_id;
-            let status = partition.partition_status.clone();
-            let snapshots: Vec<_> =
-                prepare_data_to_querier_for_partition(ingest_data.exec(), partition, &request)
-                    .await
-                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?
-                    .into_iter()
-                    .map(Ok)
-                    .collect();
+                Some(batch) => {
+                    assert_eq!(partition_id, batch.partition_id());
 
-            // Note: include partition in `unpersisted_partitions` even when there we might filter out all the data, because
-            // the metadata (e.g. max persisted parquet file) is important for the querier.
+                    // Project the data if necessary
+                    let columns = request
+                        .columns
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    let selection = if columns.is_empty() {
+                        Projection::All
+                    } else {
+                        Projection::Some(columns.as_ref())
+                    };
+
+                    let snapshots = batch.project_selection(selection).into_iter().map(|batch| {
+                        // Create a stream from the batch.
+                        Ok(Box::pin(MemoryStream::new(vec![batch])) as SendableRecordBatchStream)
+                    });
+
+                    Box::pin(futures::stream::iter(snapshots)) as SnapshotStream
+                }
+            };
+
+            // NOTE: the partition persist watermark MUST always be provided to
+            // the querier for any partition that has performed (or is aware of)
+            // a persist operation.
+            //
+            // This allows the querier to use the per-partition persist marker
+            // when planning queries.
             Ok(IngesterQueryPartition::new(
-                Box::pin(futures::stream::iter(snapshots)),
+                snapshots,
                 partition_id,
-                status,
+                PartitionStatus {
+                    parquet_max_sequence_number: max_persisted_sequence_number,
+                },
             ))
-        }
-    });
+        },
+    ));
+
+    span_recorder.ok("done");
 
     Ok(IngesterQueryResponse::new(Box::pin(partitions)))
 }
 
-async fn prepare_data_to_querier_for_partition(
-    executor: &Executor,
-    unpersisted_partition_data: UnpersistedPartitionData,
-    request: &IngesterQueryRequest,
-) -> Result<Option<SendableRecordBatchStream>> {
-    // ------------------------------------------------
-    // Accumulate data
-
-    // Make Filters
-    let selection_columns: Vec<_> = request.columns.iter().map(String::as_str).collect();
-    let selection = if selection_columns.is_empty() {
-        Selection::All
-    } else {
-        Selection::Some(&selection_columns)
-    };
-    let predicate = request.predicate.clone().unwrap_or_default();
-
-    // figure out what batches
-    let queryable_batch = unpersisted_partition_data
-        .persisting
-        .unwrap_or_else(|| QueryableBatch::new(&request.table, vec![], vec![]))
-        .with_data(unpersisted_partition_data.non_persisted);
-
-    // No data!
-    if queryable_batch.data.is_empty() {
-        return Ok(None);
-    }
-
-    query(
-        executor,
-        Arc::new(queryable_batch),
-        predicate.clone(),
-        selection,
-    )
-    .await
-    .map(Some)
-}
-
-/// Query a given Queryable Batch, applying selection and filters as appropriate
-/// Return stream of record batches
-pub(crate) async fn query(
-    executor: &Executor,
-    data: Arc<QueryableBatch>,
-    predicate: Predicate,
-    selection: Selection<'_>,
-) -> Result<SendableRecordBatchStream> {
-    // Build logical plan for filtering data
-    // Note that this query will also apply the delete predicates that go with the QueryableBatch
-
-    let mut expr = vec![];
-    if let Some(filter_expr) = predicate.filter_expr() {
-        expr.push(filter_expr);
-    }
-
-    // TODO: Since we have different type of servers (router,
-    // ingester, compactor, and querier), we may want to add more
-    // types into the ExecutorType to have better log and resource
-    // managment
-    let ctx = executor.new_context(ExecutorType::Query);
-
-    // Creates an execution plan for a scan and filter data of a single chunk
-    let schema = data.schema();
-    let table_name = data.table_name().to_string();
-
-    debug!(%table_name, ?predicate, "Creating single chunk scan plan");
-
-    let logical_plan = ScanPlanBuilder::new(schema)
-        .with_session_context(ctx.child_ctx("scan_and_filter planning"))
-        .with_predicate(&predicate)
-        .with_chunks([data as _])
-        .build()
-        .context(FrontendSnafu)?
-        .plan_builder
-        .build()
-        .context(LogicalPlanSnafu)?;
-
-    debug!(%table_name, plan=%logical_plan.display_indent_schema(),
-           "created single chunk scan plan");
-
-    // Now, restrict to all columns that are relevant
-    let logical_plan = match selection {
-        Selection::All => logical_plan,
-        Selection::Some(cols) => {
-            // filter out columns that are not in the schema
-            let schema = Arc::clone(logical_plan.schema());
-            let cols = cols.iter().filter_map(|col_name| {
-                schema
-                    .index_of_column_by_name(None, col_name)
-                    .ok()
-                    .map(|_| datafusion::prelude::col(col_name))
-            });
-
-            LogicalPlanBuilder::from(logical_plan)
-                .project(cols)
-                .context(LogicalPlanSnafu)?
-                .build()
-                .context(LogicalPlanSnafu)?
-        }
-    };
-
-    // Build physical plan
-    let physical_plan = ctx
-        .create_physical_plan(&logical_plan)
-        .await
-        .context(PhysicalPlanSnafu {})?;
-
-    // Execute the plan and return the filtered stream
-    let output_stream = ctx
-        .execute_stream(physical_plan)
-        .await
-        .context(ExecutePlanSnafu {})?;
-
-    Ok(output_stream)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        data::FlatIngesterQueryResponse,
-        test_util::{
-            create_one_record_batch_with_influxtype_no_duplicates, create_tombstone,
-            make_ingester_data, make_ingester_data_with_tombstones, make_queryable_batch,
-            make_queryable_batch_with_deletes, DataLocation, TEST_NAMESPACE, TEST_TABLE,
-        },
-    };
-    use arrow::record_batch::RecordBatch;
-    use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
+    use std::task::{Context, Poll};
+
+    use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+    use arrow_util::assert_batches_sorted_eq;
     use assert_matches::assert_matches;
-    use datafusion::logical_plan::{col, lit};
-    use futures::TryStreamExt;
+    use datafusion::{
+        physical_plan::RecordBatchStream,
+        prelude::{col, lit},
+    };
+    use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
     use predicate::Predicate;
 
+    use super::*;
+    use crate::test_util::make_ingester_data;
+
     #[tokio::test]
-    async fn test_query() {
-        test_helpers::maybe_start_logging();
+    async fn test_ingester_query_response_flatten() {
+        let batch_1_1 = lp_to_batch("table x=1 0");
+        let batch_1_2 = lp_to_batch("table x=2 1");
+        let batch_2 = lp_to_batch("table y=1 10");
+        let batch_3 = lp_to_batch("table z=1 10");
 
-        // create input data
-        let batches = create_one_record_batch_with_influxtype_no_duplicates().await;
+        let schema_1 = batch_1_1.schema();
+        let schema_2 = batch_2.schema();
+        let schema_3 = batch_3.schema();
 
-        // build queryable batch from the input batches
-        let batch = make_queryable_batch("test_table", 1, batches);
+        let response = IngesterQueryResponse::new(Box::pin(futures::stream::iter([
+            Ok(IngesterQueryPartition::new(
+                Box::pin(futures::stream::iter([
+                    Ok(Box::pin(TestRecordBatchStream::new(
+                        vec![
+                            Ok(batch_1_1.clone()),
+                            Err(ArrowError::NotYetImplemented("not yet implemeneted".into())),
+                            Ok(batch_1_2.clone()),
+                        ],
+                        Arc::clone(&schema_1),
+                    )) as _),
+                    Err(ArrowError::InvalidArgumentError("invalid arg".into())),
+                    Ok(Box::pin(TestRecordBatchStream::new(
+                        vec![Ok(batch_2.clone())],
+                        Arc::clone(&schema_2),
+                    )) as _),
+                    Ok(Box::pin(TestRecordBatchStream::new(vec![], Arc::clone(&schema_3))) as _),
+                ])),
+                PartitionId::new(2),
+                PartitionStatus {
+                    parquet_max_sequence_number: None,
+                },
+            )),
+            Err(ArrowError::IoError("some io error".into())),
+            Ok(IngesterQueryPartition::new(
+                Box::pin(futures::stream::iter([])),
+                PartitionId::new(1),
+                PartitionStatus {
+                    parquet_max_sequence_number: None,
+                },
+            )),
+        ])));
 
-        // query without filters
-        let exc = Executor::new(1);
-        let stream = query(&exc, batch, Predicate::default(), Selection::All)
-            .await
-            .unwrap();
-        let output_batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .unwrap();
-
-        // verify data: all rows and columns should be returned
+        let actual: Vec<_> = response.flatten().collect().await;
         let expected = vec![
-            "+-----------+------+-----------------------------+",
-            "| field_int | tag1 | time                        |",
-            "+-----------+------+-----------------------------+",
-            "| 70        | UT   | 1970-01-01T00:00:00.000020Z |",
-            "| 10        | VT   | 1970-01-01T00:00:00.000010Z |",
-            "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
-            "+-----------+------+-----------------------------+",
+            Ok(FlatIngesterQueryResponse::StartPartition {
+                partition_id: PartitionId::new(2),
+                status: PartitionStatus {
+                    parquet_max_sequence_number: None,
+                },
+            }),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_1 }),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_1_1 }),
+            Err(ArrowError::NotYetImplemented("not yet implemeneted".into())),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_1_2 }),
+            Err(ArrowError::InvalidArgumentError("invalid arg".into())),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_2 }),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_2 }),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_3 }),
+            Err(ArrowError::IoError("some io error".into())),
+            Ok(FlatIngesterQueryResponse::StartPartition {
+                partition_id: PartitionId::new(1),
+                status: PartitionStatus {
+                    parquet_max_sequence_number: None,
+                },
+            }),
         ];
-        assert_batches_eq!(&expected, &output_batches);
 
-        exc.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_query_with_filter() {
-        test_helpers::maybe_start_logging();
-
-        // create input data
-        let batches = create_one_record_batch_with_influxtype_no_duplicates().await;
-
-        // build queryable batch from the input batches
-        let batch = make_queryable_batch("test_table", 1, batches);
-
-        // make filters
-        // Only read 2 columns: "tag1" and "time"
-        let selection = Selection::Some(&["tag1", "time"]);
-
-        // tag1=VT
-        let expr = col("tag1").eq(lit("VT"));
-        let pred = Predicate::default().with_expr(expr);
-
-        let exc = Executor::new(1);
-        let stream = query(&exc, batch, pred, selection).await.unwrap();
-        let output_batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .unwrap();
-
-        // verify data: 2  columns and one row of "tag1=VT" should be returned
-        let expected = vec![
-            "+------+-----------------------------+",
-            "| tag1 | time                        |",
-            "+------+-----------------------------+",
-            "| VT   | 1970-01-01T00:00:00.000010Z |",
-            "+------+-----------------------------+",
-        ];
-        assert_batches_eq!(&expected, &output_batches);
-
-        exc.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_query_with_filter_with_delete() {
-        test_helpers::maybe_start_logging();
-
-        // create input data
-        let batches = create_one_record_batch_with_influxtype_no_duplicates().await;
-        let tombstones = vec![create_tombstone(1, 1, 1, 1, 0, 200000, "tag1=UT")];
-
-        // build queryable batch from the input batches
-        let batch = make_queryable_batch_with_deletes("test_table", 1, batches, tombstones);
-
-        // make filters
-        // Only read 2 columns: "tag1" and "time"
-        let selection = Selection::Some(&["tag1", "time"]);
-
-        // tag1=UT
-        let expr = col("tag1").eq(lit("UT"));
-        let pred = Predicate::default().with_expr(expr);
-
-        let exc = Executor::new(1);
-        let stream = query(&exc, batch, pred, selection).await.unwrap();
-        let output_batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .unwrap();
-
-        // verify data: return nothing because the selected row already deleted
-        let expected = vec!["++", "++"];
-        assert_batches_eq!(&expected, &output_batches);
-
-        exc.join().await;
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual, expected);
+                }
+                (Err(_), Err(_)) => {
+                    // cannot compare `ArrowError`, but it's unlikely that someone changed the error
+                }
+                (Ok(_), Err(_)) => panic!("Actual is Ok but expected is Err"),
+                (Err(_), Ok(_)) => panic!("Actual is Err but expected is Ok"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -405,29 +482,24 @@ mod tests {
         test_helpers::maybe_start_logging();
 
         // make 14 scenarios for ingester data
+        let mut table_id = None;
+        let mut ns_id = None;
         let mut scenarios = vec![];
         for two_partitions in [false, true] {
-            for loc in [
-                DataLocation::BUFFER,
-                DataLocation::BUFFER_SNAPSHOT,
-                DataLocation::BUFFER_PERSISTING,
-                DataLocation::BUFFER_SNAPSHOT_PERSISTING,
-                DataLocation::SNAPSHOT,
-                DataLocation::SNAPSHOT_PERSISTING,
-                DataLocation::PERSISTING,
-            ] {
-                let scenario = Arc::new(make_ingester_data(two_partitions, loc));
-                scenarios.push((loc, scenario));
-            }
+            let (scenario, ns, table) = make_ingester_data(two_partitions).await;
+
+            let old = *table_id.get_or_insert(table);
+            assert_eq!(old, table);
+            let old = *ns_id.get_or_insert(ns);
+            assert_eq!(old, ns);
+
+            scenarios.push(Arc::new(scenario));
         }
+        let table_id = table_id.unwrap();
+        let ns_id = ns_id.unwrap();
 
         // read data from all scenarios without any filters
-        let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec![],
-            None,
-        ));
+        let request = Arc::new(IngesterQueryRequest::new(ns_id, table_id, vec![], None));
         let expected = vec![
             "+------------+-----+------+--------------------------------+",
             "| city       | day | temp | time                           |",
@@ -442,18 +514,25 @@ mod tests {
             "| Wilmington | mon |      | 1970-01-01T00:00:00.000000035Z |", // in group 3 - seq_num: 6
             "+------------+-----+------+--------------------------------+",
         ];
-        for (loc, scenario) in &scenarios {
-            println!("Location: {loc:?}");
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
+        for scenario in &scenarios {
+            let result = prepare_data_to_querier(scenario, &request, None)
+                .await
+                .unwrap()
+                .into_record_batches()
+                .await;
             assert_batches_sorted_eq!(&expected, &result);
         }
 
         // read data from all scenarios and filter out column day
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec!["city".to_string(), "temp".to_string(), "time".to_string()],
+            ns_id,
+            table_id,
+            vec![
+                "city".to_string(),
+                "temp".to_string(),
+                "time".to_string(),
+                "a_column_that_does_not_exist".to_string(),
+            ],
             None,
         ));
         let expected = vec![
@@ -470,10 +549,12 @@ mod tests {
             "| Wilmington |      | 1970-01-01T00:00:00.000000035Z |",
             "+------------+------+--------------------------------+",
         ];
-        for (loc, scenario) in &scenarios {
-            println!("Location: {loc:?}");
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
+        for scenario in &scenarios {
+            let result = prepare_data_to_querier(scenario, &request, None)
+                .await
+                .unwrap()
+                .into_record_batches()
+                .await;
             assert_batches_sorted_eq!(&expected, &result);
         }
 
@@ -481,39 +562,55 @@ mod tests {
         let expr = col("city").not_eq(lit("Medford"));
         let pred = Predicate::default().with_expr(expr).with_range(0, 42);
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
+            ns_id,
+            table_id,
             vec!["city".to_string(), "temp".to_string(), "time".to_string()],
             Some(pred),
         ));
+        // predicates and de-dup are NOT applied!, otherwise this would look like this:
+        // let expected = vec![
+        //     "+------------+------+--------------------------------+",
+        //     "| city       | temp | time                           |",
+        //     "+------------+------+--------------------------------+",
+        //     "| Andover    | 56   | 1970-01-01T00:00:00.000000030Z |",
+        //     "| Boston     |      | 1970-01-01T00:00:00.000000038Z |",
+        //     "| Boston     | 60   | 1970-01-01T00:00:00.000000036Z |",
+        //     "| Reading    | 58   | 1970-01-01T00:00:00.000000040Z |",
+        //     "| Wilmington |      | 1970-01-01T00:00:00.000000035Z |",
+        //     "+------------+------+--------------------------------+",
+        // ];
         let expected = vec![
             "+------------+------+--------------------------------+",
             "| city       | temp | time                           |",
             "+------------+------+--------------------------------+",
+            "| Andover    |      | 1970-01-01T00:00:00.000000046Z |",
             "| Andover    | 56   | 1970-01-01T00:00:00.000000030Z |",
             "| Boston     |      | 1970-01-01T00:00:00.000000038Z |",
             "| Boston     | 60   | 1970-01-01T00:00:00.000000036Z |",
+            "| Medford    |      | 1970-01-01T00:00:00.000000026Z |",
+            "| Medford    | 55   | 1970-01-01T00:00:00.000000022Z |",
             "| Reading    | 58   | 1970-01-01T00:00:00.000000040Z |",
             "| Wilmington |      | 1970-01-01T00:00:00.000000035Z |",
             "+------------+------+--------------------------------+",
         ];
-        for (loc, scenario) in &scenarios {
-            println!("Location: {loc:?}");
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
+        for scenario in &scenarios {
+            let result = prepare_data_to_querier(scenario, &request, None)
+                .await
+                .unwrap()
+                .into_record_batches()
+                .await;
             assert_batches_sorted_eq!(&expected, &result);
         }
 
         // test "table not found" handling
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            "table_does_not_exist".to_string(),
+            ns_id,
+            TableId::new(i64::MAX),
             vec![],
             None,
         ));
-        for (loc, scenario) in &scenarios {
-            println!("Location: {loc:?}");
-            let err = prepare_data_to_querier(scenario, &request)
+        for scenario in &scenarios {
+            let err = prepare_data_to_querier(scenario, &request, None)
                 .await
                 .unwrap_err();
             assert_matches!(err, Error::TableNotFound { .. });
@@ -521,135 +618,56 @@ mod tests {
 
         // test "namespace not found" handling
         let request = Arc::new(IngesterQueryRequest::new(
-            "namespace_does_not_exist".to_string(),
-            TEST_TABLE.to_string(),
+            NamespaceId::new(i64::MAX),
+            table_id,
             vec![],
             None,
         ));
-        for (loc, scenario) in &scenarios {
-            println!("Location: {loc:?}");
-            let err = prepare_data_to_querier(scenario, &request)
+        for scenario in &scenarios {
+            let err = prepare_data_to_querier(scenario, &request, None)
                 .await
                 .unwrap_err();
             assert_matches!(err, Error::NamespaceNotFound { .. });
         }
     }
 
-    #[tokio::test]
-    async fn test_prepare_data_to_querier_with_tombstones() {
-        test_helpers::maybe_start_logging();
+    pub struct TestRecordBatchStream {
+        schema: SchemaRef,
+        batches: Vec<Result<RecordBatch, ArrowError>>,
+    }
 
-        // make 7 scenarios for ingester data with tombstones
-        let mut scenarios = vec![];
-        for loc in &[
-            DataLocation::BUFFER,
-            DataLocation::BUFFER_SNAPSHOT,
-            DataLocation::BUFFER_PERSISTING,
-            DataLocation::BUFFER_SNAPSHOT_PERSISTING,
-            DataLocation::SNAPSHOT,
-            DataLocation::SNAPSHOT_PERSISTING,
-            DataLocation::PERSISTING,
-        ] {
-            let scenario = Arc::new(make_ingester_data_with_tombstones(*loc).await);
-            scenarios.push(scenario);
-        }
-
-        // read data from all scenarios without any filters
-        let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec![],
-            None,
-        ));
-        let expected = vec![
-            "+------------+-----+------+--------------------------------+",
-            "| city       | day | temp | time                           |",
-            "+------------+-----+------+--------------------------------+",
-            "| Andover    | mon |      | 1970-01-01T00:00:00.000000046Z |",
-            "| Andover    | tue | 56   | 1970-01-01T00:00:00.000000030Z |",
-            "| Medford    | sun | 55   | 1970-01-01T00:00:00.000000022Z |",
-            "| Medford    | wed |      | 1970-01-01T00:00:00.000000026Z |",
-            "| Reading    | mon | 58   | 1970-01-01T00:00:00.000000040Z |",
-            "| Wilmington | mon |      | 1970-01-01T00:00:00.000000035Z |",
-            "+------------+-----+------+--------------------------------+",
-        ];
-        for scenario in &scenarios {
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
-            assert_batches_sorted_eq!(&expected, &result);
-        }
-
-        // read data from all scenarios and filter out column day
-        let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec!["city".to_string(), "temp".to_string(), "time".to_string()],
-            None,
-        ));
-        let expected = vec![
-            "+------------+------+--------------------------------+",
-            "| city       | temp | time                           |",
-            "+------------+------+--------------------------------+",
-            "| Andover    |      | 1970-01-01T00:00:00.000000046Z |",
-            "| Andover    | 56   | 1970-01-01T00:00:00.000000030Z |",
-            "| Medford    |      | 1970-01-01T00:00:00.000000026Z |",
-            "| Medford    | 55   | 1970-01-01T00:00:00.000000022Z |",
-            "| Reading    | 58   | 1970-01-01T00:00:00.000000040Z |",
-            "| Wilmington |      | 1970-01-01T00:00:00.000000035Z |",
-            "+------------+------+--------------------------------+",
-        ];
-        for scenario in &scenarios {
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
-            assert_batches_sorted_eq!(&expected, &result);
-        }
-
-        // read data from all scenarios, filter out column day, city Medford, time outside range [0, 42)
-        let expr = col("city").not_eq(lit("Medford"));
-        let pred = Predicate::default().with_expr(expr).with_range(0, 42);
-        let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec!["city".to_string(), "temp".to_string(), "time".to_string()],
-            Some(pred),
-        ));
-        let expected = vec![
-            "+------------+------+--------------------------------+",
-            "| city       | temp | time                           |",
-            "+------------+------+--------------------------------+",
-            "| Andover    | 56   | 1970-01-01T00:00:00.000000030Z |",
-            "| Reading    | 58   | 1970-01-01T00:00:00.000000040Z |",
-            "| Wilmington |      | 1970-01-01T00:00:00.000000035Z |",
-            "+------------+------+--------------------------------+",
-        ];
-        for scenario in &scenarios {
-            let stream = prepare_data_to_querier(scenario, &request).await.unwrap();
-            let result = ingester_response_to_record_batches(stream).await;
-            assert_batches_sorted_eq!(&expected, &result);
+    impl TestRecordBatchStream {
+        pub fn new(batches: Vec<Result<RecordBatch, ArrowError>>, schema: SchemaRef) -> Self {
+            Self { schema, batches }
         }
     }
 
-    async fn ingester_response_to_record_batches(
-        response: IngesterQueryResponse,
-    ) -> Vec<RecordBatch> {
-        let mut last_schema = None;
-        let mut batches = vec![];
+    impl RecordBatchStream for TestRecordBatchStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
 
-        let mut stream = response.flatten();
-        while let Some(msg) = stream.try_next().await.unwrap() {
-            match msg {
-                FlatIngesterQueryResponse::StartPartition { .. } => (),
-                FlatIngesterQueryResponse::RecordBatch { batch } => {
-                    let last_schema = last_schema.as_ref().unwrap();
-                    assert_eq!(&batch.schema(), last_schema);
-                    batches.push(batch);
-                }
-                FlatIngesterQueryResponse::StartSnapshot { schema } => {
-                    last_schema = Some(schema);
-                }
+    impl futures::Stream for TestRecordBatchStream {
+        type Item = Result<RecordBatch, ArrowError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if self.batches.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(self.batches.remove(0)))
             }
         }
 
-        batches
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.batches.len(), Some(self.batches.len()))
+        }
+    }
+
+    fn lp_to_batch(lp: &str) -> RecordBatch {
+        lp_to_mutable_batch(lp).1.to_arrow(Projection::All).unwrap()
     }
 }

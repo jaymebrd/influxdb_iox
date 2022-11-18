@@ -1,22 +1,25 @@
-//! Interface logic between IOx ['Predicate`] and the predicates used
-//! by the InfluxDB Storage gRPC API
+mod column_rewrite;
 mod field_rewrite;
 mod measurement_rewrite;
+mod rewrite;
 mod value_rewrite;
 
-use crate::{rewrite, Predicate};
+use crate::Predicate;
 
+use datafusion::common::{ExprSchema, ToDFSchema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::lit;
-use datafusion::logical_plan::{
-    Column, Expr, ExprSchema, ExprSchemable, ExprSimplifiable, SimplifyInfo,
-};
+use datafusion::logical_expr::expr_rewriter::ExprRewritable;
+use datafusion::logical_expr::ExprSchemable;
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyInfo};
+use datafusion::prelude::{lit, Column, Expr};
+use observability_deps::tracing::{debug, trace};
 use schema::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use self::field_rewrite::{FieldProjection, FieldProjectionRewriter};
+use self::column_rewrite::MissingColumnRewriter;
+use self::field_rewrite::FieldProjectionRewriter;
 use self::measurement_rewrite::rewrite_measurement_references;
 use self::value_rewrite::rewrite_field_value_references;
 
@@ -54,7 +57,9 @@ pub const FIELD_COLUMN_NAME: &str = "_field";
 /// into multiple expressions (one for each field column).
 pub const VALUE_COLUMN_NAME: &str = "_value";
 
-/// Predicate used by the InfluxDB Storage gRPC API
+/// [`InfluxRpcPredicate`] implements the semantics of the InfluxDB
+/// Storage gRPC and handles mapping details such as `_field` and
+/// `_measurement` predicates into the corresponding IOx structures.
 #[derive(Debug, Clone, Default)]
 pub struct InfluxRpcPredicate {
     /// Optional table restriction. If present, restricts the results
@@ -74,7 +79,7 @@ impl InfluxRpcPredicate {
         }
     }
 
-    /// Create a new [`InfluxRpcPredicate`] with the given table
+    /// Create a new [`InfluxRpcPredicate`] for the given table
     pub fn new_table(table: impl Into<String>, predicate: Predicate) -> Self {
         Self::new(Some(std::iter::once(table.into()).collect()), predicate)
     }
@@ -83,7 +88,8 @@ impl InfluxRpcPredicate {
     /// is for the entire min/max valid range.
     ///
     /// This is used in certain cases to retain compatibility with the
-    /// existing storage engine
+    /// existing storage engine which uses the max range to mean "all
+    /// the data for all time"
     pub fn clear_timestamp_if_max_range(self) -> Self {
         Self {
             inner: self.inner.with_clear_timestamp_if_max_range(),
@@ -91,13 +97,19 @@ impl InfluxRpcPredicate {
         }
     }
 
-    /// Convert to a list of [`Predicate`] to apply to specific tables
+    /// Since InfluxRPC predicates may have references to
+    /// `_measurement` columns or other table / table schema specific
+    /// restrictions, a predicate must specialized for each table
+    /// prior to being applied by IOx to a specific table.
     ///
-    /// Returns a list of [`Predicate`] and their associated table name
+    /// See [`normalize_predicate`] for more details on the
+    /// transformations applied.
+    ///
+    /// Returns a list of (TableName, [`Predicate`])
     pub fn table_predicates(
         &self,
-        table_info: &dyn QueryDatabaseMeta,
-    ) -> DataFusionResult<Vec<(String, Predicate)>> {
+        table_info: &dyn QueryNamespaceMeta,
+    ) -> DataFusionResult<Vec<(Arc<str>, Predicate)>> {
         let table_names = match &self.table_names {
             Some(table_names) => itertools::Either::Left(table_names.iter().cloned()),
             None => itertools::Either::Right(table_info.table_names().into_iter()),
@@ -106,9 +118,18 @@ impl InfluxRpcPredicate {
         table_names
             .map(|table| {
                 let schema = table_info.table_schema(&table);
-                let predicate = normalize_predicate(&table, schema, &self.inner)?;
-
-                Ok((table, predicate))
+                let predicate = match schema {
+                    Some(schema) => normalize_predicate(&table, schema, &self.inner)?,
+                    None => {
+                        // if we don't know about this table, we can't
+                        // do any predicate specialization. This can
+                        // happen if there is a request for
+                        // "measurement fields" for a non existent
+                        // measurement, for example
+                        self.inner.clone()
+                    }
+                };
+                Ok((Arc::from(table), predicate))
             })
             .collect()
     }
@@ -125,8 +146,8 @@ impl InfluxRpcPredicate {
 }
 
 /// Information required to normalize predicates
-pub trait QueryDatabaseMeta {
-    /// Returns a list of table names in this DB
+pub trait QueryNamespaceMeta {
+    /// Returns a list of table names in this namespace
     fn table_names(&self) -> Vec<String>;
 
     /// Schema for a specific table if the table exists.
@@ -141,7 +162,7 @@ pub trait QueryDatabaseMeta {
 /// * any expression on the [VALUE_COLUMN_NAME] column is rewritten to be
 /// applied across all field columns.
 /// * any expression on the [FIELD_COLUMN_NAME] is rewritten to be
-/// applied for the particular fields.
+/// applied as a projection to specific columns.
 ///
 /// For example if the original predicate was
 /// ```text
@@ -165,39 +186,56 @@ pub trait QueryDatabaseMeta {
 /// ```
 fn normalize_predicate(
     table_name: &str,
-    schema: Option<Arc<Schema>>,
+    schema: Arc<Schema>,
     predicate: &Predicate,
 ) -> DataFusionResult<Predicate> {
     let mut predicate = predicate.clone();
-    let mut field_projections = FieldProjectionRewriter::new();
+
+    let mut field_projections = FieldProjectionRewriter::new(Arc::clone(&schema));
+    let mut missing_columums = MissingColumnRewriter::new(Arc::clone(&schema));
+
     let mut field_value_exprs = vec![];
+
+    // TODO find some better interface than a DFSchema :vomit:
+    let df_schema = schema.as_arrow().to_dfschema_ref()?;
 
     predicate.exprs = predicate
         .exprs
         .into_iter()
         .map(|e| {
-            rewrite_measurement_references(table_name, e)
+            let simplifier = ExprSimplifier::new(SimplifyAdapter::new(schema.as_ref()));
+
+            debug!(?e, "rewriting expr");
+
+            let e = rewrite_measurement_references(table_name, e)
+                .map(|e| log_rewrite(e, "rewrite_measurement_references"))
                 // Rewrite any references to `_value = some_value` to literal true values.
                 // Keeps track of these expressions, which can then be used to
                 // augment field projections with conditions using `CASE` statements.
                 .and_then(|e| rewrite_field_value_references(&mut field_value_exprs, e))
-                // Rewrite any references to `_field = a_field_name` with a literal true
-                // and keep track of referenced field names to add to the field
-                // column projection set.
+                .map(|e| log_rewrite(e, "rewrite_field_value_references"))
+                // Rewrite any references to `_field` with a literal
+                // and keep track of referenced field names to add to
+                // the field column projection set.
                 .and_then(|e| field_projections.rewrite_field_exprs(e))
+                .map(|e| log_rewrite(e, "field_projections"))
+                // remove references to columns that don't exist in this schema
+                .and_then(|e| e.rewrite(&mut missing_columums))
+                .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
                 .and_then(rewrite::rewrite)
-                // Call the core DataFusion simplification logic
-                .and_then(|e| {
-                    if let Some(schema) = &schema {
-                        let adapter = SimplifyAdapter::new(schema.as_ref());
-                        // simplify twice to ensure "full" cleanup
-                        e.simplify(&adapter)?.simplify(&adapter)
-                    } else {
-                        Ok(e)
-                    }
-                })
+                .map(|e| log_rewrite(e, "rewrite"))
+                // apply type_coercing so datafuson simplification can deal with this
+                .and_then(|e| simplifier.coerce(e, Arc::clone(&df_schema)))
+                .map(|e| log_rewrite(e, "coerce_expr"))
+                // Call DataFusion simplification logic
+                .and_then(|e| simplifier.simplify(e))
+                .map(|e| log_rewrite(e, "simplify_expr"))
                 .and_then(rewrite::simplify_predicate)
+                .map(|e| log_rewrite(e, "simplify_predicate"));
+
+            debug!(?e, "rewritten expr");
+            e
         })
         // Filter out literal true so is_empty works correctly
         .filter(|f| match f {
@@ -209,32 +247,13 @@ fn normalize_predicate(
     // Store any field value (`_value`) expressions on the `Predicate`.
     predicate.value_expr = field_value_exprs;
 
-    let predicate = match field_projections.into_projection() {
-        FieldProjection::None => predicate,
-        FieldProjection::Include(include_field_names) => {
-            predicate.with_field_columns(include_field_names)
-        }
-        FieldProjection::Exclude(exclude_field_names) => {
-            // if we don't have the schema, it means the table doesn't exist so we can safely ignore
-            if let Some(schema) = schema {
-                // add all fields other than the ones mentioned
+    // save any field projections
+    field_projections.add_to_predicate(predicate)
+}
 
-                let new_fields = schema.fields_iter().filter_map(|f| {
-                    let field_name = f.name();
-                    if !exclude_field_names.contains(field_name) {
-                        Some(field_name)
-                    } else {
-                        None
-                    }
-                });
-
-                predicate.with_field_columns(new_fields)
-            } else {
-                predicate
-            }
-        }
-    };
-    Ok(predicate)
+fn log_rewrite(expr: Expr, description: &str) -> Expr {
+    trace!(?expr, %description, "After rewrite");
+    expr
 }
 
 struct SimplifyAdapter<'a> {
@@ -300,14 +319,33 @@ mod tests {
 
     use super::*;
     use arrow::datatypes::DataType;
-    use datafusion::logical_plan::{col, lit};
+    use datafusion::{
+        prelude::{col, lit},
+        scalar::ScalarValue,
+    };
+    use datafusion_util::lit_dict;
     use test_helpers::assert_contains;
+
+    #[test]
+    fn test_normalize_predicate_coerced() {
+        let schema = schema();
+        let predicate = normalize_predicate(
+            "table",
+            Arc::clone(&schema),
+            &Predicate::new().with_expr(col("t1").eq(lit("f1"))),
+        )
+        .unwrap();
+
+        let expected = Predicate::new().with_expr(col("t1").eq(lit_dict("f1")));
+
+        assert_eq!(predicate, expected);
+    }
 
     #[test]
     fn test_normalize_predicate_field_rewrite() {
         let predicate = normalize_predicate(
             "table",
-            Some(schema()),
+            schema(),
             &Predicate::new().with_expr(col("_field").eq(lit("f1"))),
         )
         .unwrap();
@@ -321,7 +359,7 @@ mod tests {
     fn test_normalize_predicate_field_rewrite_multi_field() {
         let predicate = normalize_predicate(
             "table",
-            Some(schema()),
+            schema(),
             &Predicate::new()
                 .with_expr(col("_field").eq(lit("f1")).or(col("_field").eq(lit("f2")))),
         )
@@ -333,17 +371,49 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_predicate_field_non_existent_field() {
+        let predicate = normalize_predicate(
+            "table",
+            schema(),
+            &Predicate::new().with_expr(col("_field").eq(lit("not_a_field"))),
+        )
+        .unwrap();
+
+        let expected = Predicate::new().with_field_columns(vec![] as Vec<String>);
+        assert_eq!(&expected.field_columns, &Some(BTreeSet::new()));
+        assert_eq!(predicate, expected);
+    }
+
+    #[test]
+    fn test_normalize_predicate_field_non_tag() {
+        // should treat
+        let predicate = normalize_predicate(
+            "table",
+            schema(),
+            &Predicate::new().with_expr(col("not_a_tag").eq(lit("blarg"))),
+        )
+        .unwrap();
+
+        let expected = Predicate::new().with_expr(lit(ScalarValue::Boolean(None)));
+        assert_eq!(predicate, expected);
+    }
+
+    #[test]
     fn test_normalize_predicate_field_rewrite_multi_field_unsupported() {
         let err = normalize_predicate(
             "table",
-            Some(schema()),
+            schema(),
             &Predicate::new()
-                // predicate is connected with `and` which is not supported
-                .with_expr(col("_field").eq(lit("f1")).and(col("_field").eq(lit("f2")))),
+                // predicate refers to a column other than _field which is not supported
+                .with_expr(
+                    col("t1")
+                        .eq(lit("my_awesome_tag_value"))
+                        .or(col("_field").eq(lit("f2"))),
+                ),
         )
         .unwrap_err();
 
-        let expected = "Error during planning: Unsupported structure with _field reference";
+        let expected = r#"Error during planning: Unsupported _field predicate: t1 = Utf8("my_awesome_tag_value") OR _field = Utf8("f2")"#;
 
         assert_contains!(err.to_string(), expected);
     }
@@ -352,7 +422,7 @@ mod tests {
     fn test_normalize_predicate_field_rewrite_not_eq() {
         let predicate = normalize_predicate(
             "table",
-            Some(schema()),
+            schema(),
             &Predicate::new().with_expr(col("_field").not_eq(lit("f1"))),
         )
         .unwrap();
@@ -363,21 +433,20 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_predicate_unsupported_field_rewrite_field() {
-        let err = normalize_predicate(
+    fn test_normalize_predicate_field_rewrite_field_multi_expressions() {
+        let predicate = normalize_predicate(
             "table",
-            Some(schema()),
+            schema(),
             &Predicate::new()
                 // put = and != predicates in *different* exprs
                 .with_expr(col("_field").eq(lit("f1")))
                 .with_expr(col("_field").not_eq(lit("f2"))),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_contains!(
-            err.to_string(),
-            "Unsupported _field predicates: both '=' and '!=' present"
-        );
+        let expected = Predicate::new().with_field_columns(vec!["f1"]);
+
+        assert_eq!(predicate, expected);
     }
 
     fn schema() -> Arc<Schema> {
@@ -385,10 +454,19 @@ mod tests {
             .tag("t1")
             .tag("t2")
             .field("f1", DataType::Int64)
+            .unwrap()
             .field("f2", DataType::Int64)
+            .unwrap()
             .build()
             .unwrap();
 
         Arc::new(schema)
     }
+
+    #[allow(dead_code)]
+    const fn assert_send<T: Send>() {}
+
+    // `InfluxRpcPredicate` shall be `Send`, otherwise we will have problems constructing plans for InfluxRPC
+    // concurrently.
+    const _: () = assert_send::<InfluxRpcPredicate>();
 }

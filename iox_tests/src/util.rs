@@ -5,33 +5,44 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    Column, ColumnSet, ColumnType, CompactionLevel, KafkaPartition, KafkaTopic, Namespace,
-    NamespaceSchema, ParquetFile, ParquetFileParams, Partition, PartitionId, QueryPool,
-    SequenceNumber, Sequencer, SequencerId, Table, TableId, TableSchema, Timestamp, Tombstone,
-    TombstoneId,
+    Column, ColumnSet, ColumnType, CompactionLevel, Namespace, NamespaceSchema, ParquetFile,
+    ParquetFileParams, Partition, PartitionId, QueryPool, SequenceNumber, Shard, ShardId,
+    ShardIndex, Table, TableId, TableSchema, Timestamp, Tombstone, TombstoneId, TopicMetadata,
 };
 use datafusion::physical_plan::metrics::Count;
+use datafusion_util::MemoryStream;
 use iox_catalog::{
     interface::{get_schema_by_id, get_table_schema_by_id, Catalog, PartitionRepo},
     mem::MemCatalog,
 };
-use iox_query::{exec::Executor, provider::RecordBatchDeduplicator, util::arrow_sort_key_exprs};
+use iox_query::{
+    exec::{DedicatedExecutors, Executor, ExecutorConfig},
+    provider::RecordBatchDeduplicator,
+    util::arrow_sort_key_exprs,
+};
 use iox_time::{MockProvider, Time, TimeProvider};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
 use object_store::{memory::InMemory, DynObjectStore};
 use observability_deps::tracing::debug;
 use once_cell::sync::Lazy;
-use parquet_file::{metadata::IoxMetadata, storage::ParquetStorage};
-use schema::{
-    selection::Selection,
-    sort::{adjust_sort_key_columns, compute_sort_key, SortKey},
-    Schema,
+use parquet_file::{
+    chunk::ParquetChunk,
+    metadata::IoxMetadata,
+    storage::{ParquetStorage, StorageId},
 };
-use std::sync::Arc;
+use schema::{
+    sort::{adjust_sort_key_columns, compute_sort_key, SortKey},
+    Projection, Schema,
+};
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 /// Global executor used by all test catalogs.
-static GLOBAL_EXEC: Lazy<Arc<Executor>> = Lazy::new(|| Arc::new(Executor::new(1)));
+static GLOBAL_EXEC: Lazy<Arc<DedicatedExecutors>> =
+    Lazy::new(|| Arc::new(DedicatedExecutors::new(1)));
+
+/// Common retention period used throughout tests
+pub const TEST_RETENTION_PERIOD_NS: Option<i64> = Some(3_600 * 1_000_000_000);
 
 /// Catalog for tests
 #[derive(Debug)]
@@ -40,6 +51,7 @@ pub struct TestCatalog {
     pub catalog: Arc<dyn Catalog>,
     pub metric_registry: Arc<metric::Registry>,
     pub object_store: Arc<DynObjectStore>,
+    pub parquet_store: ParquetStorage,
     pub time_provider: Arc<MockProvider>,
     pub exec: Arc<Executor>,
 }
@@ -47,25 +59,45 @@ pub struct TestCatalog {
 impl TestCatalog {
     /// Initialize the catalog
     ///
-    /// All test catalogs use the same [`Executor`]. Use [`with_exec`](Self::with_exec) if you need a special or
+    /// All test catalogs use the same [`Executor`]. Use [`with_execs`](Self::with_execs) if you need a special or
     /// dedicated executor.
     pub fn new() -> Arc<Self> {
         let exec = Arc::clone(&GLOBAL_EXEC);
 
-        Self::with_exec(exec)
+        Self::with_execs(exec, 1)
     }
 
-    /// Initialize with given executor.
-    pub fn with_exec(exec: Arc<Executor>) -> Arc<Self> {
+    /// Initialize with partitions
+    pub fn with_target_query_partitions(target_query_partitions: usize) -> Arc<Self> {
+        let exec = Arc::clone(&GLOBAL_EXEC);
+        Self::with_execs(exec, target_query_partitions)
+    }
+
+    /// Initialize with given executors and partitions
+    pub fn with_execs(exec: Arc<DedicatedExecutors>, target_query_partitions: usize) -> Arc<Self> {
         let metric_registry = Arc::new(metric::Registry::new());
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metric_registry)));
         let object_store = Arc::new(InMemory::new());
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0)));
+        let parquet_store =
+            ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0).unwrap()));
+        let exec = Arc::new(Executor::new_with_config_and_executors(
+            ExecutorConfig {
+                num_threads: exec.num_threads(),
+                target_query_partitions,
+                object_stores: HashMap::from([(
+                    parquet_store.id(),
+                    Arc::clone(parquet_store.object_store()),
+                )]),
+            },
+            exec,
+        ));
 
         Arc::new(Self {
             metric_registry,
             catalog,
             object_store,
+            parquet_store,
             time_provider,
             exec,
         })
@@ -105,44 +137,39 @@ impl TestCatalog {
         Arc::clone(&self.exec)
     }
 
-    /// Create a sequencer in the catalog
-    pub async fn create_sequencer(self: &Arc<Self>, sequencer: i32) -> Arc<Sequencer> {
+    /// Create a shard in the catalog
+    pub async fn create_shard(self: &Arc<Self>, shard_index: i32) -> Arc<Shard> {
         let mut repos = self.catalog.repositories().await;
 
-        let kafka_topic = repos
-            .kafka_topics()
-            .create_or_get("kafka_topic")
-            .await
-            .unwrap();
-        let kafka_partition = KafkaPartition::new(sequencer);
+        let topic = repos.topics().create_or_get("topic").await.unwrap();
+        let shard_index = ShardIndex::new(shard_index);
         Arc::new(
             repos
-                .sequencers()
-                .create_or_get(&kafka_topic, kafka_partition)
+                .shards()
+                .create_or_get(&topic, shard_index)
                 .await
                 .unwrap(),
         )
     }
 
-    /// Create a namesapce in the catalog
-    pub async fn create_namespace(self: &Arc<Self>, name: &str) -> Arc<TestNamespace> {
+    /// Create a namespace in the catalog
+    pub async fn create_namespace_1hr_retention(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Arc<TestNamespace> {
         let mut repos = self.catalog.repositories().await;
 
-        let kafka_topic = repos
-            .kafka_topics()
-            .create_or_get("kafka_topic")
-            .await
-            .unwrap();
+        let topic = repos.topics().create_or_get("topic").await.unwrap();
         let query_pool = repos.query_pools().create_or_get("pool").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create(name, "1y", kafka_topic.id, query_pool.id)
+            .create(name, TEST_RETENTION_PERIOD_NS, topic.id, query_pool.id)
             .await
             .unwrap();
 
         Arc::new(TestNamespace {
             catalog: Arc::clone(self),
-            kafka_topic,
+            topic,
             query_pool,
             namespace,
         })
@@ -184,27 +211,24 @@ impl TestCatalog {
     }
 
     /// List level 0 files
-    pub async fn list_level_0_files(
-        self: &Arc<Self>,
-        sequencer_id: SequencerId,
-    ) -> Vec<ParquetFile> {
+    pub async fn list_level_0_files(self: &Arc<Self>, shard_id: ShardId) -> Vec<ParquetFile> {
         self.catalog
             .repositories()
             .await
             .parquet_files()
-            .level_0(sequencer_id)
+            .level_0(shard_id)
             .await
             .unwrap()
     }
 
     /// Count level 0 files
-    pub async fn count_level_0_files(self: &Arc<Self>, sequencer_id: SequencerId) -> usize {
+    pub async fn count_level_0_files(self: &Arc<Self>, shard_id: ShardId) -> usize {
         let level_0 = self
             .catalog
             .repositories()
             .await
             .parquet_files()
-            .level_0(sequencer_id)
+            .level_0(shard_id)
             .await
             .unwrap();
         level_0.len()
@@ -230,7 +254,7 @@ impl TestCatalog {
 #[allow(missing_docs)]
 pub struct TestNamespace {
     pub catalog: Arc<TestCatalog>,
-    pub kafka_topic: KafkaTopic,
+    pub topic: TopicMetadata,
     pub query_pool: QueryPool,
     pub namespace: Namespace,
 }
@@ -253,20 +277,20 @@ impl TestNamespace {
         })
     }
 
-    /// Create a sequencer for this namespace
-    pub async fn create_sequencer(self: &Arc<Self>, sequencer: i32) -> Arc<TestSequencer> {
+    /// Create a shard for this namespace
+    pub async fn create_shard(self: &Arc<Self>, shard_index: i32) -> Arc<TestShard> {
         let mut repos = self.catalog.catalog.repositories().await;
 
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&self.kafka_topic, KafkaPartition::new(sequencer))
+        let shard = repos
+            .shards()
+            .create_or_get(&self.topic, ShardIndex::new(shard_index))
             .await
             .unwrap();
 
-        Arc::new(TestSequencer {
+        Arc::new(TestShard {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(self),
-            sequencer,
+            shard,
         })
     }
 
@@ -277,15 +301,25 @@ impl TestNamespace {
             .await
             .unwrap()
     }
+
+    /// Set the number of columns per table allowed in this namespace.
+    pub async fn update_column_limit(&self, new_max: i32) {
+        let mut repos = self.catalog.catalog.repositories().await;
+        repos
+            .namespaces()
+            .update_column_limit(&self.namespace.name, new_max)
+            .await
+            .unwrap();
+    }
 }
 
-/// A test sequencer with ist namespace in the catalog
+/// A test shard with its namespace in the catalog
 #[derive(Debug)]
 #[allow(missing_docs)]
-pub struct TestSequencer {
+pub struct TestShard {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
-    pub sequencer: Sequencer,
+    pub shard: Shard,
 }
 
 /// A test table of a namespace in the catalog
@@ -298,19 +332,16 @@ pub struct TestTable {
 }
 
 impl TestTable {
-    /// Attach a sequencer to the table
-    pub fn with_sequencer(
-        self: &Arc<Self>,
-        sequencer: &Arc<TestSequencer>,
-    ) -> Arc<TestTableBoundSequencer> {
-        assert!(Arc::ptr_eq(&self.catalog, &sequencer.catalog));
-        assert!(Arc::ptr_eq(&self.namespace, &sequencer.namespace));
+    /// Attach a shard to the table
+    pub fn with_shard(self: &Arc<Self>, shard: &Arc<TestShard>) -> Arc<TestTableBoundShard> {
+        assert!(Arc::ptr_eq(&self.catalog, &shard.catalog));
+        assert!(Arc::ptr_eq(&self.namespace, &shard.namespace));
 
-        Arc::new(TestTableBoundSequencer {
+        Arc::new(TestTableBoundShard {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(self),
-            sequencer: Arc::clone(sequencer),
+            shard: Arc::clone(shard),
         })
     }
 
@@ -349,6 +380,35 @@ impl TestTable {
     pub async fn schema(&self) -> Schema {
         self.catalog_schema().await.try_into().unwrap()
     }
+
+    /// Read the record batches from the specified Parquet File associated with this table.
+    pub async fn read_parquet_file(&self, file: ParquetFile) -> Vec<RecordBatch> {
+        // get schema
+        let table_catalog_schema = self.catalog_schema().await;
+        let column_id_lookup = table_catalog_schema.column_id_map();
+        let table_schema = self.schema().await;
+        let selection: Vec<_> = file
+            .column_set
+            .iter()
+            .map(|id| *column_id_lookup.get(id).unwrap())
+            .collect();
+        let schema = table_schema.select_by_names(&selection).unwrap();
+
+        let chunk = ParquetChunk::new(
+            Arc::new(file),
+            Arc::new(schema),
+            self.catalog.parquet_store.clone(),
+        );
+        chunk
+            .parquet_exec_input()
+            .read_to_batches(
+                chunk.schema().as_arrow(),
+                Projection::All,
+                &chunk.store().test_df_context(),
+            )
+            .await
+            .unwrap()
+    }
 }
 
 /// A test column.
@@ -360,23 +420,23 @@ pub struct TestColumn {
     pub column: Column,
 }
 
-/// A test catalog with specified namespace, sequencer, and table
+/// A test catalog with specified namespace, shard, and table
 #[allow(missing_docs)]
-pub struct TestTableBoundSequencer {
+pub struct TestTableBoundShard {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
     pub table: Arc<TestTable>,
-    pub sequencer: Arc<TestSequencer>,
+    pub shard: Arc<TestShard>,
 }
 
-impl TestTableBoundSequencer {
+impl TestTableBoundShard {
     /// Creat a partition for the table
     pub async fn create_partition(self: &Arc<Self>, key: &str) -> Arc<TestPartition> {
         let mut repos = self.catalog.catalog.repositories().await;
 
         let partition = repos
             .partitions()
-            .create_or_get(key.into(), self.sequencer.sequencer.id, self.table.table.id)
+            .create_or_get(key.into(), self.shard.shard.id, self.table.table.id)
             .await
             .unwrap();
 
@@ -384,7 +444,7 @@ impl TestTableBoundSequencer {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            sequencer: Arc::clone(&self.sequencer),
+            shard: Arc::clone(&self.shard),
             partition,
         })
     }
@@ -399,7 +459,7 @@ impl TestTableBoundSequencer {
 
         let partition = repos
             .partitions()
-            .create_or_get(key.into(), self.sequencer.sequencer.id, self.table.table.id)
+            .create_or_get(key.into(), self.shard.shard.id, self.table.table.id)
             .await
             .unwrap();
 
@@ -413,7 +473,7 @@ impl TestTableBoundSequencer {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            sequencer: Arc::clone(&self.sequencer),
+            shard: Arc::clone(&self.shard),
             partition,
         })
     }
@@ -432,7 +492,7 @@ impl TestTableBoundSequencer {
             .tombstones()
             .create_or_get(
                 self.table.table.id,
-                self.sequencer.sequencer.id,
+                self.shard.shard.id,
                 SequenceNumber::new(sequence_number),
                 Timestamp::new(min_time),
                 Timestamp::new(max_time),
@@ -449,14 +509,14 @@ impl TestTableBoundSequencer {
     }
 }
 
-/// A test catalog with specified namespace, sequencer, table, partition
+/// A test catalog with specified namespace, shard, table, partition
 #[allow(missing_docs)]
 #[derive(Debug)]
 pub struct TestPartition {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
     pub table: Arc<TestTable>,
-    pub sequencer: Arc<TestSequencer>,
+    pub shard: Arc<TestShard>,
     pub partition: Partition,
 }
 
@@ -480,12 +540,13 @@ impl TestPartition {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            sequencer: Arc::clone(&self.sequencer),
+            shard: Arc::clone(&self.shard),
             partition,
         })
     }
 
-    /// Create a Parquet file in this partition with attributes specified by the builder
+    /// Create a Parquet file in this partition in object storage and the catalog with attributes
+    /// specified by the builder
     pub async fn create_parquet_file(
         self: &Arc<Self>,
         builder: TestParquetFileBuilder,
@@ -494,74 +555,137 @@ impl TestPartition {
             record_batch,
             table,
             schema,
-            min_seq,
-            max_seq,
+            max_sequence_number,
             min_time,
             max_time,
             file_size_bytes,
+            size_override,
             creation_time,
             compaction_level,
             to_delete,
+            object_store_id,
+            row_count,
         } = builder;
 
         let record_batch = record_batch.expect("A record batch is required");
         let table = table.expect("A table is required");
         let schema = schema.expect("A schema is required");
-
         assert_eq!(
             table, self.table.table.name,
             "Table name of line protocol and partition should have matched",
         );
 
+        assert!(
+            row_count.is_none(),
+            "Cannot have both a record batch and a manually set row_count!"
+        );
         let row_count = record_batch.num_rows();
         assert!(row_count > 0, "Parquet file must have at least 1 row");
-        let (record_batch, sort_key) = sort_batch(record_batch, schema);
+        let (record_batch, sort_key) = sort_batch(record_batch, schema.clone());
         let record_batch = dedup_batch(record_batch, &sort_key);
 
-        let object_store_id = Uuid::new_v4();
-        let min_sequence_number = SequenceNumber::new(min_seq);
-        let max_sequence_number = SequenceNumber::new(max_seq);
+        let object_store_id = object_store_id.unwrap_or_else(Uuid::new_v4);
+
         let metadata = IoxMetadata {
             object_store_id,
             creation_timestamp: now(),
             namespace_id: self.namespace.namespace.id,
             namespace_name: self.namespace.namespace.name.clone().into(),
-            sequencer_id: self.sequencer.sequencer.id,
+            shard_id: self.shard.shard.id,
             table_id: self.table.table.id,
             table_name: self.table.table.name.clone().into(),
             partition_id: self.partition.id,
             partition_key: self.partition.partition_key.clone(),
-            min_sequence_number,
             max_sequence_number,
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key.clone()),
         };
-        let table_catalog_schema = self.table.catalog_schema().await;
-        let column_set = ColumnSet::new(record_batch.schema().fields().iter().map(|f| {
-            table_catalog_schema
-                .columns
-                .get(f.name())
-                .expect("Column registered")
-                .id
-        }));
         let real_file_size_bytes = create_parquet_file(
-            ParquetStorage::new(Arc::clone(&self.catalog.object_store)),
+            ParquetStorage::new(
+                Arc::clone(&self.catalog.object_store),
+                StorageId::from("iox"),
+            ),
             &metadata,
-            record_batch,
+            record_batch.clone(),
         )
         .await;
 
+        let builder = TestParquetFileBuilder {
+            record_batch: Some(record_batch),
+            table: Some(table),
+            schema: Some(schema),
+            max_sequence_number,
+            min_time,
+            max_time,
+            file_size_bytes: Some(file_size_bytes.unwrap_or(real_file_size_bytes as u64)),
+            size_override,
+            creation_time,
+            compaction_level,
+            to_delete,
+            object_store_id: Some(object_store_id),
+            row_count: None, // will be computed from the record batch again
+        };
+
+        let result = self.create_parquet_file_catalog_record(builder).await;
+        let mut repos = self.catalog.catalog.repositories().await;
+        update_catalog_sort_key_if_needed(repos.partitions(), self.partition.id, sort_key).await;
+        result
+    }
+
+    /// Only update the catalog with the builder's info, don't create anything in object storage.
+    /// Record batch is not required in this case.
+    pub async fn create_parquet_file_catalog_record(
+        self: &Arc<Self>,
+        builder: TestParquetFileBuilder,
+    ) -> TestParquetFile {
+        let TestParquetFileBuilder {
+            record_batch,
+            max_sequence_number,
+            min_time,
+            max_time,
+            file_size_bytes,
+            size_override,
+            creation_time,
+            compaction_level,
+            to_delete,
+            object_store_id,
+            row_count,
+            ..
+        } = builder;
+
+        let table_catalog_schema = self.table.catalog_schema().await;
+
+        let (row_count, column_set) = if let Some(record_batch) = record_batch {
+            let column_set = ColumnSet::new(record_batch.schema().fields().iter().map(|f| {
+                table_catalog_schema
+                    .columns
+                    .get(f.name())
+                    .unwrap_or_else(|| panic!("Column {} is not registered", f.name()))
+                    .id
+            }));
+
+            assert!(
+                row_count.is_none(),
+                "Cannot have both a record batch and a manually set row_count!"
+            );
+
+            (record_batch.num_rows(), column_set)
+        } else {
+            let column_set =
+                ColumnSet::new(table_catalog_schema.columns.values().map(|col| col.id));
+            (row_count.unwrap_or(0), column_set)
+        };
+
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: self.sequencer.sequencer.id,
+            shard_id: self.shard.shard.id,
             namespace_id: self.namespace.namespace.id,
             table_id: self.table.table.id,
             partition_id: self.partition.id,
-            object_store_id,
-            min_sequence_number,
+            object_store_id: object_store_id.unwrap_or_else(Uuid::new_v4),
             max_sequence_number,
             min_time: Timestamp::new(min_time),
             max_time: Timestamp::new(max_time),
-            file_size_bytes: file_size_bytes.unwrap_or(real_file_size_bytes as i64),
+            file_size_bytes: file_size_bytes.unwrap_or(0) as i64,
             row_count: row_count as i64,
             created_at: Timestamp::new(creation_time),
             compaction_level,
@@ -574,7 +698,6 @@ impl TestPartition {
             .create(parquet_file_params)
             .await
             .unwrap();
-        update_catalog_sort_key_if_needed(repos.partitions(), self.partition.id, sort_key).await;
 
         if to_delete {
             repos
@@ -588,9 +711,10 @@ impl TestPartition {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            sequencer: Arc::clone(&self.sequencer),
+            shard: Arc::clone(&self.shard),
             partition: Arc::clone(self),
             parquet_file,
+            size_override,
         }
     }
 }
@@ -601,14 +725,16 @@ pub struct TestParquetFileBuilder {
     record_batch: Option<RecordBatch>,
     table: Option<String>,
     schema: Option<Schema>,
-    min_seq: i64,
-    max_seq: i64,
+    max_sequence_number: SequenceNumber,
     min_time: i64,
     max_time: i64,
-    file_size_bytes: Option<i64>,
+    file_size_bytes: Option<u64>,
+    size_override: Option<i64>,
     creation_time: i64,
     compaction_level: CompactionLevel,
     to_delete: bool,
+    object_store_id: Option<Uuid>,
+    row_count: Option<usize>,
 }
 
 impl Default for TestParquetFileBuilder {
@@ -617,14 +743,16 @@ impl Default for TestParquetFileBuilder {
             record_batch: None,
             table: None,
             schema: None,
-            min_seq: 1,
-            max_seq: 100,
+            max_sequence_number: SequenceNumber::new(100),
             min_time: now().timestamp_nanos(),
             max_time: now().timestamp_nanos(),
             file_size_bytes: None,
+            size_override: None,
             creation_time: 1,
             compaction_level: CompactionLevel::Initial,
             to_delete: false,
+            object_store_id: None,
+            row_count: None,
         }
     }
 }
@@ -634,8 +762,8 @@ impl TestParquetFileBuilder {
     pub fn with_line_protocol(self, line_protocol: &str) -> Self {
         let (table, batch) = lp_to_mutable_batch(line_protocol);
 
-        let schema = batch.schema(Selection::All).unwrap();
-        let record_batch = batch.to_arrow(Selection::All).unwrap();
+        let schema = batch.schema(Projection::All).unwrap();
+        let record_batch = batch.to_arrow(Projection::All).unwrap();
 
         self.with_record_batch(record_batch)
             .with_table(table)
@@ -657,15 +785,9 @@ impl TestParquetFileBuilder {
         self
     }
 
-    /// Specify the minimum sequence number for the parquet file metadata.
-    pub fn with_min_seq(mut self, min_seq: i64) -> Self {
-        self.min_seq = min_seq;
-        self
-    }
-
     /// Specify the maximum sequence number for the parquet file metadata.
     pub fn with_max_seq(mut self, max_seq: i64) -> Self {
-        self.max_seq = max_seq;
+        self.max_sequence_number = SequenceNumber::new(max_seq);
         self
     }
 
@@ -681,15 +803,9 @@ impl TestParquetFileBuilder {
         self
     }
 
-    /// Specify the file size, in bytes, for the parquet file metadata.
-    pub fn with_file_size_bytes(mut self, file_size_bytes: i64) -> Self {
-        self.file_size_bytes = Some(file_size_bytes);
-        self
-    }
-
     /// Specify the creation time for the parquet file metadata.
-    pub fn with_creation_time(mut self, creation_time: i64) -> Self {
-        self.creation_time = creation_time;
+    pub fn with_creation_time(mut self, creation_time: iox_time::Time) -> Self {
+        self.creation_time = creation_time.timestamp_nanos();
         self
     }
 
@@ -702,6 +818,19 @@ impl TestParquetFileBuilder {
     /// Specify whether the parquet file should be marked as deleted or not.
     pub fn with_to_delete(mut self, to_delete: bool) -> Self {
         self.to_delete = to_delete;
+        self
+    }
+
+    /// Specify the number of rows in this parquet file. If line protocol/record batch are also
+    /// set, this will panic! Only use this when you're not specifying any rows!
+    pub fn with_row_count(mut self, row_count: usize) -> Self {
+        self.row_count = Some(row_count);
+        self
+    }
+
+    /// Specify the size override to use for a CompactorParquetFile
+    pub fn with_size_override(mut self, size_override: i64) -> Self {
+        self.size_override = Some(size_override);
         self
     }
 }
@@ -754,7 +883,7 @@ async fn create_parquet_file(
     metadata: &IoxMetadata,
     record_batch: RecordBatch,
 ) -> usize {
-    let stream = futures::stream::once(async { Ok(record_batch) });
+    let stream = Box::pin(MemoryStream::new(vec![record_batch]));
     let (_meta, file_size) = store
         .upload(stream, metadata)
         .await
@@ -768,9 +897,10 @@ pub struct TestParquetFile {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
     pub table: Arc<TestTable>,
-    pub sequencer: Arc<TestSequencer>,
+    pub shard: Arc<TestShard>,
     pub partition: Arc<TestPartition>,
     pub parquet_file: ParquetFile,
+    pub size_override: Option<i64>,
 }
 
 impl TestParquetFile {
@@ -826,7 +956,7 @@ impl TestTombstone {
 
 /// Return the current time
 pub fn now() -> Time {
-    Time::from_timestamp(0, 0)
+    Time::from_timestamp(0, 0).unwrap()
 }
 
 /// Sort arrow record batch into arrow record batch and sort key.
@@ -885,5 +1015,5 @@ fn dedup_batch(record_batch: RecordBatch, sort_key: &SortKey) -> RecordBatch {
         batches.push(batch);
     }
 
-    RecordBatch::concat(&schema, &batches).unwrap()
+    arrow::compute::concat_batches(&schema, &batches).unwrap()
 }

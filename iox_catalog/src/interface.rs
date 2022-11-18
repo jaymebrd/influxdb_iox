@@ -1,18 +1,17 @@
-//! This module contains the traits and data objects for the Catalog API.
+//! Traits and data types for the IOx Catalog API.
 
 use async_trait::async_trait;
 use data_types::{
-    Column, ColumnSchema, ColumnType, KafkaPartition, KafkaTopic, KafkaTopicId, Namespace,
-    NamespaceId, NamespaceSchema, ParquetFile, ParquetFileId, ParquetFileParams, Partition,
-    PartitionId, PartitionInfo, PartitionKey, ProcessedTombstone, QueryPool, QueryPoolId,
-    SequenceNumber, Sequencer, SequencerId, Table, TableId, TablePartition, TableSchema, Timestamp,
-    Tombstone, TombstoneId,
+    Column, ColumnSchema, ColumnType, ColumnTypeCount, CompactionLevel, Namespace, NamespaceId,
+    NamespaceSchema, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionId,
+    PartitionKey, PartitionParam, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber,
+    Shard, ShardId, ShardIndex, SkippedCompaction, Table, TableId, TablePartition, TableSchema,
+    Timestamp, Tombstone, TombstoneId, TopicId, TopicMetadata,
 };
 use iox_time::TimeProvider;
 use snafu::{OptionExt, Snafu};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    convert::TryFrom,
     fmt::Debug,
     sync::Arc,
 };
@@ -20,6 +19,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
+#[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("name {} already exists", name))]
     NameExists { name: String },
@@ -33,8 +33,8 @@ pub enum Error {
     #[snafu(display("column {} is type {} but write has type {}", name, existing, new))]
     ColumnTypeMismatch {
         name: String,
-        existing: String,
-        new: String,
+        existing: ColumnType,
+        new: ColumnType,
     },
 
     #[snafu(display(
@@ -115,46 +115,62 @@ pub enum Error {
 
     #[snafu(display("database setup error: {}", source))]
     Setup { source: sqlx::Error },
+
+    #[snafu(display(
+        "could not record a skipped compaction for partition {partition_id}: {source}"
+    ))]
+    CouldNotRecordSkippedCompaction {
+        source: sqlx::Error,
+        partition_id: PartitionId,
+    },
+
+    #[snafu(display("could not list skipped compactions: {source}"))]
+    CouldNotListSkippedCompactions { source: sqlx::Error },
+
+    #[snafu(display("could not delete skipped compactions: {source}"))]
+    CouldNotDeleteSkippedCompactions { source: sqlx::Error },
 }
 
 /// A specialized `Error` for Catalog errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Trait that contains methods for working with the catalog
+/// Methods for working with the catalog.
 #[async_trait]
 pub trait Catalog: Send + Sync + Debug {
     /// Setup catalog for usage and apply possible migrations.
     async fn setup(&self) -> Result<(), Error>;
 
-    /// Create a new transaction.
+    /// Creates a new [`Transaction`].
     ///
-    /// Creating transactions is potentially expensive. Holding one consumes resources. The number of parallel active
-    /// transactions might be limited per catalog, so you MUST NOT rely on the ability to create multiple transactions in
-    /// parallel for correctness but only for scaling.
+    /// Creating transactions is potentially expensive. Holding one consumes resources. The number
+    /// of parallel active transactions might be limited per catalog, so you MUST NOT rely on the
+    /// ability to create multiple transactions in parallel for correctness. Parallel transactions
+    /// must only be used for scaling.
     async fn start_transaction(&self) -> Result<Box<dyn Transaction>, Error>;
 
-    /// Access the repositories w/o a transaction scope.
+    /// Accesses the repositories without a transaction scope.
     async fn repositories(&self) -> Box<dyn RepoCollection>;
 
-    /// Get metric registry associated w/ this catalog.
+    /// Gets metric registry associated with this catalog.
     fn metrics(&self) -> Arc<metric::Registry>;
 
-    /// Get the time provider associated w/ this catalog.
+    /// Gets the time provider associated with this catalog.
     fn time_provider(&self) -> Arc<dyn TimeProvider>;
 }
 
 /// Secret module for [sealed traits].
 ///
 /// [sealed traits]: https://rust-lang.github.io/api-guidelines/future-proofing.html#sealed-traits-protect-against-downstream-implementations-c-sealed
+#[doc(hidden)]
 pub(crate) mod sealed {
     use super::*;
 
     /// Helper trait to implement commit and abort of an transaction.
     ///
-    /// The problem is that both methods cannot take `self` directly, otherwise the [`Transaction`] would not be object
-    /// safe. Therefore we can only take a reference. To avoid that a user uses a transaction after calling one of the
-    /// finalizers, we use a tiny trick and take `Box<dyn Transaction>` in our public interface and use a sealed trait
-    /// for the actual implementation.
+    /// The problem is that both methods cannot take `self` directly, otherwise the [`Transaction`]
+    /// would not be object safe. Therefore we can only take a reference. To avoid that a user uses
+    /// a transaction after calling one of the finalizers, we use a tiny trick and take `Box<dyn
+    /// Transaction>` in our public interface and use a sealed trait for the actual implementation.
     #[async_trait]
     pub trait TransactionFinalize: Send + Sync + Debug {
         async fn commit_inplace(&mut self) -> Result<(), Error>;
@@ -162,34 +178,40 @@ pub(crate) mod sealed {
     }
 }
 
-/// transaction of a [`Catalog`].
+/// Transaction in a [`Catalog`] (similar to a database transaction).
 ///
-/// A transaction provides a consistent view on data and stages writes (this normally maps to a database transaction).
-/// Repositories can cheaply be borrowed from it. To finalize a transaction, call [commit](Self::commit) or [abort](Self::abort).
+/// A transaction provides a consistent view on data and stages writes.
+/// To finalize a transaction, call [commit](Self::commit) or [abort](Self::abort).
 ///
-/// Note that after any method in this transaction (including all repositories derived from it) returned an error, the
-/// transaction MIGHT be poisoned and will return errors for all operations, depending on the backend.
+/// Repositories can cheaply be borrowed from it.
+///
+/// Note that after any method in this transaction (including all repositories derived from it)
+/// returns an error, the transaction MIGHT be poisoned and will return errors for all operations,
+/// depending on the backend.
 ///
 ///
 /// # Drop
-/// Dropping a transaction without calling [`commit`](Self::commit) or [`abort`](Self::abort) will abort the
-/// transaction. However resources might not be released immediately, so it is adviced to always call
-/// [`abort`](Self::abort) when you want to enforce that. Dropping w/o commiting/aborting will also log a warning.
+///
+/// Dropping a transaction without calling [`commit`](Self::commit) or [`abort`](Self::abort) will
+/// abort the transaction. However resources might not be released immediately, so it is adviced to
+/// always call [`abort`](Self::abort) when you want to enforce that. Dropping w/o
+/// commiting/aborting will also log a warning.
 #[async_trait]
 pub trait Transaction: Send + Sync + Debug + sealed::TransactionFinalize + RepoCollection {
-    /// Commit transaction.
+    /// Commits a transaction.
     ///
     /// # Error Handling
-    /// If successfull, all changes will be visible to other transactions.
     ///
-    /// If an error is returned, the transaction may or or not be committed. This might be due to IO errors after the
-    /// transaction was finished. However in either case, the transaction is atomic and can only succeed or fail
-    /// entirely.
+    /// If successful, all changes will be visible to other transactions.
+    ///
+    /// If an error is returned, the transaction may or or not be committed. This might be due to
+    /// IO errors after the transaction was finished. However in either case, the transaction is
+    /// atomic and can only succeed or fail entirely.
     async fn commit(mut self: Box<Self>) -> Result<(), Error> {
         self.commit_inplace().await
     }
 
-    /// Abort transaction, throwing away all changes.
+    /// Aborts the transaction, throwing away all changes.
     async fn abort(mut self: Box<Self>) -> Result<(), Error> {
         self.abort_inplace().await
     }
@@ -198,56 +220,59 @@ pub trait Transaction: Send + Sync + Debug + sealed::TransactionFinalize + RepoC
 impl<T> Transaction for T where T: Send + Sync + Debug + sealed::TransactionFinalize + RepoCollection
 {}
 
-/// Collection of the different repositories that the catalog offers.
+/// Methods for working with the catalog's various repositories (collections of entities).
 ///
-/// The methods (e.g. "get or create") for handling entities (e.g. namespaces, tombstones, ...) are grouped into
-/// *repositories* with one *repository* per entity. A repository can be thought of a collection of a single entity.
-/// Getting repositories from the transaction is cheap.
+/// # Repositories
 ///
-/// Note that a repository might internally map to a wide range of different storage abstractions, ranging from one or
-/// more SQL tables over key-value key spaces to simple in-memory vectors. The user should and must not care how these
-/// are implemented.
+/// The methods (e.g. `create_*` or `get_by_*`) for handling entities (namespaces, tombstones,
+/// etc.) are grouped into *repositories* with one repository per entity. A repository can be
+/// thought of a collection of a single kind of entity. Getting repositories from the transaction
+/// is cheap.
+///
+/// A repository might internally map to a wide range of different storage abstractions, ranging
+/// from one or more SQL tables over key-value key spaces to simple in-memory vectors. The user
+/// should and must not care how these are implemented.
 #[async_trait]
 pub trait RepoCollection: Send + Sync + Debug {
-    /// repo for kafka topics
-    fn kafka_topics(&mut self) -> &mut dyn KafkaTopicRepo;
+    /// Repository for [topics](data_types::TopicMetadata).
+    fn topics(&mut self) -> &mut dyn TopicMetadataRepo;
 
-    /// repo fo rquery pools
+    /// Repository for [query pools](data_types::QueryPool).
     fn query_pools(&mut self) -> &mut dyn QueryPoolRepo;
 
-    /// repo for namespaces
+    /// Repository for [namespaces](data_types::Namespace).
     fn namespaces(&mut self) -> &mut dyn NamespaceRepo;
 
-    /// repo for tables
+    /// Repository for [tables](data_types::Table).
     fn tables(&mut self) -> &mut dyn TableRepo;
 
-    /// repo for columns
+    /// Repository for [columns](data_types::Column).
     fn columns(&mut self) -> &mut dyn ColumnRepo;
 
-    /// repo for sequencers
-    fn sequencers(&mut self) -> &mut dyn SequencerRepo;
+    /// Repository for [shards](data_types::Shard).
+    fn shards(&mut self) -> &mut dyn ShardRepo;
 
-    /// repo for partitions
+    /// Repository for [partitions](data_types::Partition).
     fn partitions(&mut self) -> &mut dyn PartitionRepo;
 
-    /// repo for tombstones
+    /// Repository for [tombstones](data_types::Tombstone).
     fn tombstones(&mut self) -> &mut dyn TombstoneRepo;
 
-    /// repo for parquet_files
+    /// Repository for [Parquet files](data_types::ParquetFile).
     fn parquet_files(&mut self) -> &mut dyn ParquetFileRepo;
 
-    /// repo for processed_tombstones
+    /// Repository for [processed tombstones](data_types::ProcessedTombstone).
     fn processed_tombstones(&mut self) -> &mut dyn ProcessedTombstoneRepo;
 }
 
-/// Functions for working with Kafka topics in the catalog.
+/// Functions for working with topics in the catalog.
 #[async_trait]
-pub trait KafkaTopicRepo: Send + Sync {
-    /// Creates the kafka topic in the catalog or gets the existing record by name.
-    async fn create_or_get(&mut self, name: &str) -> Result<KafkaTopic>;
+pub trait TopicMetadataRepo: Send + Sync {
+    /// Creates the topic in the catalog or gets the existing record by name.
+    async fn create_or_get(&mut self, name: &str) -> Result<TopicMetadata>;
 
-    /// Gets the kafka topic by its unique name
-    async fn get_by_name(&mut self, name: &str) -> Result<Option<KafkaTopic>>;
+    /// Gets the topic by its unique name
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<TopicMetadata>>;
 }
 
 /// Functions for working with query pools in the catalog.
@@ -262,12 +287,20 @@ pub trait QueryPoolRepo: Send + Sync {
 pub trait NamespaceRepo: Send + Sync {
     /// Creates the namespace in the catalog. If one by the same name already exists, an
     /// error is returned.
+    /// Specify `None` for `retention_period_ns` to get infinite retention.
     async fn create(
         &mut self,
         name: &str,
-        retention_duration: &str,
-        kafka_topic_id: KafkaTopicId,
+        retention_period_ns: Option<i64>,
+        topic_id: TopicId,
         query_pool_id: QueryPoolId,
+    ) -> Result<Namespace>;
+
+    /// Update retention period for a namespace
+    async fn update_retention_period(
+        &mut self,
+        name: &str,
+        retention_period_ns: Option<i64>,
     ) -> Result<Namespace>;
 
     /// List all namespaces.
@@ -307,37 +340,6 @@ pub trait TableRepo: Send + Sync {
 
     /// List all tables.
     async fn list(&mut self) -> Result<Vec<Table>>;
-
-    /// Gets the table persistence info for the given sequencer
-    async fn get_table_persist_info(
-        &mut self,
-        sequencer_id: SequencerId,
-        namespace_id: NamespaceId,
-        table_name: &str,
-    ) -> Result<Option<TablePersistInfo>>;
-}
-
-/// Information for a table's persistence information for a specific sequencer from the catalog
-#[derive(Debug, Copy, Clone, Eq, PartialEq, sqlx::FromRow)]
-pub struct TablePersistInfo {
-    /// sequencer the sequence numbers are associated with
-    pub sequencer_id: SequencerId,
-    /// the global identifier for the table
-    pub table_id: TableId,
-    /// max sequence number from this table's tombstones for this sequencer
-    pub tombstone_max_sequence_number: Option<SequenceNumber>,
-}
-
-/// Parameters necessary to perform a batch insert of
-/// [`ColumnRepo::create_or_get()`].
-#[derive(Debug)]
-pub struct ColumnUpsertRequest<'a> {
-    /// The name of the column.
-    pub name: &'a str,
-    /// The table ID to which it belongs.
-    pub table_id: TableId,
-    /// The data type of the column.
-    pub column_type: ColumnType,
 }
 
 /// Functions for working with columns in the catalog
@@ -353,14 +355,19 @@ pub trait ColumnRepo: Send + Sync {
         column_type: ColumnType,
     ) -> Result<Column>;
 
-    /// Perform a bulk upsert of columns.
+    /// Perform a bulk upsert of columns specified by a map of column name to column type.
     ///
     /// Implementations make no guarantees as to the ordering or atomicity of
     /// the batch of column upsert operations - a batch upsert may partially
     /// commit, in which case an error MUST be returned by the implementation.
-    async fn create_or_get_many(
+    ///
+    /// Per-namespace limits on the number of columns allowed per table are explicitly NOT checked
+    /// by this function, hence the name containing `unchecked`. It is expected that the caller
+    /// will check this first-- and yes, this is racy.
+    async fn create_or_get_many_unchecked(
         &mut self,
-        columns: &[ColumnUpsertRequest<'_>],
+        table_id: TableId,
+        columns: HashMap<&str, ColumnType>,
     ) -> Result<Vec<Column>>;
 
     /// Lists all columns in the passed in namespace id.
@@ -371,56 +378,62 @@ pub trait ColumnRepo: Send + Sync {
 
     /// List all columns.
     async fn list(&mut self) -> Result<Vec<Column>>;
+
+    /// List column types and their count for a table
+    async fn list_type_count_by_table_id(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<Vec<ColumnTypeCount>>;
 }
 
-/// Functions for working with sequencers in the catalog
+/// Functions for working with shards in the catalog
 #[async_trait]
-pub trait SequencerRepo: Send + Sync {
-    /// create a sequencer record for the kafka topic and partition or return the existing record
+pub trait ShardRepo: Send + Sync {
+    /// create a shard record for the topic and shard index or return the existing record
     async fn create_or_get(
         &mut self,
-        topic: &KafkaTopic,
-        partition: KafkaPartition,
-    ) -> Result<Sequencer>;
+        topic: &TopicMetadata,
+        shard_index: ShardIndex,
+    ) -> Result<Shard>;
 
-    /// get the sequencer record by `KafkaTopicId` and `KafkaPartition`
-    async fn get_by_topic_id_and_partition(
+    /// get the shard record by `TopicId` and `ShardIndex`
+    async fn get_by_topic_id_and_shard_index(
         &mut self,
-        topic_id: KafkaTopicId,
-        partition: KafkaPartition,
-    ) -> Result<Option<Sequencer>>;
+        topic_id: TopicId,
+        shard_index: ShardIndex,
+    ) -> Result<Option<Shard>>;
 
-    /// list all sequencers
-    async fn list(&mut self) -> Result<Vec<Sequencer>>;
+    /// list all shards
+    async fn list(&mut self) -> Result<Vec<Shard>>;
 
-    /// list all sequencers for a given kafka topic
-    async fn list_by_kafka_topic(&mut self, topic: &KafkaTopic) -> Result<Vec<Sequencer>>;
+    /// list all shards for a given topic
+    async fn list_by_topic(&mut self, topic: &TopicMetadata) -> Result<Vec<Shard>>;
 
-    /// updates the `min_unpersisted_sequence_number` for a sequencer
+    /// updates the `min_unpersisted_sequence_number` for a shard
     async fn update_min_unpersisted_sequence_number(
         &mut self,
-        sequencer_id: SequencerId,
+        shard: ShardId,
         sequence_number: SequenceNumber,
     ) -> Result<()>;
 }
 
 /// Functions for working with IOx partitions in the catalog. Note that these are how IOx splits up
-/// data within a database, which is differenet than Kafka partitions.
+/// data within a namespace, which is different than Kafka partitions.
 #[async_trait]
 pub trait PartitionRepo: Send + Sync {
-    /// create or get a partition record for the given partition key, sequencer and table
+    /// create or get a partition record for the given partition key, shard and table
     async fn create_or_get(
         &mut self,
         key: PartitionKey,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         table_id: TableId,
     ) -> Result<Partition>;
 
     /// get partition by ID
     async fn get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>>;
 
-    /// return partitions for a given sequencer
-    async fn list_by_sequencer(&mut self, sequencer_id: SequencerId) -> Result<Vec<Partition>>;
+    /// return partitions for a given shard
+    async fn list_by_shard(&mut self, shard_id: ShardId) -> Result<Vec<Partition>>;
 
     /// return partitions for a given namespace
     async fn list_by_namespace(&mut self, namespace_id: NamespaceId) -> Result<Vec<Partition>>;
@@ -428,19 +441,51 @@ pub trait PartitionRepo: Send + Sync {
     /// return the partitions by table id
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>>;
 
-    /// return the partition record, the namespace name it belongs to, and the table name it is
-    /// under
-    async fn partition_info_by_id(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<PartitionInfo>>;
-
-    /// Update the sort key for the partition
+    /// Update the sort key for the partition.
+    ///
+    /// NOTE: it is expected that ONLY the ingesters update sort keys for
+    /// existing partitions.
     async fn update_sort_key(
         &mut self,
         partition_id: PartitionId,
         sort_key: &[&str],
     ) -> Result<Partition>;
+
+    /// Record an instance of a partition being selected for compaction but compaction was not
+    /// completed for the specified reason.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_skipped_compaction(
+        &mut self,
+        partition_id: PartitionId,
+        reason: &str,
+        num_files: usize,
+        limit_num_files: usize,
+        limit_num_files_first_in_partition: usize,
+        estimated_bytes: u64,
+        limit_bytes: u64,
+    ) -> Result<()>;
+
+    /// List the records of compacting a partition being skipped. This is mostly useful for testing.
+    async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>>;
+
+    /// Delete the records of skipping a partition being compacted.
+    async fn delete_skipped_compactions(
+        &mut self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>>;
+
+    /// Update the per-partition persistence watermark.
+    ///
+    /// The given `sequence_number` is the inclusive maximum [`SequenceNumber`]
+    /// of the most recently persisted data for this partition.
+    async fn update_persisted_sequence_number(
+        &mut self,
+        partition_id: PartitionId,
+        sequence_number: SequenceNumber,
+    ) -> Result<()>;
+
+    /// Return the N most recently created partitions for the specified shards.
+    async fn most_recent_n(&mut self, n: usize, shards: &[ShardId]) -> Result<Vec<Partition>>;
 }
 
 /// Functions for working with tombstones in the catalog
@@ -450,7 +495,7 @@ pub trait TombstoneRepo: Send + Sync {
     async fn create_or_get(
         &mut self,
         table_id: TableId,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         sequence_number: SequenceNumber,
         min_time: Timestamp,
         max_time: Timestamp,
@@ -466,12 +511,12 @@ pub trait TombstoneRepo: Send + Sync {
     /// get tombstones of the given id
     async fn get_by_id(&mut self, tombstone_id: TombstoneId) -> Result<Option<Tombstone>>;
 
-    /// return all tombstones for the sequencer with a sequence number greater than that
+    /// return all tombstones for the shard with a sequence number greater than that
     /// passed in. This will be used by the ingester on startup to see what tombstones
     /// might have to be applied to data that is read from the write buffer.
-    async fn list_tombstones_by_sequencer_greater_than(
+    async fn list_tombstones_by_shard_greater_than(
         &mut self,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         sequence_number: SequenceNumber,
     ) -> Result<Vec<Tombstone>>;
 
@@ -480,14 +525,14 @@ pub trait TombstoneRepo: Send + Sync {
 
     /// Return all tombstones that have:
     ///
-    /// - the specified sequencer ID and table ID
+    /// - the specified shard ID and table ID
     /// - a sequence number greater than the specified sequence number
     /// - a time period that overlaps with the specified time period
     ///
     /// Used during compaction.
     async fn list_tombstones_for_time_range(
         &mut self,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         table_id: TableId,
         sequence_number: SequenceNumber,
         min_time: Timestamp,
@@ -504,13 +549,16 @@ pub trait ParquetFileRepo: Send + Sync {
     /// Flag the parquet file for deletion
     async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()>;
 
-    /// Get all parquet files for a sequencer with a max_sequence_number greater than the
+    /// Flag all parquet files for deletion that are older than their namespace's retention period.
+    async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>>;
+
+    /// Get all parquet files for a shard with a max_sequence_number greater than the
     /// one passed in. The ingester will use this on startup to see which files were persisted
     /// that are greater than its min_unpersisted_number so that it can discard any data in
     /// these partitions on replay.
-    async fn list_by_sequencer_greater_than(
+    async fn list_by_shard_greater_than(
         &mut self,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         sequence_number: SequenceNumber,
     ) -> Result<Vec<ParquetFile>>;
 
@@ -529,19 +577,46 @@ pub trait ParquetFileRepo: Send + Sync {
     /// Returns the deleted records.
     async fn delete_old(&mut self, older_than: Timestamp) -> Result<Vec<ParquetFile>>;
 
-    /// List parquet files for a given sequencer with compaction level 0 and other criteria that
+    /// Delete parquet files that were marked to be deleted earlier than the specified time.
+    ///
+    /// Returns the deleted IDs only.
+    ///
+    /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge changes. The caller
+    /// MAY call this method again if the result was NOT empty.
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ParquetFileId>>;
+
+    /// List parquet files for a given shard with compaction level 0 and other criteria that
     /// define a file as a candidate for compaction
-    async fn level_0(&mut self, sequencer_id: SequencerId) -> Result<Vec<ParquetFile>>;
+    async fn level_0(&mut self, shard_id: ShardId) -> Result<Vec<ParquetFile>>;
 
     /// List parquet files for a given table partition, in a given time range, with compaction
-    /// level 2, and other criteria that define a file as a candidate for compaction with a level 0
+    /// level 1, and other criteria that define a file as a candidate for compaction with a level 0
     /// file
-    async fn level_2(
+    async fn level_1(
         &mut self,
         table_partition: TablePartition,
         min_time: Timestamp,
         max_time: Timestamp,
     ) -> Result<Vec<ParquetFile>>;
+
+    /// List the most recent highest throughput partition for a given shard
+    async fn recent_highest_throughput_partitions(
+        &mut self,
+        shard_id: ShardId,
+        time_at_num_minutes_ago: Timestamp,
+        min_num_files: usize,
+        num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>>;
+
+    /// List partitions with the most level 0 + level 1 files created earlier than
+    /// `older_than_num_hours` hours ago for a given shard. In other words, "cold" partitions
+    /// that need compaction.
+    async fn most_cold_files_partitions(
+        &mut self,
+        shard_id: ShardId,
+        time_in_the_past: Timestamp,
+        num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>>;
 
     /// List parquet files for a given partition that are NOT marked as
     /// [`to_delete`](ParquetFile::to_delete).
@@ -551,11 +626,12 @@ pub trait ParquetFileRepo: Send + Sync {
     ) -> Result<Vec<ParquetFile>>;
 
     /// Update the compaction level of the specified parquet files to
-    /// `CompactionLevel::FileNonOverlapped`
+    /// the specified [`CompactionLevel`].
     /// Returns the IDs of the files that were successfully updated.
-    async fn update_to_level_2(
+    async fn update_compaction_level(
         &mut self,
         parquet_file_ids: &[ParquetFileId],
+        compaction_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>>;
 
     /// Verify if the parquet file exists by selecting its id
@@ -564,16 +640,26 @@ pub trait ParquetFileRepo: Send + Sync {
     /// Return count
     async fn count(&mut self) -> Result<i64>;
 
-    /// Return count of files of given tableId and sequenceId that
-    /// overlap with the given min_time and max_time and have sequencer number
+    /// Return count of level-0 files of given tableId and shardId that
+    /// overlap with the given min_time and max_time and have sequence number
     /// smaller the given one
-    async fn count_by_overlaps(
+    async fn count_by_overlaps_with_level_0(
         &mut self,
         table_id: TableId,
-        sequencer_id: SequencerId,
+        shard_id: ShardId,
         min_time: Timestamp,
         max_time: Timestamp,
         sequence_number: SequenceNumber,
+    ) -> Result<i64>;
+
+    /// Return count of level-1 files of given tableId and shardId that
+    /// overlap with the given min_time and max_time
+    async fn count_by_overlaps_with_level_1(
+        &mut self,
+        table_id: TableId,
+        shard_id: ShardId,
+        min_time: Timestamp,
+        max_time: Timestamp,
     ) -> Result<i64>;
 
     /// Return the parquet file with the given object store id
@@ -645,8 +731,10 @@ where
 
     let mut namespace = NamespaceSchema::new(
         namespace.id,
-        namespace.kafka_topic_id,
+        namespace.topic_id,
         namespace.query_pool_id,
+        namespace.max_columns_per_table,
+        namespace.retention_period_ns,
     );
 
     let mut table_id_to_schema = BTreeMap::new();
@@ -656,23 +744,13 @@ where
 
     for c in columns {
         let (_, t) = table_id_to_schema.get_mut(&c.table_id).unwrap();
-        match ColumnType::try_from(c.column_type) {
-            Ok(column_type) => {
-                t.columns.insert(
-                    c.name,
-                    ColumnSchema {
-                        id: c.id,
-                        column_type,
-                    },
-                );
-            }
-            _ => {
-                return Err(Error::UnknownColumnType {
-                    data_type: c.column_type,
-                    name: c.name.to_string(),
-                });
-            }
-        }
+        t.columns.insert(
+            c.name,
+            ColumnSchema {
+                id: c.id,
+                column_type: c.column_type,
+            },
+        );
     }
 
     for (_, (table_name, schema)) in table_id_to_schema {
@@ -691,23 +769,13 @@ where
     let mut schema = TableSchema::new(id);
 
     for c in columns {
-        match ColumnType::try_from(c.column_type) {
-            Ok(column_type) => {
-                schema.columns.insert(
-                    c.name,
-                    ColumnSchema {
-                        id: c.id,
-                        column_type,
-                    },
-                );
-            }
-            _ => {
-                return Err(Error::UnknownColumnType {
-                    data_type: c.column_type,
-                    name: c.name,
-                });
-            }
-        }
+        schema.columns.insert(
+            c.name,
+            ColumnSchema {
+                id: c.id,
+                column_type: c.column_type,
+            },
+        );
     }
 
     Ok(schema)
@@ -798,7 +866,13 @@ pub async fn list_schemas(
         // was created, or have no tables/columns (and therefore have no entry
         // in "joined").
         .filter_map(move |v| {
-            let mut ns = NamespaceSchema::new(v.id, v.kafka_topic_id, v.query_pool_id);
+            let mut ns = NamespaceSchema::new(
+                v.id,
+                v.topic_id,
+                v.query_pool_id,
+                v.max_columns_per_table,
+                v.retention_period_ns,
+            );
             ns.tables = joined.remove(&v.id)?;
             Some((v, ns))
         });
@@ -808,10 +882,11 @@ pub async fn list_schemas(
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use crate::validate_or_insert_schema;
+    use crate::{validate_or_insert_schema, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES};
 
     use super::*;
     use ::test_helpers::{assert_contains, tracing::TracingCapture};
+    use assert_matches::assert_matches;
     use data_types::{ColumnId, ColumnSet, CompactionLevel};
     use metric::{Attributes, DurationHistogram, Metric};
     use std::{
@@ -822,19 +897,21 @@ pub(crate) mod test_helpers {
 
     pub(crate) async fn test_catalog(catalog: Arc<dyn Catalog>) {
         test_setup(Arc::clone(&catalog)).await;
-        test_kafka_topic(Arc::clone(&catalog)).await;
+        test_topic(Arc::clone(&catalog)).await;
         test_query_pool(Arc::clone(&catalog)).await;
         test_namespace(Arc::clone(&catalog)).await;
         test_table(Arc::clone(&catalog)).await;
         test_column(Arc::clone(&catalog)).await;
-        test_sequencer(Arc::clone(&catalog)).await;
+        test_shards(Arc::clone(&catalog)).await;
         test_partition(Arc::clone(&catalog)).await;
         test_tombstone(Arc::clone(&catalog)).await;
         test_tombstones_by_parquet_file(Arc::clone(&catalog)).await;
         test_parquet_file(Arc::clone(&catalog)).await;
         test_parquet_file_compaction_level_0(Arc::clone(&catalog)).await;
-        test_parquet_file_compaction_level_2(Arc::clone(&catalog)).await;
-        test_update_to_compaction_level_2(Arc::clone(&catalog)).await;
+        test_parquet_file_compaction_level_1(Arc::clone(&catalog)).await;
+        test_most_cold_files_partitions(Arc::clone(&catalog)).await;
+        test_recent_highest_throughput_partitions(Arc::clone(&catalog)).await;
+        test_update_to_compaction_level_1(Arc::clone(&catalog)).await;
         test_processed_tombstones(Arc::clone(&catalog)).await;
         test_list_by_partiton_not_to_delete(Arc::clone(&catalog)).await;
         test_txn_isolation(Arc::clone(&catalog)).await;
@@ -842,15 +919,15 @@ pub(crate) mod test_helpers {
         test_list_schemas(Arc::clone(&catalog)).await;
 
         let metrics = catalog.metrics();
-        assert_metric_hit(&*metrics, "kafka_create_or_get");
-        assert_metric_hit(&*metrics, "query_create_or_get");
-        assert_metric_hit(&*metrics, "namespace_create");
-        assert_metric_hit(&*metrics, "table_create_or_get");
-        assert_metric_hit(&*metrics, "column_create_or_get");
-        assert_metric_hit(&*metrics, "sequencer_create_or_get");
-        assert_metric_hit(&*metrics, "partition_create_or_get");
-        assert_metric_hit(&*metrics, "tombstone_create_or_get");
-        assert_metric_hit(&*metrics, "parquet_create");
+        assert_metric_hit(&metrics, "topic_create_or_get");
+        assert_metric_hit(&metrics, "query_create_or_get");
+        assert_metric_hit(&metrics, "namespace_create");
+        assert_metric_hit(&metrics, "table_create_or_get");
+        assert_metric_hit(&metrics, "column_create_or_get");
+        assert_metric_hit(&metrics, "shard_create_or_get");
+        assert_metric_hit(&metrics, "partition_create_or_get");
+        assert_metric_hit(&metrics, "tombstone_create_or_get");
+        assert_metric_hit(&metrics, "parquet_create");
     }
 
     async fn test_setup(catalog: Arc<dyn Catalog>) {
@@ -858,18 +935,18 @@ pub(crate) mod test_helpers {
         catalog.setup().await.expect("second catalog setup");
     }
 
-    async fn test_kafka_topic(catalog: Arc<dyn Catalog>) {
+    async fn test_topic(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka_repo = repos.kafka_topics();
+        let topic_repo = repos.topics();
 
-        let k = kafka_repo.create_or_get("foo").await.unwrap();
-        assert!(k.id > KafkaTopicId::new(0));
+        let k = topic_repo.create_or_get("foo").await.unwrap();
+        assert!(k.id > TopicId::new(0));
         assert_eq!(k.name, "foo");
-        let k2 = kafka_repo.create_or_get("foo").await.unwrap();
+        let k2 = topic_repo.create_or_get("foo").await.unwrap();
         assert_eq!(k, k2);
-        let k3 = kafka_repo.get_by_name("foo").await.unwrap().unwrap();
+        let k3 = topic_repo.get_by_name("foo").await.unwrap().unwrap();
         assert_eq!(k3, k);
-        let k3 = kafka_repo.get_by_name("asdf").await.unwrap();
+        let k3 = topic_repo.get_by_name("asdf").await.unwrap();
         assert!(k3.is_none());
     }
 
@@ -886,21 +963,28 @@ pub(crate) mod test_helpers {
 
     async fn test_namespace(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
 
         let namespace_name = "test_namespace";
         let namespace = repos
             .namespaces()
-            .create(namespace_name, "inf", kafka.id, pool.id)
+            .create(namespace_name, None, topic.id, pool.id)
             .await
             .unwrap();
         assert!(namespace.id > NamespaceId::new(0));
         assert_eq!(namespace.name, namespace_name);
 
+        // Assert default values for service protection limits.
+        assert_eq!(namespace.max_tables, DEFAULT_MAX_TABLES);
+        assert_eq!(
+            namespace.max_columns_per_table,
+            DEFAULT_MAX_COLUMNS_PER_TABLE
+        );
+
         let conflict = repos
             .namespaces()
-            .create(namespace_name, "inf", kafka.id, pool.id)
+            .create(namespace_name, None, topic.id, pool.id)
             .await;
         assert!(matches!(
             conflict.unwrap_err(),
@@ -940,7 +1024,7 @@ pub(crate) mod test_helpers {
         let namespace2_name = "test_namespace2";
         let namespace2 = repos
             .namespaces()
-            .create(namespace2_name, "inf", kafka.id, pool.id)
+            .create(namespace2_name, None, topic.id, pool.id)
             .await
             .unwrap();
         let mut namespaces = repos.namespaces().list().await.unwrap();
@@ -962,15 +1046,65 @@ pub(crate) mod test_helpers {
             .await
             .expect("namespace should be updateable");
         assert_eq!(NEW_COLUMN_LIMIT, modified.max_columns_per_table);
+
+        const NEW_RETENTION_PERIOD_NS: i64 = 5 * 60 * 60 * 1000 * 1000 * 1000;
+        let modified = repos
+            .namespaces()
+            .update_retention_period(namespace_name, Some(NEW_RETENTION_PERIOD_NS))
+            .await
+            .expect("namespace should be updateable");
+        assert_eq!(
+            NEW_RETENTION_PERIOD_NS,
+            modified.retention_period_ns.unwrap()
+        );
+
+        let modified = repos
+            .namespaces()
+            .update_retention_period(namespace_name, None)
+            .await
+            .expect("namespace should be updateable");
+        assert!(modified.retention_period_ns.is_none());
+
+        // create namespace with retention period NULL
+        let namespace3_name = "test_namespace3";
+        let namespace3 = repos
+            .namespaces()
+            .create(namespace3_name, None, topic.id, pool.id)
+            .await
+            .expect("namespace with NULL retention should be created");
+        assert!(namespace3.retention_period_ns.is_none());
+
+        // create namespace with retention period
+        let namespace4_name = "test_namespace4";
+        let namespace4 = repos
+            .namespaces()
+            .create(
+                namespace4_name,
+                Some(NEW_RETENTION_PERIOD_NS),
+                topic.id,
+                pool.id,
+            )
+            .await
+            .expect("namespace with 5-hour retention should be created");
+        assert_eq!(
+            NEW_RETENTION_PERIOD_NS,
+            namespace4.retention_period_ns.unwrap()
+        );
+        // reset retention period to NULL to avoid affecting later tests
+        repos
+            .namespaces()
+            .update_retention_period(namespace4_name, None)
+            .await
+            .expect("namespace should be updateable");
     }
 
     async fn test_table(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("namespace_table_test", "inf", kafka.id, pool.id)
+            .create("namespace_table_test", None, topic.id, pool.id)
             .await
             .unwrap();
 
@@ -1007,7 +1141,7 @@ pub(crate) mod test_helpers {
         // test we can create a table of the same name in a different namespace
         let namespace2 = repos
             .namespaces()
-            .create("two", "inf", kafka.id, pool.id)
+            .create("two", None, topic.id, pool.id)
             .await
             .unwrap();
         assert_ne!(namespace, namespace2);
@@ -1072,55 +1206,6 @@ pub(crate) mod test_helpers {
         let list = repos.tables().list().await.unwrap();
         assert_eq!(list.as_slice(), [tt, test_table, foo_table]);
 
-        // test we can get table persistence info with no persistence so far
-        let seq = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(555))
-            .await
-            .unwrap();
-        let ti = repos
-            .tables()
-            .get_table_persist_info(seq.id, t.namespace_id, &t.name)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ti,
-            TablePersistInfo {
-                sequencer_id: seq.id,
-                table_id: t.id,
-                tombstone_max_sequence_number: None
-            }
-        );
-
-        // and now with a tombstone persisted
-        let tombstone = repos
-            .tombstones()
-            .create_or_get(
-                t.id,
-                seq.id,
-                SequenceNumber::new(2001),
-                Timestamp::new(1),
-                Timestamp::new(10),
-                "wahtevs",
-            )
-            .await
-            .unwrap();
-        let ti = repos
-            .tables()
-            .get_table_persist_info(seq.id, t.namespace_id, &t.name)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ti,
-            TablePersistInfo {
-                sequencer_id: seq.id,
-                table_id: t.id,
-                tombstone_max_sequence_number: Some(tombstone.sequence_number),
-            }
-        );
-
         // test per-namespace table limits
         let latest = repos
             .namespaces()
@@ -1143,11 +1228,11 @@ pub(crate) mod test_helpers {
 
     async fn test_column(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("namespace_column_test", "inf", kafka.id, pool.id)
+            .create("namespace_column_test", None, topic.id, pool.id)
             .await
             .unwrap();
         let table = repos
@@ -1171,20 +1256,14 @@ pub(crate) mod test_helpers {
         assert!(c.id > ColumnId::new(0));
         assert_eq!(c, cc);
 
-        // test that attempting to create an already defined column of a different type returns error
+        // test that attempting to create an already defined column of a different type returns
+        // error
         let err = repos
             .columns()
             .create_or_get("column_test", table.id, ColumnType::U64)
             .await
             .expect_err("should error with wrong column type");
-        assert!(matches!(
-            err,
-            Error::ColumnTypeMismatch {
-                name: _,
-                existing: _,
-                new: _
-            }
-        ));
+        assert!(matches!(err, Error::ColumnTypeMismatch { .. }));
 
         // test that we can create a column of the same name under a different table
         let table2 = repos
@@ -1199,23 +1278,6 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_ne!(c, ccc);
 
-        let cols3 = repos
-            .columns()
-            .create_or_get_many(&[
-                ColumnUpsertRequest {
-                    name: "a",
-                    table_id: table2.id,
-                    column_type: ColumnType::U64,
-                },
-                ColumnUpsertRequest {
-                    name: "a",
-                    table_id: table.id,
-                    column_type: ColumnType::U64,
-                },
-            ])
-            .await
-            .unwrap();
-
         let columns = repos
             .columns()
             .list_by_namespace_id(namespace.id)
@@ -1223,17 +1285,56 @@ pub(crate) mod test_helpers {
             .unwrap();
 
         let mut want = vec![c.clone(), ccc];
-        want.extend(cols3.clone());
         assert_eq!(want, columns);
 
         let columns = repos.columns().list_by_table_id(table.id).await.unwrap();
 
-        let want2 = vec![c, cols3[1].clone()];
+        let want2 = vec![c];
         assert_eq!(want2, columns);
+
+        // Add another tag column into table2
+        let c3 = repos
+            .columns()
+            .create_or_get("b", table2.id, ColumnType::Tag)
+            .await
+            .unwrap();
+        // Listing count of column types
+        let mut col_count = repos
+            .columns()
+            .list_type_count_by_table_id(table2.id)
+            .await
+            .unwrap();
+        let mut expect = vec![
+            ColumnTypeCount {
+                col_type: ColumnType::Tag,
+                count: 1,
+            },
+            ColumnTypeCount {
+                col_type: ColumnType::U64,
+                count: 1,
+            },
+        ];
+        expect.sort_by_key(|c| c.col_type);
+        col_count.sort_by_key(|c| c.col_type);
+        assert_eq!(expect, col_count);
 
         // Listing columns should return all columns in the catalog
         let list = repos.columns().list().await.unwrap();
+        want.extend([c3]);
         assert_eq!(list, want);
+
+        // test create_or_get_many_unchecked, below column limit
+        let mut columns = HashMap::new();
+        columns.insert("column_test", ColumnType::Tag);
+        columns.insert("new_column", ColumnType::Tag);
+        let table1_columns = repos
+            .columns()
+            .create_or_get_many_unchecked(table.id, columns)
+            .await
+            .unwrap();
+        let mut table1_column_names: Vec<_> = table1_columns.iter().map(|c| &c.name).collect();
+        table1_column_names.sort();
+        assert_eq!(table1_column_names, vec!["column_test", "new_column"]);
 
         // test per-namespace column limits
         repos
@@ -1253,82 +1354,96 @@ pub(crate) mod test_helpers {
                 table_id: _,
             }
         ));
-    }
 
-    async fn test_sequencer(catalog: Arc<dyn Catalog>) {
-        let mut repos = catalog.repositories().await;
-        let kafka = repos
-            .kafka_topics()
-            .create_or_get("sequencer_test")
+        // test per-namespace column limits are NOT enforced with create_or_get_many_unchecked
+        let table3 = repos
+            .tables()
+            .create_or_get("test_table_3", namespace.id)
             .await
             .unwrap();
+        let mut columns = HashMap::new();
+        columns.insert("apples", ColumnType::Tag);
+        columns.insert("oranges", ColumnType::Tag);
+        let table3_columns = repos
+            .columns()
+            .create_or_get_many_unchecked(table3.id, columns)
+            .await
+            .unwrap();
+        let mut table3_column_names: Vec<_> = table3_columns.iter().map(|c| &c.name).collect();
+        table3_column_names.sort();
+        assert_eq!(table3_column_names, vec!["apples", "oranges"]);
+    }
 
-        // Create 10 sequencers
+    async fn test_shards(catalog: Arc<dyn Catalog>) {
+        let mut repos = catalog.repositories().await;
+        let topic = repos.topics().create_or_get("shard_test").await.unwrap();
+
+        // Create 10 shards
         let mut created = BTreeMap::new();
-        for partition in 1..=10 {
-            let sequencer = repos
-                .sequencers()
-                .create_or_get(&kafka, KafkaPartition::new(partition))
+        for shard_index in 1..=10 {
+            let shard = repos
+                .shards()
+                .create_or_get(&topic, ShardIndex::new(shard_index))
                 .await
-                .expect("failed to create sequencer");
-            created.insert(sequencer.id, sequencer);
+                .expect("failed to create shard");
+            created.insert(shard.id, shard);
         }
 
         // List them and assert they match
         let listed = repos
-            .sequencers()
-            .list_by_kafka_topic(&kafka)
+            .shards()
+            .list_by_topic(&topic)
             .await
-            .expect("failed to list sequencers")
+            .expect("failed to list shards")
             .into_iter()
             .map(|v| (v.id, v))
             .collect::<BTreeMap<_, _>>();
 
         assert_eq!(created, listed);
 
-        // get by the sequencer id and partition
-        let kafka_partition = KafkaPartition::new(1);
-        let sequencer = repos
-            .sequencers()
-            .get_by_topic_id_and_partition(kafka.id, kafka_partition)
+        // get by the topic and shard index
+        let shard_index = ShardIndex::new(1);
+        let shard = repos
+            .shards()
+            .get_by_topic_id_and_shard_index(topic.id, shard_index)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(kafka.id, sequencer.kafka_topic_id);
-        assert_eq!(kafka_partition, sequencer.kafka_partition);
+        assert_eq!(topic.id, shard.topic_id);
+        assert_eq!(shard_index, shard.shard_index);
 
         // update the number
         repos
-            .sequencers()
-            .update_min_unpersisted_sequence_number(sequencer.id, SequenceNumber::new(53))
+            .shards()
+            .update_min_unpersisted_sequence_number(shard.id, SequenceNumber::new(53))
             .await
             .unwrap();
-        let updated_sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, kafka_partition)
+        let updated_shard = repos
+            .shards()
+            .create_or_get(&topic, shard_index)
             .await
             .unwrap();
-        assert_eq!(updated_sequencer.id, sequencer.id);
+        assert_eq!(updated_shard.id, shard.id);
         assert_eq!(
-            updated_sequencer.min_unpersisted_sequence_number,
+            updated_shard.min_unpersisted_sequence_number,
             SequenceNumber::new(53)
         );
 
-        let sequencer = repos
-            .sequencers()
-            .get_by_topic_id_and_partition(kafka.id, KafkaPartition::new(523))
+        let shard = repos
+            .shards()
+            .get_by_topic_id_and_shard_index(topic.id, ShardIndex::new(523))
             .await
             .unwrap();
-        assert!(sequencer.is_none());
+        assert!(shard.is_none());
     }
 
     async fn test_partition(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("namespace_partition_test", "inf", kafka.id, pool.id)
+            .create("namespace_partition_test", None, topic.id, pool.id)
             .await
             .unwrap();
         let table = repos
@@ -1336,14 +1451,14 @@ pub(crate) mod test_helpers {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
-        let other_sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(2))
+        let other_shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(2))
             .await
             .unwrap();
 
@@ -1351,14 +1466,14 @@ pub(crate) mod test_helpers {
         for key in ["foo", "bar"] {
             let partition = repos
                 .partitions()
-                .create_or_get(key.into(), sequencer.id, table.id)
+                .create_or_get(key.into(), shard.id, table.id)
                 .await
                 .expect("failed to create partition");
             created.insert(partition.id, partition);
         }
         let other_partition = repos
             .partitions()
-            .create_or_get("asdf".into(), other_sequencer.id, table.id)
+            .create_or_get("asdf".into(), other_shard.id, table.id)
             .await
             .unwrap();
 
@@ -1382,7 +1497,7 @@ pub(crate) mod test_helpers {
         // List them and assert they match
         let listed = repos
             .partitions()
-            .list_by_sequencer(sequencer.id)
+            .list_by_shard(shard.id)
             .await
             .expect("failed to list partitions")
             .into_iter()
@@ -1403,21 +1518,10 @@ pub(crate) mod test_helpers {
         created.insert(other_partition.id, other_partition.clone());
         assert_eq!(created, listed);
 
-        // test get_partition_info_by_id
-        let info = repos
-            .partitions()
-            .partition_info_by_id(other_partition.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(info.partition, other_partition);
-        assert_eq!(info.table_name, "test_table");
-        assert_eq!(info.namespace_name, "namespace_partition_test");
-
         // test list_by_namespace
         let namespace2 = repos
             .namespaces()
-            .create("namespace_partition_test2", "inf", kafka.id, pool.id)
+            .create("namespace_partition_test2", None, topic.id, pool.id)
             .await
             .unwrap();
         let table2 = repos
@@ -1427,7 +1531,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .partitions()
-            .create_or_get("some_key".into(), sequencer.id, table2.id)
+            .create_or_get("some_key".into(), shard.id, table2.id)
             .await
             .expect("failed to create partition");
         let listed = repos
@@ -1491,15 +1595,130 @@ pub(crate) mod test_helpers {
             updated_other_partition.sort_key,
             vec!["tag2", "tag1", "tag3 , with comma", "time"]
         );
+
+        // The compactor can log why compaction was skipped
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
+        assert!(
+            skipped_compactions.is_empty(),
+            "Expected no skipped compactions, got: {skipped_compactions:?}"
+        );
+        repos
+            .partitions()
+            .record_skipped_compaction(other_partition.id, "I am le tired", 1, 2, 4, 10, 20)
+            .await
+            .unwrap();
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
+        assert_eq!(skipped_compactions.len(), 1);
+        assert_eq!(skipped_compactions[0].partition_id, other_partition.id);
+        assert_eq!(skipped_compactions[0].reason, "I am le tired");
+        assert_eq!(skipped_compactions[0].num_files, 1);
+        assert_eq!(skipped_compactions[0].limit_num_files, 2);
+        assert_eq!(skipped_compactions[0].estimated_bytes, 10);
+        assert_eq!(skipped_compactions[0].limit_bytes, 20);
+
+        // Only save the last reason that any particular partition was skipped (really if the
+        // partition appears in the skipped compactions, it shouldn't become a compaction candidate
+        // again, but race conditions and all that)
+        repos
+            .partitions()
+            .record_skipped_compaction(other_partition.id, "I'm on fire", 11, 12, 24, 110, 120)
+            .await
+            .unwrap();
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
+        assert_eq!(skipped_compactions.len(), 1);
+        assert_eq!(skipped_compactions[0].partition_id, other_partition.id);
+        assert_eq!(skipped_compactions[0].reason, "I'm on fire");
+        assert_eq!(skipped_compactions[0].num_files, 11);
+        assert_eq!(skipped_compactions[0].limit_num_files, 12);
+        assert_eq!(skipped_compactions[0].estimated_bytes, 110);
+        assert_eq!(skipped_compactions[0].limit_bytes, 120);
+
+        let deleted_skipped_compaction = repos
+            .partitions()
+            .delete_skipped_compactions(other_partition.id)
+            .await
+            .unwrap()
+            .expect("The skipped compaction should have been returned");
+
+        assert_eq!(deleted_skipped_compaction.partition_id, other_partition.id);
+        assert_eq!(deleted_skipped_compaction.reason, "I'm on fire");
+        assert_eq!(deleted_skipped_compaction.num_files, 11);
+        assert_eq!(deleted_skipped_compaction.limit_num_files, 12);
+        assert_eq!(deleted_skipped_compaction.estimated_bytes, 110);
+        assert_eq!(deleted_skipped_compaction.limit_bytes, 120);
+
+        let not_deleted_skipped_compaction = repos
+            .partitions()
+            .delete_skipped_compactions(other_partition.id)
+            .await
+            .unwrap();
+
+        assert!(
+            not_deleted_skipped_compaction.is_none(),
+            "There should be no skipped compation",
+        );
+
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
+        assert!(
+            skipped_compactions.is_empty(),
+            "Expected no skipped compactions, got: {skipped_compactions:?}"
+        );
+
+        // Test setting and reading the per-partition persistence numbers
+        let partition = repos
+            .partitions()
+            .get_by_id(other_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(partition.persisted_sequence_number, None);
+        // Set
+        repos
+            .partitions()
+            .update_persisted_sequence_number(other_partition.id, SequenceNumber::new(42))
+            .await
+            .unwrap();
+        // Read
+        let partition = repos
+            .partitions()
+            .get_by_id(other_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partition.persisted_sequence_number,
+            Some(SequenceNumber::new(42))
+        );
+
+        let recent = repos
+            .partitions()
+            .most_recent_n(10, &[shard.id, other_shard.id])
+            .await
+            .expect("should list most recent");
+        assert_eq!(recent.len(), 4);
+
+        let recent = repos
+            .partitions()
+            .most_recent_n(10, &[shard.id])
+            .await
+            .expect("should list most recent");
+        assert_eq!(recent.len(), 3);
+
+        let recent2 = repos
+            .partitions()
+            .most_recent_n(10, &[shard.id, ShardId::new(42)])
+            .await
+            .expect("should list most recent");
+        assert_eq!(recent, recent2);
     }
 
     async fn test_tombstone(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("namespace_tombstone_test", "inf", kafka.id, pool.id)
+            .create("namespace_tombstone_test", None, topic.id, pool.id)
             .await
             .unwrap();
         let table = repos
@@ -1512,9 +1731,9 @@ pub(crate) mod test_helpers {
             .create_or_get("other", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
 
@@ -1524,7 +1743,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(1),
                 min_time,
                 max_time,
@@ -1533,7 +1752,7 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert!(t1.id > TombstoneId::new(0));
-        assert_eq!(t1.sequencer_id, sequencer.id);
+        assert_eq!(t1.shard_id, shard.id);
         assert_eq!(t1.sequence_number, SequenceNumber::new(1));
         assert_eq!(t1.min_time, min_time);
         assert_eq!(t1.max_time, max_time);
@@ -1542,7 +1761,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 other_table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(2),
                 min_time.add(10),
                 max_time.add(10),
@@ -1554,7 +1773,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(3),
                 min_time.add(10),
                 max_time.add(10),
@@ -1565,7 +1784,7 @@ pub(crate) mod test_helpers {
 
         let listed = repos
             .tombstones()
-            .list_tombstones_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(1))
+            .list_tombstones_by_shard_greater_than(shard.id, SequenceNumber::new(1))
             .await
             .unwrap();
         assert_eq!(vec![t2.clone(), t3.clone()], listed);
@@ -1583,7 +1802,7 @@ pub(crate) mod test_helpers {
         // test list_by_namespace
         let namespace2 = repos
             .namespaces()
-            .create("namespace_tombstone_test2", "inf", kafka.id, pool.id)
+            .create("namespace_tombstone_test2", None, topic.id, pool.id)
             .await
             .unwrap();
         let table2 = repos
@@ -1595,7 +1814,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table2.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(1),
                 min_time.add(10),
                 max_time.add(10),
@@ -1607,7 +1826,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table2.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(2),
                 min_time.add(10),
                 max_time.add(10),
@@ -1658,14 +1877,14 @@ pub(crate) mod test_helpers {
 
     async fn test_tombstones_by_parquet_file(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
             .create(
                 "namespace_tombstones_by_parquet_file_test",
-                "inf",
-                kafka.id,
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -1680,19 +1899,19 @@ pub(crate) mod test_helpers {
             .create_or_get("other", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(57))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(57))
             .await
             .unwrap();
-        let other_sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(58))
+        let other_shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(58))
             .await
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -1701,12 +1920,11 @@ pub(crate) mod test_helpers {
         let max_sequence_number = SequenceNumber::new(140);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number,
             min_time,
             max_time,
@@ -1722,12 +1940,12 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        // Create a tombstone with another sequencer
+        // Create a tombstone with another shard
         repos
             .tombstones()
             .create_or_get(
                 table.id,
-                other_sequencer.id,
+                other_shard.id,
                 max_sequence_number + 100,
                 min_time,
                 max_time,
@@ -1736,12 +1954,12 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        // Create a tombstone with the same sequencer but a different table
+        // Create a tombstone with the same shard but a different table
         repos
             .tombstones()
             .create_or_get(
                 other_table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 101,
                 min_time,
                 max_time,
@@ -1755,7 +1973,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number - 10,
                 min_time,
                 max_time,
@@ -1769,7 +1987,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number,
                 min_time,
                 max_time,
@@ -1783,7 +2001,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 102,
                 min_time - 5,
                 min_time - 4,
@@ -1797,7 +2015,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 103,
                 max_time + 1,
                 max_time + 2,
@@ -1811,7 +2029,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 104,
                 min_time,
                 max_time,
@@ -1825,7 +2043,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 105,
                 min_time - 1,
                 min_time + 1,
@@ -1839,7 +2057,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 max_sequence_number + 106,
                 max_time - 1,
                 max_time + 1,
@@ -1851,7 +2069,7 @@ pub(crate) mod test_helpers {
         let tombstones = repos
             .tombstones()
             .list_tombstones_for_time_range(
-                sequencer.id,
+                shard.id,
                 table.id,
                 max_sequence_number,
                 min_time,
@@ -1878,11 +2096,11 @@ pub(crate) mod test_helpers {
 
     async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create("namespace_parquet_file_test", "inf", kafka.id, pool.id)
+            .create("namespace_parquet_file_test", None, topic.id, pool.id)
             .await
             .unwrap();
         let table = repos
@@ -1895,29 +2113,28 @@ pub(crate) mod test_helpers {
             .create_or_get("other", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
         let other_partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, other_table.id)
+            .create_or_get("one".into(), shard.id, other_table.id)
             .await
             .unwrap();
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(140),
             min_time: Timestamp::new(1),
             max_time: Timestamp::new(10),
@@ -1953,7 +2170,6 @@ pub(crate) mod test_helpers {
             table_id: other_partition.table_id,
             partition_id: other_partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(45),
             max_sequence_number: SequenceNumber::new(200),
             min_time: Timestamp::new(50),
             max_time: Timestamp::new(60),
@@ -1970,13 +2186,13 @@ pub(crate) mod test_helpers {
 
         let files = repos
             .parquet_files()
-            .list_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(1))
+            .list_by_shard_greater_than(shard.id, SequenceNumber::new(1))
             .await
             .unwrap();
         assert_eq!(vec![parquet_file.clone(), other_file.clone()], files);
         let files = repos
             .parquet_files()
-            .list_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(150))
+            .list_by_shard_greater_than(shard.id, SequenceNumber::new(150))
             .await
             .unwrap();
         assert_eq!(vec![other_file.clone()], files);
@@ -1998,7 +2214,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let files = repos
             .parquet_files()
-            .list_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(1))
+            .list_by_shard_greater_than(shard.id, SequenceNumber::new(1))
             .await
             .unwrap();
         let marked_deleted = files.first().unwrap();
@@ -2039,7 +2255,7 @@ pub(crate) mod test_helpers {
         // test list_by_namespace_not_to_delete
         let namespace2 = repos
             .namespaces()
-            .create("namespace_parquet_file_test1", "inf", kafka.id, pool.id)
+            .create("namespace_parquet_file_test1", None, topic.id, pool.id)
             .await
             .unwrap();
         let table2 = repos
@@ -2049,7 +2265,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("foo".into(), sequencer.id, table2.id)
+            .create_or_get("foo".into(), shard.id, table2.id)
             .await
             .unwrap();
         let files = repos
@@ -2065,7 +2281,6 @@ pub(crate) mod test_helpers {
             object_store_id: Uuid::new_v4(),
             min_time: Timestamp::new(1),
             max_time: Timestamp::new(10),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(10),
             ..parquet_file_params
         };
@@ -2079,7 +2294,6 @@ pub(crate) mod test_helpers {
             object_store_id: Uuid::new_v4(),
             min_time: Timestamp::new(50),
             max_time: Timestamp::new(60),
-            min_sequence_number: SequenceNumber::new(11),
             max_sequence_number: SequenceNumber::new(11),
             ..f1_params
         };
@@ -2099,11 +2313,14 @@ pub(crate) mod test_helpers {
             object_store_id: Uuid::new_v4(),
             min_time: Timestamp::new(50),
             max_time: Timestamp::new(60),
-            min_sequence_number: SequenceNumber::new(12),
             max_sequence_number: SequenceNumber::new(12),
             ..f2_params
         };
-        let f3 = repos.parquet_files().create(f3_params).await.unwrap();
+        let f3 = repos
+            .parquet_files()
+            .create(f3_params.clone())
+            .await
+            .unwrap();
         let files = repos
             .parquet_files()
             .list_by_namespace_not_to_delete(namespace2.id)
@@ -2117,7 +2334,7 @@ pub(crate) mod test_helpers {
             .list_by_namespace_not_to_delete(namespace2.id)
             .await
             .unwrap();
-        assert_eq!(vec![f1, f3], files);
+        assert_eq!(vec![f1.clone(), f3.clone()], files);
 
         let files = repos
             .parquet_files()
@@ -2126,13 +2343,13 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert!(files.is_empty());
 
-        // test count_by_overlaps
+        // test count_by_overlaps_with_level_0
         // not time overlap
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(11),
                 Timestamp::new(20),
                 SequenceNumber::new(20),
@@ -2143,9 +2360,9 @@ pub(crate) mod test_helpers {
         // overlaps with f1
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(1),
                 Timestamp::new(10),
                 SequenceNumber::new(20),
@@ -2157,9 +2374,9 @@ pub(crate) mod test_helpers {
         // f2 is deleted and should not be counted
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(7),
                 Timestamp::new(55),
                 SequenceNumber::new(20),
@@ -2170,9 +2387,9 @@ pub(crate) mod test_helpers {
         // overlaps with f1 and f3 but on different time range
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(1),
                 Timestamp::new(100),
                 SequenceNumber::new(20),
@@ -2183,9 +2400,9 @@ pub(crate) mod test_helpers {
         // overlaps with f3
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(15),
                 Timestamp::new(100),
                 SequenceNumber::new(20),
@@ -2193,12 +2410,12 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert_eq!(count, 1);
-        // no overlaps due to smaller sequnce number
+        // no overlaps due to smaller sequence number
         let count = repos
             .parquet_files()
-            .count_by_overlaps(
+            .count_by_overlaps_with_level_0(
                 partition2.table_id,
-                sequencer.id,
+                shard.id,
                 Timestamp::new(15),
                 Timestamp::new(100),
                 SequenceNumber::new(2),
@@ -2206,18 +2423,201 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert_eq!(count, 0);
+
+        // test count_by_overlaps_with_level_1
+        //
+        // no level-1 file -> nothing overlap
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(1),
+                Timestamp::new(200),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Let upgrade all files (only f1 and f3 are not deleted) to level 1
+        repos
+            .parquet_files()
+            .update_compaction_level(&[f1.id], CompactionLevel::FileNonOverlapped)
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .update_compaction_level(&[f3.id], CompactionLevel::FileNonOverlapped)
+            .await
+            .unwrap();
+        //
+        // not overlap with any
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(11),
+                Timestamp::new(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        // overlaps with f1
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(1),
+                Timestamp::new(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        // overlaps with f1 and f3
+        // f2 is deleted and should not be counted
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(7),
+                Timestamp::new(55),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        // overlaps with f1 and f3 but on different time range
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(1),
+                Timestamp::new(100),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        // overlaps with f3
+        let count = repos
+            .parquet_files()
+            .count_by_overlaps_with_level_1(
+                partition2.table_id,
+                shard.id,
+                Timestamp::new(15),
+                Timestamp::new(100),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // test delete_old_ids_only
+        let older_than = Timestamp::new(
+            (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
+        );
+        let ids = repos
+            .parquet_files()
+            .delete_old_ids_only(older_than)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+
+        // test retention-based flagging for deletion
+        // Since mem catalog has default retention 1 hour, let us first set it to 0 means infinite
+        let namespaces = repos.namespaces().list().await.expect("listing namespaces");
+        for namespace in namespaces {
+            repos
+                .namespaces()
+                .update_retention_period(&namespace.name, None) // infinite
+                .await
+                .unwrap();
+        }
+
+        // 1. with no retention period set on the ns, nothing should get flagged
+        let ids = repos
+            .parquet_files()
+            .flag_for_delete_by_retention()
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+        // 2. set ns retention period to one hour then create some files before and after and
+        //    ensure correct files get deleted
+        repos
+            .namespaces()
+            .update_retention_period(&namespace.name, Some(60 * 60 * 1_000_000_000)) // 1 hour
+            .await
+            .unwrap();
+        let f4_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            max_time: Timestamp::new(
+                // a bit over an hour ago
+                (catalog.time_provider().now() - Duration::from_secs(60 * 65)).timestamp_nanos(),
+            ),
+            ..f3_params
+        };
+        let f4 = repos
+            .parquet_files()
+            .create(f4_params.clone())
+            .await
+            .unwrap();
+        let f5_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            max_time: Timestamp::new(
+                // a bit under an hour ago
+                (catalog.time_provider().now() - Duration::from_secs(60 * 55)).timestamp_nanos(),
+            ),
+            ..f4_params
+        };
+        let f5 = repos
+            .parquet_files()
+            .create(f5_params.clone())
+            .await
+            .unwrap();
+        let ids = repos
+            .parquet_files()
+            .flag_for_delete_by_retention()
+            .await
+            .unwrap();
+        assert!(ids.len() > 1); // it's also going to flag f1, f2 & f3 because they have low max
+                                // timestamps but i don't want this test to be brittle if those
+                                // values change so i'm not asserting len == 4
+        let f4 = repos
+            .parquet_files()
+            .get_by_object_store_id(f4.object_store_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_matches!(f4.to_delete, Some(_)); // f4 is > 1hr old
+        let f5 = repos
+            .parquet_files()
+            .get_by_object_store_id(f5.object_store_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_matches!(f5.to_delete, None); // f5 is < 1hr old
+
+        // call flag_for_delete_by_retention() again and nothing should be flagged because they've
+        // already been flagged
+        let ids = repos
+            .parquet_files()
+            .flag_for_delete_by_retention()
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
     }
 
     async fn test_parquet_file_compaction_level_0(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
             .create(
                 "namespace_parquet_file_compaction_level_0_test",
-                "inf",
-                kafka.id,
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -2227,20 +2627,20 @@ pub(crate) mod test_helpers {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(100))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(100))
             .await
             .unwrap();
-        let other_sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(101))
+        let other_shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(101))
             .await
             .unwrap();
 
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -2248,12 +2648,11 @@ pub(crate) mod test_helpers {
         let max_time = Timestamp::new(10);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(140),
             min_time,
             max_time,
@@ -2270,16 +2669,16 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        // Create a compaction level 0 file for some other sequencer
-        let other_sequencer_params = ParquetFileParams {
-            sequencer_id: other_sequencer.id,
+        // Create a compaction level 0 file for some other shard
+        let other_shard_params = ParquetFileParams {
+            shard_id: other_shard.id,
             object_store_id: Uuid::new_v4(),
             ..parquet_file_params.clone()
         };
 
-        let _other_sequencer_file = repos
+        let _other_shard_file = repos
             .parquet_files()
-            .create(other_sequencer_params)
+            .create(other_shard_params)
             .await
             .unwrap();
 
@@ -2299,21 +2698,21 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        // Create a compaction level 2 file
-        let level_2_params = ParquetFileParams {
+        // Create a compaction level 1 file
+        let level_1_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             ..parquet_file_params.clone()
         };
-        let level_2_file = repos.parquet_files().create(level_2_params).await.unwrap();
+        let level_1_file = repos.parquet_files().create(level_1_params).await.unwrap();
         repos
             .parquet_files()
-            .update_to_level_2(&[level_2_file.id])
+            .update_compaction_level(&[level_1_file.id], CompactionLevel::FileNonOverlapped)
             .await
             .unwrap();
 
-        // Level 0 parquet files for a sequencer should contain only those that match the right
+        // Level 0 parquet files for a shard should contain only those that match the right
         // criteria
-        let level_0 = repos.parquet_files().level_0(sequencer.id).await.unwrap();
+        let level_0 = repos.parquet_files().level_0(shard.id).await.unwrap();
         let mut level_0_ids: Vec<_> = level_0.iter().map(|pf| pf.id).collect();
         level_0_ids.sort();
         let expected = vec![parquet_file];
@@ -2327,16 +2726,16 @@ pub(crate) mod test_helpers {
         );
     }
 
-    async fn test_parquet_file_compaction_level_2(catalog: Arc<dyn Catalog>) {
+    async fn test_parquet_file_compaction_level_1(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
             .create(
-                "namespace_parquet_file_compaction_level_2_test",
-                "inf",
-                kafka.id,
+                "namespace_parquet_file_compaction_level_1_test",
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -2351,24 +2750,24 @@ pub(crate) mod test_helpers {
             .create_or_get("test_table2", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(100))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(100))
             .await
             .unwrap();
-        let other_sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(101))
+        let other_shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(101))
             .await
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
         let other_partition = repos
             .partitions()
-            .create_or_get("two".into(), sequencer.id, table.id)
+            .create_or_get("two".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -2378,12 +2777,11 @@ pub(crate) mod test_helpers {
 
         // Create a file with times entirely within the window
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(140),
             min_time: query_min_time + 1,
             max_time: query_max_time - 1,
@@ -2454,19 +2852,19 @@ pub(crate) mod test_helpers {
         };
         let too_late_file = repos.parquet_files().create(too_late_params).await.unwrap();
 
-        // Create a file for some other sequencer
-        let other_sequencer_params = ParquetFileParams {
-            sequencer_id: other_sequencer.id,
+        // Create a file for some other shard
+        let other_shard_params = ParquetFileParams {
+            shard_id: other_shard.id,
             object_store_id: Uuid::new_v4(),
             ..parquet_file_params.clone()
         };
-        let other_sequencer_file = repos
+        let other_shard_file = repos
             .parquet_files()
-            .create(other_sequencer_params)
+            .create(other_shard_params)
             .await
             .unwrap();
 
-        // Create a file for the same sequencer but a different table
+        // Create a file for the same shard but a different table
         let other_table_params = ParquetFileParams {
             table_id: other_table.id,
             object_store_id: Uuid::new_v4(),
@@ -2478,7 +2876,7 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        // Create a file for the same sequencer and table but a different partition
+        // Create a file for the same shard and table but a different partition
         let other_partition_params = ParquetFileParams {
             partition_id: other_partition.id,
             object_store_id: Uuid::new_v4(),
@@ -2509,51 +2907,58 @@ pub(crate) mod test_helpers {
         // Make all but _level_0_file compaction level 1
         repos
             .parquet_files()
-            .update_to_level_2(&[
-                parquet_file.id,
-                too_early_file.id,
-                too_late_file.id,
-                overlap_lower_file.id,
-                overlap_upper_file.id,
-                other_sequencer_file.id,
-                other_table_file.id,
-                other_partition_file.id,
-                to_delete_file.id,
-            ])
+            .update_compaction_level(
+                &[
+                    parquet_file.id,
+                    too_early_file.id,
+                    too_late_file.id,
+                    overlap_lower_file.id,
+                    overlap_upper_file.id,
+                    other_shard_file.id,
+                    other_table_file.id,
+                    other_partition_file.id,
+                    to_delete_file.id,
+                ],
+                CompactionLevel::FileNonOverlapped,
+            )
             .await
             .unwrap();
 
-        // Level 1 parquet files for a sequencer should contain only those that match the right
+        // Level 1 parquet files for a shard should contain only those that match the right
         // criteria
-        let table_partition = TablePartition::new(sequencer.id, table.id, partition.id);
-        let level_2 = repos
+        let table_partition = TablePartition::new(shard.id, table.id, partition.id);
+        let level_1 = repos
             .parquet_files()
-            .level_2(table_partition, query_min_time, query_max_time)
+            .level_1(table_partition, query_min_time, query_max_time)
             .await
             .unwrap();
-        let mut level_2_ids: Vec<_> = level_2.iter().map(|pf| pf.id).collect();
-        level_2_ids.sort();
+        let mut level_1_ids: Vec<_> = level_1.iter().map(|pf| pf.id).collect();
+        level_1_ids.sort();
         let expected = vec![parquet_file, overlap_lower_file, overlap_upper_file];
         let mut expected_ids: Vec<_> = expected.iter().map(|pf| pf.id).collect();
         expected_ids.sort();
 
         assert_eq!(
-            level_2_ids, expected_ids,
-            "\nlevel 2: {:#?}\nexpected: {:#?}",
-            level_2, expected,
+            level_1_ids, expected_ids,
+            "\nlevel 1: {:#?}\nexpected: {:#?}",
+            level_1, expected,
         );
     }
 
-    async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
+    async fn test_most_cold_files_partitions(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
-        let pool = repos.query_pools().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("most_cold").await.unwrap();
+        let pool = repos
+            .query_pools()
+            .create_or_get("most_cold")
+            .await
+            .unwrap();
         let namespace = repos
             .namespaces()
             .create(
-                "namespace_parquet_file_test_list_by_partiton_not_to_delete",
-                "inf",
-                kafka.id,
+                "test_most_level_0_files_partitions",
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -2563,20 +2968,776 @@ pub(crate) mod test_helpers {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(100))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(88))
+            .await
+            .unwrap();
+
+        let time_five_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(5));
+        let time_8_hours_ago = Timestamp::from(catalog.time_provider().hours_ago(8));
+        let time_38_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(38));
+
+        let num_partitions = 2;
+
+        // Db has no partition
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert!(
+            partitions.is_empty(),
+            "Expected no partitions, instead got {:#?}",
+            partitions,
+        );
+
+        // The DB has 1 partition, partition_1, but it does not have any files
+        let partition_1 = repos
+            .partitions()
+            .create_or_get("one".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert!(
+            partitions.is_empty(),
+            "Expected no partitions, instead got {:#?}",
+            partitions,
+        );
+
+        // The partition_1 has one deleted file
+        let parquet_file_params = ParquetFileParams {
+            shard_id: shard.id,
+            namespace_id: namespace.id,
+            table_id: partition_1.table_id,
+            partition_id: partition_1.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(140),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: time_38_hour_ago,
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+        };
+        let delete_l0_file = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .flag_for_delete(delete_l0_file.id)
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert!(
+            partitions.is_empty(),
+            "Expected no partitions, instead got {:#?}",
+            partitions,
+        );
+
+        // A hot_partition with one cold file and one hot file
+        let hot_partition = repos
+            .partitions()
+            .create_or_get("hot".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let cold_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: hot_partition.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(cold_file_params)
+            .await
+            .unwrap();
+        let hot_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: hot_partition.id,
+            created_at: time_five_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos.parquet_files().create(hot_file_params).await.unwrap();
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert!(
+            partitions.is_empty(),
+            "Expected no partitions, instead got {:#?}",
+            partitions,
+        );
+
+        // A already_compacted_partition that has only one non-deleted level 2 file, should never be returned
+        let already_compacted_partition = repos
+            .partitions()
+            .create_or_get("already_compacted".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let l2_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: already_compacted_partition.id,
+            compaction_level: CompactionLevel::Final,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l2_file_params.clone())
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert!(
+            partitions.is_empty(),
+            "Expected no partitions, instead got {:#?}",
+            partitions,
+        );
+
+        // The partition_1 has one non-deleted level 0 file created 38 hours ago
+        let l0_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_file_params.clone())
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+
+        // Partition_2 has 2 non-deleted L0 file created 38 hours ago
+        let partition_2 = repos
+            .partitions()
+            .create_or_get("two".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let another_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_2.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(another_file_params.clone())
+            .await
+            .unwrap();
+        let another_file_params_for_second_l0 = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            ..another_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(another_file_params_for_second_l0.clone())
+            .await
+            .unwrap();
+        // Must return 2 partitions
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // They must be in order partition_2 (more files), partition
+        assert_eq!(partitions[0].partition_id, partition_2.id); // 2 files
+        assert_eq!(partitions[1].partition_id, partition_1.id); // 1 file
+
+        // Make partition_3  that has one level-1 file, no level-0
+        // The DB now has 3 cold partitions, two with non-deleted L0 files and one with only non-deleted L1
+        let partition_3 = repos
+            .partitions()
+            .create_or_get("three".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        // recent L1 but since no L0, this partition is still cold
+        let file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_3.id,
+            compaction_level: CompactionLevel::FileNonOverlapped,
+            created_at: time_five_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(file_params.clone())
+            .await
+            .unwrap();
+
+        // Still return 2 partitions because the limit num_partitions is 2
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // and the first one should still be the one, partition_2, with the most files
+        assert_eq!(partitions[0].partition_id, partition_2.id);
+        //
+        // return 3 partitions becasue the limit num_partitions is now 5
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, 5)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+        // and the first one should still be the one with the most files
+        assert_eq!(partitions[0].partition_id, partition_2.id);
+
+        // The compactor skipped compacting partition_2
+        repos
+            .partitions()
+            .record_skipped_compaction(
+                partition_2.id,
+                "Not feeling up to it today",
+                1,
+                2,
+                4,
+                10,
+                20,
+            )
+            .await
+            .unwrap();
+
+        // partition_2 should no longer be selected for compaction
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        assert!(
+            partitions.iter().all(|p| p.partition_id != partition_2.id),
+            "Expected partitions not to include {}: {partitions:?}",
+            partition_2.id
+        );
+
+        // Add another L1 files into partition_3 to make it have 2 L1 files for easier to check the output
+        // A non-recent L1
+        let file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_3.id,
+            compaction_level: CompactionLevel::FileNonOverlapped,
+            created_at: time_38_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(file_params.clone())
+            .await
+            .unwrap();
+
+        // Create partition_4 with 3 non-deleted L1 files
+        // The DB now has 4 cold partitions but partition_2 should still be skipped
+        let partition_4 = repos
+            .partitions()
+            .create_or_get("four".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let file_params = ParquetFileParams {
+                object_store_id: Uuid::new_v4(),
+                partition_id: partition_4.id,
+                compaction_level: CompactionLevel::FileNonOverlapped,
+                ..parquet_file_params.clone()
+            };
+            repos
+                .parquet_files()
+                .create(file_params.clone())
+                .await
+                .unwrap();
+        }
+        // Still return 2 partitions with the limit num_partitions=2
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, num_partitions)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // the first one should now be the one with the most files: 3 L1s
+        assert_eq!(partitions[0].partition_id, partition_4.id);
+        // second one should be partition_3 with 2 files: 2 L1s
+        assert_eq!(partitions[1].partition_id, partition_3.id);
+
+        // Return 3 partitions with the limit num_partitions=4
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, 4)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+        // the first one should now be the one with the most files: 3 L1s
+        assert_eq!(partitions[0].partition_id, partition_4.id);
+        // second one should be partition_3 with 2 files: 2 L1s
+        assert_eq!(partitions[1].partition_id, partition_3.id);
+        // third one should be partition_1 witth 1 file: 1 L0
+        assert_eq!(partitions[2].partition_id, partition_1.id);
+
+        // Partition_5 with a non-deleted L1 and a deleted L0 created recently
+        // The DB now still has 4 cold partitions but partition_2 should still be skipped
+        // partition_5 is hot because it has a recent L0 even though it is deleted
+        let partition_5 = repos
+            .partitions()
+            .create_or_get("five".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        // L1 created recently
+        let file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_5.id,
+            compaction_level: CompactionLevel::FileNonOverlapped,
+            created_at: time_five_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(file_params.clone())
+            .await
+            .unwrap();
+        // L0 created recently but deleted
+        let file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_5.id,
+            compaction_level: CompactionLevel::Initial,
+            created_at: time_five_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        let delete_l0_file = repos
+            .parquet_files()
+            .create(file_params.clone())
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .flag_for_delete(delete_l0_file.id)
+            .await
+            .unwrap();
+        //
+        // Return 3 cold partitions, partition_1, partition_3, partition_4 becasue num_partitions=5
+        // still skip partition_2 and partition_5 is considered hot becasue it has a (deleted) L0 created recently
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, 5)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+        // the first one should now be the one with the most files 3 L1s
+        assert_eq!(partitions[0].partition_id, partition_4.id);
+        // second one should be partition_3 with 2 files: 2 L1s
+        assert_eq!(partitions[1].partition_id, partition_3.id);
+        // third one should be partition_1 witth 1 file: 1 L0
+        assert_eq!(partitions[2].partition_id, partition_1.id);
+
+        // Create partition_6 with 4 L1s and one deleted but non-recent L0
+        // The DB now has 5 cold partitions but partition_2 should still be skipped
+        let partition_6 = repos
+            .partitions()
+            .create_or_get("six".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            // L1 created recently
+            let file_params = ParquetFileParams {
+                object_store_id: Uuid::new_v4(),
+                partition_id: partition_6.id,
+                compaction_level: CompactionLevel::FileNonOverlapped,
+                created_at: time_five_hour_ago,
+                ..parquet_file_params.clone()
+            };
+            repos
+                .parquet_files()
+                .create(file_params.clone())
+                .await
+                .unwrap();
+        }
+        // old and deleted L0
+        let file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            partition_id: partition_6.id,
+            compaction_level: CompactionLevel::Initial,
+            created_at: time_38_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        let delete_l0_file = repos
+            .parquet_files()
+            .create(file_params.clone())
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .flag_for_delete(delete_l0_file.id)
+            .await
+            .unwrap();
+
+        //
+        // Return 4 cold partitions, partition_1, partition_3, partition_4, partition_6 because num_partitions=5
+        // still skip partition_2 and partition_5 is considered hot becasue it has a (deleted) L0 created recently
+        let partitions = repos
+            .parquet_files()
+            .most_cold_files_partitions(shard.id, time_8_hours_ago, 5)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 4);
+        // the first one should now be the one with the most files: 4 L1s
+        assert_eq!(partitions[0].partition_id, partition_6.id);
+        // then should  be the one with the most files: 3 L1s
+        assert_eq!(partitions[1].partition_id, partition_4.id);
+        // then  should be partition_3 with 2 files: 2 L1s
+        assert_eq!(partitions[2].partition_id, partition_3.id);
+        // then should be partition_1 witth 1 file: 1 L0
+        assert_eq!(partitions[3].partition_id, partition_1.id);
+    }
+
+    async fn test_recent_highest_throughput_partitions(catalog: Arc<dyn Catalog>) {
+        let mut repos = catalog.repositories().await;
+        let topic = repos
+            .topics()
+            .create_or_get("highest_throughput")
+            .await
+            .unwrap();
+        let pool = repos
+            .query_pools()
+            .create_or_get("highest_throughput")
+            .await
+            .unwrap();
+        let namespace = repos
+            .namespaces()
+            .create(
+                "test_recent_highest_throughput_partitions",
+                None,
+                topic.id,
+                pool.id,
+            )
+            .await
+            .unwrap();
+        let table = repos
+            .tables()
+            .create_or_get("test_table", namespace.id)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(100))
+            .await
+            .unwrap();
+
+        // params for the tests
+        let num_minutes = 4 * 60;
+        let min_num_files = 2;
+        let num_partitions = 2;
+
+        let time_at_num_minutes_ago =
+            Timestamp::from(catalog.time_provider().minutes_ago(num_minutes));
+
+        // Case 1
+        // Db has no partition
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // Case 2
+        // The DB has 1 partition but it does not have any file
+        let partition = repos
+            .partitions()
+            .create_or_get("one".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // Time for testing
+        let time_now = Timestamp::from(catalog.time_provider().now());
+        let time_one_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(1));
+        let time_two_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(2));
+        let time_three_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(3));
+        let time_five_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(5));
+        let time_ten_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(10));
+
+        // Case 3
+        // The partition has one deleted file
+        let parquet_file_params = ParquetFileParams {
+            shard_id: shard.id,
+            namespace_id: namespace.id,
+            table_id: partition.table_id,
+            partition_id: partition.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(140),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: time_now,
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+        };
+        let delete_l0_file = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .flag_for_delete(delete_l0_file.id)
+            .await
+            .unwrap();
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // Case 4
+        // Partition has only 1 file created recently
+        let l0_one_hour_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_one_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_one_hour_ago_file_params.clone())
+            .await
+            .unwrap();
+        // Case 4.1: min_num_files = 2
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        // nothing return because the partition has only one recent L0 file which is smaller than
+        // min_num_files = 2
+        assert!(partitions.is_empty());
+        // Case 4.2: min_num_files = 1
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        // and have one partition
+        assert_eq!(partitions.len(), 1);
+
+        // Case 5
+        // Let us create another partition with 2 L0 recent files
+        let another_partition = repos
+            .partitions()
+            .create_or_get("two".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        let l0_2_hours_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_two_hour_ago,
+            partition_id: another_partition.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_2_hours_ago_file_params)
+            .await
+            .unwrap();
+        let l0_3_hours_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_three_hour_ago,
+            partition_id: another_partition.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_3_hours_ago_file_params)
+            .await
+            .unwrap();
+        // Case 5.1: min_num_files = 2
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        // must be the partition with 2 files
+        assert_eq!(partitions[0].partition_id, another_partition.id);
+
+        // Case 5.2: min_num_files = 1
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // partition with 2 files must be first
+        assert_eq!(partitions[0].partition_id, another_partition.id);
+        assert_eq!(partitions[1].partition_id, partition.id);
+
+        // Case 6
+        // Add 2 not-recent files to the first partition
+        let l0_5_hours_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_five_hour_ago,
+            partition_id: partition.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_5_hours_ago_file_params)
+            .await
+            .unwrap();
+        let l0_10_hours_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_ten_hour_ago,
+            partition_id: partition.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_10_hours_ago_file_params)
+            .await
+            .unwrap();
+        // Case 6.1: min_num_files = 2
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                min_num_files,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        // result still 1 partition because the old files do not contribute to recent throughput
+        assert_eq!(partitions.len(), 1);
+        // must be the partition with 2 files
+        assert_eq!(partitions[0].partition_id, another_partition.id);
+
+        // Case 6.2: min_num_files = 1
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // partition with 2 files must be first
+        assert_eq!(partitions[0].partition_id, another_partition.id);
+        assert_eq!(partitions[1].partition_id, partition.id);
+
+        // The compactor skipped compacting another_partition
+        repos
+            .partitions()
+            .record_skipped_compaction(another_partition.id, "Secret reasons", 1, 2, 4, 10, 20)
+            .await
+            .unwrap();
+
+        // another_partition should no longer be selected for compaction
+        let partitions = repos
+            .parquet_files()
+            .recent_highest_throughput_partitions(
+                shard.id,
+                time_at_num_minutes_ago,
+                1,
+                num_partitions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].partition_id, partition.id);
+    }
+
+    async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
+        let mut repos = catalog.repositories().await;
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
+        let pool = repos.query_pools().create_or_get("foo").await.unwrap();
+        let namespace = repos
+            .namespaces()
+            .create(
+                "namespace_parquet_file_test_list_by_partiton_not_to_delete",
+                None,
+                topic.id,
+                pool.id,
+            )
+            .await
+            .unwrap();
+        let table = repos
+            .tables()
+            .create_or_get("test_table", namespace.id)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(100))
             .await
             .unwrap();
 
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("two".into(), sequencer.id, table.id)
+            .create_or_get("two".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -2584,12 +3745,11 @@ pub(crate) mod test_helpers {
         let max_time = Timestamp::new(10);
 
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
             max_sequence_number: SequenceNumber::new(140),
             min_time,
             max_time,
@@ -2630,7 +3790,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .parquet_files()
-            .update_to_level_2(&[level1_file.id])
+            .update_compaction_level(&[level1_file.id], CompactionLevel::FileNonOverlapped)
             .await
             .unwrap();
         level1_file.compaction_level = CompactionLevel::FileNonOverlapped;
@@ -2651,19 +3811,23 @@ pub(crate) mod test_helpers {
             .list_by_partition_not_to_delete(partition.id)
             .await
             .unwrap();
-        assert_eq!(files, vec![parquet_file.clone(), level1_file.clone()]);
+        // not asserting against a vector literal to guard against flakiness due to uncertain
+        // ordering of SQL query in postgres impl
+        assert_eq!(files.len(), 2);
+        assert_matches!(files.iter().find(|f| f.id == parquet_file.id), Some(_));
+        assert_matches!(files.iter().find(|f| f.id == level1_file.id), Some(_));
     }
 
-    async fn test_update_to_compaction_level_2(catalog: Arc<dyn Catalog>) {
+    async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
             .create(
-                "namespace_update_to_compaction_level_2_test",
-                "inf",
-                kafka.id,
+                "namespace_update_to_compaction_level_1_test",
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -2673,14 +3837,14 @@ pub(crate) mod test_helpers {
             .create_or_get("update_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1000))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1000))
             .await
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -2690,12 +3854,12 @@ pub(crate) mod test_helpers {
 
         // Create a file with times entirely within the window
         let parquet_file_params = ParquetFileParams {
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             namespace_id: namespace.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(10),
+
             max_sequence_number: SequenceNumber::new(140),
             min_time: query_min_time + 1,
             max_time: query_max_time - 1,
@@ -2723,7 +3887,7 @@ pub(crate) mod test_helpers {
 
         // Level 0 parquet files should contain both existing files at this point
         let expected = vec![parquet_file.clone(), level_0_file.clone()];
-        let level_0 = repos.parquet_files().level_0(sequencer.id).await.unwrap();
+        let level_0 = repos.parquet_files().level_0(shard.id).await.unwrap();
         let mut level_0_ids: Vec<_> = level_0.iter().map(|pf| pf.id).collect();
         level_0_ids.sort();
         let mut expected_ids: Vec<_> = expected.iter().map(|pf| pf.id).collect();
@@ -2738,14 +3902,17 @@ pub(crate) mod test_helpers {
         // should succeed
         let updated = repos
             .parquet_files()
-            .update_to_level_2(&[parquet_file.id, nonexistent_parquet_file_id])
+            .update_compaction_level(
+                &[parquet_file.id, nonexistent_parquet_file_id],
+                CompactionLevel::FileNonOverlapped,
+            )
             .await
             .unwrap();
         assert_eq!(updated, vec![parquet_file.id]);
 
         // Level 0 parquet files should only contain level_0_file
         let expected = vec![level_0_file];
-        let level_0 = repos.parquet_files().level_0(sequencer.id).await.unwrap();
+        let level_0 = repos.parquet_files().level_0(shard.id).await.unwrap();
         let mut level_0_ids: Vec<_> = level_0.iter().map(|pf| pf.id).collect();
         level_0_ids.sort();
         let mut expected_ids: Vec<_> = expected.iter().map(|pf| pf.id).collect();
@@ -2756,35 +3923,35 @@ pub(crate) mod test_helpers {
             level_0, expected,
         );
 
-        // Level 1 parquet files for a sequencer should only contain parquet_file
+        // Level 1 parquet files for a shard should only contain parquet_file
         let expected = vec![parquet_file];
-        let table_partition = TablePartition::new(sequencer.id, table.id, partition.id);
-        let level_2 = repos
+        let table_partition = TablePartition::new(shard.id, table.id, partition.id);
+        let level_1 = repos
             .parquet_files()
-            .level_2(table_partition, query_min_time, query_max_time)
+            .level_1(table_partition, query_min_time, query_max_time)
             .await
             .unwrap();
-        let mut level_2_ids: Vec<_> = level_2.iter().map(|pf| pf.id).collect();
-        level_2_ids.sort();
+        let mut level_1_ids: Vec<_> = level_1.iter().map(|pf| pf.id).collect();
+        level_1_ids.sort();
         let mut expected_ids: Vec<_> = expected.iter().map(|pf| pf.id).collect();
         expected_ids.sort();
         assert_eq!(
-            level_2_ids, expected_ids,
+            level_1_ids, expected_ids,
             "\nlevel 1: {:#?}\nexpected: {:#?}",
-            level_2, expected,
+            level_1, expected,
         );
     }
 
     async fn test_processed_tombstones(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
             .create(
                 "namespace_processed_tombstone_test",
-                "inf",
-                kafka.id,
+                None,
+                topic.id,
                 pool.id,
             )
             .await
@@ -2794,25 +3961,24 @@ pub(crate) mod test_helpers {
             .create_or_get("test_table", namespace.id)
             .await
             .unwrap();
-        let sequencer = repos
-            .sequencers()
-            .create_or_get(&kafka, KafkaPartition::new(1))
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
             .await
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), sequencer.id, table.id)
+            .create_or_get("one".into(), shard.id, table.id)
             .await
             .unwrap();
 
         // parquet files
         let parquet_file_params = ParquetFileParams {
             namespace_id: namespace.id,
-            sequencer_id: sequencer.id,
+            shard_id: shard.id,
             table_id: partition.table_id,
             partition_id: partition.id,
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(1),
             max_sequence_number: SequenceNumber::new(1),
             min_time: Timestamp::new(100),
             max_time: Timestamp::new(250),
@@ -2829,7 +3995,6 @@ pub(crate) mod test_helpers {
             .unwrap();
         let parquet_file_params_2 = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
-            min_sequence_number: SequenceNumber::new(2),
             max_sequence_number: SequenceNumber::new(3),
             min_time: Timestamp::new(200),
             max_time: Timestamp::new(300),
@@ -2846,7 +4011,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(10),
                 Timestamp::new(1),
                 Timestamp::new(10),
@@ -2858,7 +4023,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(11),
                 Timestamp::new(100),
                 Timestamp::new(110),
@@ -2870,7 +4035,7 @@ pub(crate) mod test_helpers {
             .tombstones()
             .create_or_get(
                 table.id,
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(12),
                 Timestamp::new(200),
                 Timestamp::new(210),
@@ -2964,7 +4129,7 @@ pub(crate) mod test_helpers {
             barrier_captured.wait().await;
 
             let mut txn = catalog_captured.start_transaction().await.unwrap();
-            txn.kafka_topics()
+            txn.topics()
                 .create_or_get("test_txn_isolation")
                 .await
                 .unwrap();
@@ -2979,7 +4144,7 @@ pub(crate) mod test_helpers {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let topic = txn
-            .kafka_topics()
+            .topics()
             .get_by_name("test_txn_isolation")
             .await
             .unwrap();
@@ -2990,7 +4155,7 @@ pub(crate) mod test_helpers {
 
         let mut txn = catalog.start_transaction().await.unwrap();
         let topic = txn
-            .kafka_topics()
+            .topics()
             .get_by_name("test_txn_isolation")
             .await
             .unwrap();
@@ -3001,10 +4166,7 @@ pub(crate) mod test_helpers {
     async fn test_txn_drop(catalog: Arc<dyn Catalog>) {
         let capture = TracingCapture::new();
         let mut txn = catalog.start_transaction().await.unwrap();
-        txn.kafka_topics()
-            .create_or_get("test_txn_drop")
-            .await
-            .unwrap();
+        txn.topics().create_or_get("test_txn_drop").await.unwrap();
         drop(txn);
 
         // got a warning
@@ -3013,11 +4175,7 @@ pub(crate) mod test_helpers {
 
         // data is NOT committed
         let mut txn = catalog.start_transaction().await.unwrap();
-        let topic = txn
-            .kafka_topics()
-            .get_by_name("test_txn_drop")
-            .await
-            .unwrap();
+        let topic = txn.topics().get_by_name("test_txn_drop").await.unwrap();
         assert!(topic.is_none());
         txn.abort().await.unwrap();
     }
@@ -3031,11 +4189,11 @@ pub(crate) mod test_helpers {
     where
         R: RepoCollection + ?Sized,
     {
-        let kafka = repos.kafka_topics().create_or_get("foo").await.unwrap();
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
         let pool = repos.query_pools().create_or_get("foo").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create(namespace_name, "inf", kafka.id, pool.id)
+            .create(namespace_name, None, topic.id, pool.id)
             .await;
 
         let namespace = match namespace {
@@ -3051,7 +4209,13 @@ pub(crate) mod test_helpers {
 
         let batches = mutable_batch_lp::lines_to_batches(lines, 42).unwrap();
         let batches = batches.iter().map(|(table, batch)| (table.as_str(), batch));
-        let ns = NamespaceSchema::new(namespace.id, kafka.id, pool.id);
+        let ns = NamespaceSchema::new(
+            namespace.id,
+            topic.id,
+            pool.id,
+            namespace.max_columns_per_table,
+            namespace.retention_period_ns,
+        );
 
         let schema = validate_or_insert_schema(batches, &ns, repos)
             .await

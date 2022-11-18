@@ -1,5 +1,4 @@
 use futures::{prelude::*, FutureExt};
-use generated_types::storage_client::StorageClient;
 use test_helpers_end_to_end::{
     maybe_skip_integration, GrpcRequestBuilder, MiniCluster, Step, StepTest, StepTestState,
     TestConfig, UdpCapture,
@@ -41,7 +40,7 @@ pub async fn test_tracing_sql() {
     // "shallow" packet inspection and verify the UDP server got omething that had some expected
     // results (maybe we could eventually verify the payload here too)
     udp_capture
-        .wait_for(|m| m.to_string().contains("IOxReadFilterNode"))
+        .wait_for(|m| m.to_string().contains("RecordBatchesExec"))
         .await;
 
     // debugging assistance
@@ -70,8 +69,7 @@ pub async fn test_tracing_storage_api() {
             Step::WaitForReadable,
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 let cluster = state.cluster();
-                let mut storage_client =
-                    StorageClient::new(cluster.querier().querier_grpc_connection());
+                let mut storage_client = cluster.querier_storage_client();
 
                 let read_filter_request = GrpcRequestBuilder::new()
                     .source(state.cluster())
@@ -96,7 +94,7 @@ pub async fn test_tracing_storage_api() {
     // "shallow" packet inspection and verify the UDP server got omething that had some expected
     // results (maybe we could eventually verify the payload here too)
     udp_capture
-        .wait_for(|m| m.to_string().contains("IOxReadFilterNode"))
+        .wait_for(|m| m.to_string().contains("RecordBatchesExec"))
         .await;
 
     // debugging assistance
@@ -144,7 +142,7 @@ pub async fn test_tracing_create_trace() {
     // "shallow" packet inspection and verify the UDP server got omething that had some expected
     // results (maybe we could eventually verify the payload here too)
     udp_capture
-        .wait_for(|m| m.to_string().contains("IOxReadFilterNode"))
+        .wait_for(|m| m.to_string().contains("RecordBatchesExec"))
         .await;
 
     // debugging assistance

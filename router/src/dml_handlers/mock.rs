@@ -1,10 +1,12 @@
-use super::{DmlError, DmlHandler};
-use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate};
-use parking_lot::Mutex;
 use std::{collections::VecDeque, fmt::Debug};
+
+use async_trait::async_trait;
+use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use parking_lot::Mutex;
 use trace::ctx::SpanContext;
 use write_summary::WriteSummary;
+
+use super::{DmlError, DmlHandler};
 
 /// A captured call to a [`MockDmlHandler`], generic over `W`, the captured
 /// [`DmlHandler::WriteInput`] type.
@@ -12,10 +14,12 @@ use write_summary::WriteSummary;
 pub enum MockDmlHandlerCall<W> {
     Write {
         namespace: String,
+        namespace_id: NamespaceId,
         write_input: W,
     },
     Delete {
         namespace: String,
+        namespace_id: NamespaceId,
         table: String,
         predicate: DeletePredicate,
     },
@@ -99,7 +103,8 @@ where
 
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         write_input: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
@@ -107,6 +112,7 @@ where
             self,
             MockDmlHandlerCall::Write {
                 namespace: namespace.into(),
+                namespace_id,
                 write_input,
             },
             write_return
@@ -115,7 +121,8 @@ where
 
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
+        namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
         _span_ctx: Option<SpanContext>,
@@ -124,6 +131,7 @@ where
             self,
             MockDmlHandlerCall::Delete {
                 namespace: namespace.into(),
+                namespace_id,
                 table: table_name.to_owned(),
                 predicate: predicate.clone(),
             },

@@ -1,4 +1,5 @@
 use arrow_util::assert_batches_sorted_eq;
+use data_types::{NamespaceId, TableId};
 use generated_types::{
     influxdata::iox::ingester::v1::PartitionStatus, ingester::IngesterQueryRequest,
 };
@@ -29,11 +30,11 @@ async fn ingester_flight_api() {
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
-        cluster.namespace().to_string(),
-        table_name.into(),
+        cluster.namespace_id().await,
+        cluster.table_id(table_name).await,
         vec![],
         Some(::predicate::EMPTY_PREDICATE),
     );
@@ -52,7 +53,6 @@ async fn ingester_flight_api() {
             partition_id,
             status: Some(PartitionStatus {
                 parquet_max_sequence_number: None,
-                tombstone_max_sequence_number: None
             })
         },
     );
@@ -92,18 +92,16 @@ async fn ingester_flight_api_namespace_not_found() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let table_name = "mytable";
-
     // Set up cluster
     let cluster = MiniCluster::create_shared(database_url).await;
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
-        String::from("does_not_exist"),
-        table_name.into(),
+        NamespaceId::new(i64::MAX),
+        TableId::new(42),
         vec![],
         Some(::predicate::EMPTY_PREDICATE),
     );
@@ -138,11 +136,11 @@ async fn ingester_flight_api_table_not_found() {
 
     let mut querier_flight = influxdb_iox_client::flight::low_level::Client::<
         influxdb_iox_client::flight::generated_types::IngesterQueryRequest,
-    >::new(cluster.ingester().ingester_grpc_connection());
+    >::new(cluster.ingester().ingester_grpc_connection(), None);
 
     let query = IngesterQueryRequest::new(
-        cluster.namespace().to_string(),
-        String::from("does_not_exist"),
+        cluster.namespace_id().await,
+        TableId::new(i64::MAX),
         vec![],
         Some(::predicate::EMPTY_PREDICATE),
     );

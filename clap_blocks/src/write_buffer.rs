@@ -1,6 +1,7 @@
+//! Config for [`write_buffer`].
 use iox_time::SystemProvider;
 use observability_deps::tracing::*;
-use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroU32, ops::Range, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use trace::TraceCollector;
 use write_buffer::{
@@ -8,21 +9,18 @@ use write_buffer::{
     core::{WriteBufferError, WriteBufferReading, WriteBufferWriting},
 };
 
+/// Config for [`write_buffer`].
 #[derive(Debug, clap::Parser)]
 pub struct WriteBufferConfig {
     /// The type of write buffer to use.
     ///
     /// Valid options are: file, kafka
-    #[clap(
-        long = "--write-buffer",
-        env = "INFLUXDB_IOX_WRITE_BUFFER_TYPE",
-        action
-    )]
+    #[clap(long = "write-buffer", env = "INFLUXDB_IOX_WRITE_BUFFER_TYPE", action)]
     pub(crate) type_: String,
 
     /// The address to the write buffer.
     #[clap(
-        long = "--write-buffer-addr",
+        long = "write-buffer-addr",
         env = "INFLUXDB_IOX_WRITE_BUFFER_ADDR",
         action
     )]
@@ -30,7 +28,7 @@ pub struct WriteBufferConfig {
 
     /// Write buffer topic/database that should be used.
     #[clap(
-        long = "--write-buffer-topic",
+        long = "write-buffer-topic",
         env = "INFLUXDB_IOX_WRITE_BUFFER_TOPIC",
         default_value = "iox-shared",
         action
@@ -42,22 +40,21 @@ pub struct WriteBufferConfig {
     /// The concrete options depend on the write buffer type.
     ///
     /// Command line arguments are passed as
-    /// `--write-buffer-connection-config key1=value1 key2=value2` or
     /// `--write-buffer-connection-config key1=value1,key2=value2`.
     ///
     /// Environment variables are passed as `key1=value1,key2=value2,...`.
     #[clap(
-        long = "--write-buffer-connection-config",
+        long = "write-buffer-connection-config",
         env = "INFLUXDB_IOX_WRITE_BUFFER_CONNECTION_CONFIG",
         default_value = "",
-        multiple_values = true,
-        use_value_delimiter = true
+        use_value_delimiter = true,
+        action = clap::ArgAction::Append
     )]
     pub(crate) connection_config: Vec<String>,
 
     /// The number of topics to create automatically, if any. Default is to not create any topics.
     #[clap(
-        long = "--write-buffer-auto-create-topics",
+        long = "write-buffer-auto-create-topics",
         env = "INFLUXDB_IOX_WRITE_BUFFER_AUTO_CREATE_TOPICS"
     )]
     pub(crate) auto_create_topics: Option<NonZeroU32>,
@@ -92,12 +89,13 @@ impl WriteBufferConfig {
     pub async fn writing(
         &self,
         metrics: Arc<metric::Registry>,
+        partitions: Option<Range<i32>>,
         trace_collector: Option<Arc<dyn TraceCollector>>,
     ) -> Result<Arc<dyn WriteBufferWriting>, WriteBufferError> {
         let conn = self.conn();
         let factory = Self::factory(metrics);
         factory
-            .new_config_write(&self.topic, trace_collector.as_ref(), &conn)
+            .new_config_write(&self.topic, partitions, trace_collector.as_ref(), &conn)
             .await
     }
 
@@ -105,12 +103,13 @@ impl WriteBufferConfig {
     pub async fn reading(
         &self,
         metrics: Arc<metric::Registry>,
+        partitions: Option<Range<i32>>,
         trace_collector: Option<Arc<dyn TraceCollector>>,
     ) -> Result<Arc<dyn WriteBufferReading>, WriteBufferError> {
         let conn = self.conn();
         let factory = Self::factory(metrics);
         factory
-            .new_config_read(&self.topic, trace_collector.as_ref(), &conn)
+            .new_config_read(&self.topic, partitions, trace_collector.as_ref(), &conn)
             .await
     }
 
@@ -133,12 +132,12 @@ impl WriteBufferConfig {
     }
 
     fn conn(&self) -> WriteBufferConnection {
-        let creation_config =
-            self.auto_create_topics
-                .map(|n_sequencers| WriteBufferCreationConfig {
-                    n_sequencers,
-                    ..Default::default()
-                });
+        let creation_config = self
+            .auto_create_topics
+            .map(|n_shards| WriteBufferCreationConfig {
+                n_shards,
+                ..Default::default()
+            });
         WriteBufferConnection {
             type_: self.type_.clone(),
             connection: self.connection_string.clone(),
@@ -169,9 +168,8 @@ impl WriteBufferConfig {
 
 #[cfg(test)]
 mod tests {
-    use clap::StructOpt;
-
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_connection_config() {
@@ -183,10 +181,15 @@ mod tests {
             "localhost:1234",
             "--write-buffer-connection-config",
             "foo=bar",
+            "--write-buffer-connection-config",
             "",
+            "--write-buffer-connection-config",
             "x=",
+            "--write-buffer-connection-config",
             "y",
+            "--write-buffer-connection-config",
             "foo=baz",
+            "--write-buffer-connection-config",
             "so=many=args",
         ])
         .unwrap();

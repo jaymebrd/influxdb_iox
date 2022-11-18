@@ -6,7 +6,9 @@
     clippy::explicit_iter_loop,
     clippy::future_not_send,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 
 //! A mutable data structure for a collection of writes.
@@ -20,10 +22,10 @@ use arrow::record_batch::RecordBatch;
 use data_types::StatValues;
 use hashbrown::HashMap;
 use iox_time::Time;
-use schema::selection::Selection;
+use schema::Projection;
 use schema::{builder::SchemaBuilder, Schema, TIME_COLUMN_NAME};
 use snafu::{OptionExt, ResultExt, Snafu};
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 pub mod column;
 pub mod payload;
@@ -83,10 +85,10 @@ impl MutableBatch {
     /// Returns the schema for a given selection
     ///
     /// If Selection::All the returned columns are sorted by name
-    pub fn schema(&self, selection: Selection<'_>) -> Result<Schema> {
+    pub fn schema(&self, selection: Projection<'_>) -> Result<Schema> {
         let mut schema_builder = SchemaBuilder::new();
         let schema = match selection {
-            Selection::All => {
+            Projection::All => {
                 for (column_name, column_idx) in self.column_names.iter() {
                     let column = &self.columns[*column_idx];
                     schema_builder.influx_column(column_name, column.influx_type());
@@ -97,7 +99,7 @@ impl MutableBatch {
                     .context(InternalSchemaSnafu)?
                     .sort_fields_by_name()
             }
-            Selection::Some(cols) => {
+            Projection::Some(cols) => {
                 for col in cols {
                     let column = self.column(col)?;
                     schema_builder.influx_column(col, column.influx_type());
@@ -110,7 +112,7 @@ impl MutableBatch {
     }
 
     /// Convert all the data in this `MutableBatch` into a `RecordBatch`
-    pub fn to_arrow(&self, selection: Selection<'_>) -> Result<RecordBatch> {
+    pub fn to_arrow(&self, selection: Projection<'_>) -> Result<RecordBatch> {
         let schema = self.schema(selection)?;
         let columns = schema
             .iter()
@@ -133,6 +135,12 @@ impl MutableBatch {
         self.column_names
             .iter()
             .map(move |(name, idx)| (name, &self.columns[*idx]))
+    }
+
+    /// Return the set of column names for this table. Used in combination with a write operation's
+    /// column names to determine whether a write would exceed the max allowed columns.
+    pub fn column_names(&self) -> BTreeSet<&str> {
+        self.column_names.keys().map(|name| name.as_str()).collect()
     }
 
     /// Return the number of rows in this chunk

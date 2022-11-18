@@ -1,10 +1,11 @@
 use assert_cmd::prelude::*;
 use futures::prelude::*;
 use influxdb_iox_client::connection::Connection;
-use observability_deps::tracing::info;
+use observability_deps::tracing::{info, warn};
 use std::{
     fmt::Debug,
     fs::OpenOptions,
+    ops::DerefMut,
     path::Path,
     process::{Child, Command},
     str,
@@ -15,7 +16,7 @@ use tempfile::NamedTempFile;
 use test_helpers::timeout::FutureTimeout;
 use tokio::sync::Mutex;
 
-use crate::{database::initialize_db, server_type::AddAddrEnv};
+use crate::{database::initialize_db, dump_log_to_stdout, log_command, server_type::AddAddrEnv};
 
 use super::{addrs::BindAddresses, ServerType, TestConfig};
 
@@ -81,19 +82,16 @@ impl ServerFixture {
         self.connections.router_grpc_connection()
     }
 
-    /// Return a channel connected to the ingester gRPC API, panic'ing if not the correct type of server
+    /// Return a channel connected to the ingester gRPC API, panic'ing if not the correct type of
+    /// server
     pub fn ingester_grpc_connection(&self) -> Connection {
         self.connections.ingester_grpc_connection()
     }
 
-    /// Return a channel connected to the querier gRPC API, panic'ing if not the correct type of server
+    /// Return a channel connected to the querier gRPC API, panic'ing if not the correct type of
+    /// server
     pub fn querier_grpc_connection(&self) -> Connection {
         self.connections.querier_grpc_connection()
-    }
-
-    /// Return a channel connected to the compactor gRPC API, panic'ing if not the correct type of server
-    pub fn compactor_grpc_connection(&self) -> Connection {
-        self.connections.compactor_grpc_connection()
     }
 
     /// Return the http base URL for the router HTTP API
@@ -147,9 +145,6 @@ pub struct Connections {
 
     /// connection to querier gRPC, if available
     querier_grpc_connection: Option<Connection>,
-
-    /// connection to compactor gRPC, if available
-    compactor_grpc_connection: Option<Connection>,
 }
 
 impl Connections {
@@ -166,7 +161,8 @@ impl Connections {
             .clone()
     }
 
-    /// Return a channel connected to the ingester gRPC API, panic'ing if not the correct type of server
+    /// Return a channel connected to the ingester gRPC API, panic'ing if not the correct type of
+    /// server
     pub fn ingester_grpc_connection(&self) -> Connection {
         self.ingester_grpc_connection
             .as_ref()
@@ -174,19 +170,12 @@ impl Connections {
             .clone()
     }
 
-    /// Return a channel connected to the querier gRPC API, panic'ing if not the correct type of server
+    /// Return a channel connected to the querier gRPC API, panic'ing if not the correct type of
+    /// server
     pub fn querier_grpc_connection(&self) -> Connection {
         self.querier_grpc_connection
             .as_ref()
             .expect("Server type does not have querier")
-            .clone()
-    }
-
-    /// Return a channel connected to the compactor gRPC API, panic'ing if not the correct type of server
-    pub fn compactor_grpc_connection(&self) -> Connection {
-        self.compactor_grpc_connection
-            .as_ref()
-            .expect("Server type does not have compactor")
             .clone()
     }
 
@@ -231,20 +220,6 @@ impl Connections {
                         .await
                         .map_err(|e| {
                             format!("Can not connect to querier at {}: {}", client_base, e)
-                        })?,
-                )
-            }
-            _ => None,
-        };
-
-        self.compactor_grpc_connection = match server_type {
-            ServerType::AllInOne | ServerType::Compactor => {
-                let client_base = test_config.addrs().compactor_grpc_api().client_base();
-                Some(
-                    grpc_channel(test_config, client_base.as_ref())
-                        .await
-                        .map_err(|e| {
-                            format!("Can not connect to compactor at {}: {}", client_base, e)
                         })?,
                 )
             }
@@ -386,12 +361,14 @@ impl TestServer {
                 .env("INFLUXDB_IOX_CATALOG_POSTGRES_SCHEMA_NAME", schema_name);
         }
 
-        let child = command
+        command = command
             // redirect output to log file
             .stdout(stdout_log_file)
-            .stderr(stderr_log_file)
-            .spawn()
-            .unwrap();
+            .stderr(stderr_log_file);
+
+        log_command(command);
+
+        let child = command.spawn().unwrap();
 
         Process { child, log_path }
     }
@@ -509,9 +486,18 @@ impl TestServer {
             }
 
             match server_type {
+                ServerType::Compactor => {
+                    unimplemented!(
+                        "Don't use a long-running compactor and gRPC in e2e tests; use \
+                        `influxdb_iox compactor run-once` instead"
+                    );
+                }
                 ServerType::Router => {
-                    if check_write_service_health(server_type, connections.router_grpc_connection())
-                        .await
+                    if check_catalog_service_health(
+                        server_type,
+                        connections.router_grpc_connection(),
+                    )
+                    .await
                     {
                         return;
                     }
@@ -536,21 +522,14 @@ impl TestServer {
                         return;
                     }
                 }
-                ServerType::Compactor => {
-                    if check_test_service_health(
-                        server_type,
-                        connections.compactor_grpc_connection(),
-                    )
-                    .await
-                    {
-                        return;
-                    }
-                }
                 ServerType::AllInOne => {
                     // ensure we can write and query
-                    // TODO also check compactor and ingester
-                    if check_write_service_health(server_type, connections.router_grpc_connection())
-                        .await
+                    // TODO also check ingester
+                    if check_catalog_service_health(
+                        server_type,
+                        connections.router_grpc_connection(),
+                    )
+                    .await
                         && check_arrow_service_health(
                             server_type,
                             connections.ingester_grpc_connection(),
@@ -571,21 +550,25 @@ impl TestServer {
     }
 }
 
-/// checks write service health, returning false if the service should be checked again
-async fn check_write_service_health(server_type: ServerType, connection: Connection) -> bool {
+/// checks catalog service health, as a proxy for all gRPC
+/// services. Returns false if the service should be checked again
+async fn check_catalog_service_health(server_type: ServerType, connection: Connection) -> bool {
     let mut health = influxdb_iox_client::health::Client::new(connection);
 
-    match health.check("influxdata.pbdata.v1.WriteService").await {
+    match health
+        .check("influxdata.iox.catalog.v1.CatalogService")
+        .await
+    {
         Ok(true) => {
-            info!("Write service {:?} is running", server_type);
+            info!("CatalogService service {:?} is running", server_type);
             true
         }
         Ok(false) => {
-            info!("Write service {:?} is not running", server_type);
+            info!("CatalogService {:?} is not running", server_type);
             true
         }
         Err(e) => {
-            info!("Write service {:?} not yet healthy: {:?}", server_type, e);
+            info!("CatalogService {:?} not yet healthy: {:?}", server_type, e);
             false
         }
     }
@@ -611,26 +594,6 @@ async fn check_arrow_service_health(server_type: ServerType, connection: Connect
     }
 }
 
-/// checks the test service health, returning false if the service should be checked again
-async fn check_test_service_health(server_type: ServerType, connection: Connection) -> bool {
-    let mut health = influxdb_iox_client::health::Client::new(connection);
-
-    match health.check("influxdata.platform.storage.IOxTesting").await {
-        Ok(true) => {
-            info!("Test service {:?} is running", server_type);
-            true
-        }
-        Ok(false) => {
-            info!("Test service {:?} is not running", server_type);
-            true
-        }
-        Err(e) => {
-            info!("Test service {:?} not yet healthy: {:?}", server_type, e);
-            false
-        }
-    }
-}
-
 impl std::fmt::Display for TestServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(
@@ -649,56 +612,35 @@ impl Drop for TestServer {
             .try_lock()
             .expect("should be able to get a server process lock");
 
+        server_dead_inner(server_lock.deref_mut());
+
         kill_politely(&mut server_lock.child, Duration::from_secs(1));
 
-        dump_log_to_stdout(self.test_config.server_type(), &server_lock.log_path);
+        dump_log_to_stdout(
+            &format!("{:?}", self.test_config.server_type()),
+            &server_lock.log_path,
+        );
     }
 }
 
 /// returns true if the server process has exited (for any reason), and
 /// prints what happened to stdout
 async fn server_dead(server_process: &Mutex<Process>) -> bool {
-    match server_process.lock().await.child.try_wait() {
+    server_dead_inner(server_process.lock().await.deref_mut())
+}
+
+fn server_dead_inner(server_process: &mut Process) -> bool {
+    match server_process.child.try_wait() {
         Ok(None) => false,
         Ok(Some(status)) => {
-            info!("Server process exited: {}", status);
+            warn!("Server process exited: {}", status);
             true
         }
         Err(e) => {
-            info!("Error getting server process exit status: {}", e);
+            warn!("Error getting server process exit status: {}", e);
             true
         }
     }
-}
-
-/// Dumps the content of the log file to stdout
-fn dump_log_to_stdout(server_type: ServerType, log_path: &Path) {
-    use std::io::Read;
-
-    let mut f = std::fs::File::open(log_path).expect("failed to open log file");
-    let mut buffer = [0_u8; 8 * 1024];
-
-    info!("****************");
-    info!("Start {:?} TestServer Output", server_type);
-    info!("****************");
-
-    while let Ok(read) = f.read(&mut buffer) {
-        if read == 0 {
-            break;
-        }
-        if let Ok(str) = std::str::from_utf8(&buffer[..read]) {
-            print!("{}", str);
-        } else {
-            info!(
-                "\n\n-- ERROR IN TRANSFER -- please see {:?} for raw contents ---\n\n",
-                log_path
-            );
-        }
-    }
-
-    info!("****************");
-    info!("End {:?} TestServer Output", server_type);
-    info!("****************");
 }
 
 /// Attempt to kill a child process politely.

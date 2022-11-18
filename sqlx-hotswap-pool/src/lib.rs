@@ -10,7 +10,9 @@
     clippy::todo,
     clippy::dbg_macro,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro
 )]
 #![allow(clippy::missing_docs_in_private_items, clippy::type_complexity)]
 
@@ -44,15 +46,19 @@ where
         }
     }
 
-    /// Replaces the underlying [`Pool`] with `new_pool`.
+    /// Replaces the underlying [`Pool`] with `new_pool`, returning
+    /// the previous pool
     ///
     /// Existing connections obtained by performing operations on the pool
     /// before the call to `replace` are still valid.
     ///
     /// This method affects new operations only.
-    pub fn replace(&self, new_pool: Pool<DB>) {
+    pub fn replace(&self, new_pool: Pool<DB>) -> Arc<Pool<DB>> {
+        let mut t = Arc::new(new_pool);
         let mut pool = self.pool.write().expect("poisoned");
-        *pool = Arc::new(new_pool);
+        // swap the new pool for the old pool
+        std::mem::swap(&mut t, &mut *pool);
+        t
     }
 }
 
@@ -148,7 +154,7 @@ mod tests {
     // are not set.
     macro_rules! maybe_skip_integration {
         () => {{
-            dotenv::dotenv().ok();
+            dotenvy::dotenv().ok();
 
             let required_vars = ["TEST_INFLUXDB_IOX_CATALOG_DSN"];
             let unset_vars: Vec<_> = required_vars
@@ -286,5 +292,40 @@ mod tests {
             .expect("got result");
 
         assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_replace_with_outstanding_future() {
+        maybe_skip_integration!();
+        println!("tests are running");
+
+        let db = connect_db().await.unwrap();
+        let db = HotSwapPool::new(db);
+
+        sqlx::query("CREATE TABLE IF NOT EXISTS test (id int)")
+            .execute(&db)
+            .await
+            .expect("executed");
+
+        // create a future from the pool but don't execute it yet
+        let query_future = sqlx::query("CREATE TABLE IF NOT EXISTS test (id int)").execute(&db);
+
+        // hot swap a new pool. This should not deadlock
+        let new_pool = connect_db().await.unwrap();
+        let old_pool = db.replace(new_pool);
+
+        // Ensure there are outstanding references to the old pool
+        // captured in the future
+        assert_eq!(Arc::strong_count(&old_pool), 1);
+
+        // resolve the future created prior to the previous
+        // connection (executes against the new connection)
+        query_future.await.expect("executed");
+
+        // can also run queries successfully against the new pool
+        sqlx::query("CREATE TABLE IF NOT EXISTS test (id int)")
+            .execute(&db)
+            .await
+            .expect("executed");
     }
 }

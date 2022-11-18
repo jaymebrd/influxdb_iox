@@ -1,19 +1,20 @@
 [package]
 name = "test_helpers"
-version = "0.1.0"
-authors = ["Paul Dix <paul@pauldix.net>"]
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies] # In alphabetical order
-dotenv = "0.15.0"
+dotenvy = "0.15.6"
 parking_lot = "0.12"
 tempfile = "3.1.0"
 tracing-log = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 observability_deps = { path = "../observability_deps" }
 workspace-hack = { path = "../workspace-hack"}
-async-trait = { version = "0.1.56", optional = true }
-tokio = { version = "1.20.0", optional = true, default_features = false, features = ["time"] }
+async-trait = { version = "0.1.58", optional = true }
+tokio = { version = "1.21.1", optional = true, default_features = false, features = ["time"] }
 
 [features]
 default = []

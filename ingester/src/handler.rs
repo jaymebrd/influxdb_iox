@@ -1,18 +1,10 @@
 //! Ingest handler
 
-use crate::{
-    data::{IngesterData, IngesterQueryResponse, SequencerData},
-    lifecycle::{run_lifecycle_manager, LifecycleConfig, LifecycleManager},
-    poison::PoisonCabinet,
-    querier_handler::prepare_data_to_querier,
-    stream_handler::{
-        sink_adaptor::IngestSinkAdaptor, sink_instrumentation::SinkInstrumentation,
-        PeriodicWatermarkFetcher, SequencedStreamHandler,
-    },
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use backoff::BackoffConfig;
-use data_types::{KafkaPartition, KafkaTopic, Sequencer};
+use data_types::{Shard, ShardIndex, TopicMetadata};
 use futures::{
     future::{BoxFuture, Shared},
     stream::FuturesUnordered,
@@ -26,51 +18,55 @@ use metric::{DurationHistogram, Metric, U64Counter};
 use object_store::DynObjectStore;
 use observability_deps::tracing::*;
 use snafu::{ResultExt, Snafu};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Semaphore, TryAcquireError},
     task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
+use trace::span::{Span, SpanRecorder};
 use write_buffer::core::WriteBufferReading;
-use write_summary::SequencerProgress;
+use write_summary::ShardProgress;
+
+use crate::{
+    data::IngesterData,
+    lifecycle::{run_lifecycle_manager, LifecycleConfig, LifecycleManager},
+    poison::PoisonCabinet,
+    querier_handler::{prepare_data_to_querier, IngesterQueryResponse},
+    stream_handler::{
+        handler::SequencedStreamHandler, sink_adaptor::IngestSinkAdaptor,
+        sink_instrumentation::SinkInstrumentation, PeriodicWatermarkFetcher,
+    },
+};
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
-    #[snafu(display(
-        "No sequencer record found for kafka topic {} and partition {}",
-        kafka_topic,
-        kafka_partition
-    ))]
-    SequencerRecordNotFound {
-        kafka_topic: String,
-        kafka_partition: KafkaPartition,
-    },
-
     #[snafu(display("Write buffer error: {}", source))]
     WriteBuffer {
         source: write_buffer::core::WriteBufferError,
     },
+    #[snafu(display("error initialising ingester: {}", source))]
+    IngesterInit { source: crate::data::InitError },
 }
 
 /// A specialized `Error` for Catalog errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// An [`IngestHandler`] handles all ingest requests from kafka, persistence and queries
+/// An [`IngestHandler`] handles all ingest requests from persistence and queries
 #[async_trait]
 pub trait IngestHandler: Send + Sync {
     /// Return results from the in-memory data that match this query
     async fn query(
         &self,
         request: IngesterQueryRequest,
+        span: Option<Span>,
     ) -> Result<IngesterQueryResponse, crate::querier_handler::Error>;
 
-    /// Return sequencer progress for the requested kafka partitions
+    /// Return shard progress for the requested shard indexes
     async fn progresses(
         &self,
-        sequencers: Vec<KafkaPartition>,
-    ) -> BTreeMap<KafkaPartition, SequencerProgress>;
+        shard_indexes: Vec<ShardIndex>,
+    ) -> BTreeMap<ShardIndex, ShardProgress>;
 
     /// Wait until the handler finished  to shutdown.
     ///
@@ -89,13 +85,13 @@ fn shared_handle(handle: JoinHandle<()>) -> SharedJoinHandle {
     handle.map_err(Arc::new).boxed().shared()
 }
 
-/// Implementation of the `IngestHandler` trait to ingest from kafka and manage
+/// Implementation of the `IngestHandler` trait to ingest from shards and manage
 /// persistence and answer queries
 #[derive(Debug)]
 pub struct IngestHandlerImpl<T = SystemProvider> {
-    /// Kafka Topic assigned to this ingester
+    /// Topic assigned to this ingester
     #[allow(dead_code)]
-    kafka_topic: KafkaTopic,
+    topic: TopicMetadata,
 
     /// Future that resolves when the background worker exits
     join_handles: Vec<(String, SharedJoinHandle)>,
@@ -133,8 +129,8 @@ impl IngestHandlerImpl {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         lifecycle_config: LifecycleConfig,
-        topic: KafkaTopic,
-        sequencer_states: BTreeMap<KafkaPartition, Sequencer>,
+        topic: TopicMetadata,
+        shard_states: BTreeMap<ShardIndex, Shard>,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<DynObjectStore>,
         write_buffer: Arc<dyn WriteBufferReading>,
@@ -143,24 +139,21 @@ impl IngestHandlerImpl {
         skip_to_oldest_available: bool,
         max_requests: usize,
     ) -> Result<Self> {
-        // build the initial ingester data state
-        let mut sequencers = BTreeMap::new();
-        for s in sequencer_states.values() {
-            sequencers.insert(
-                s.id,
-                SequencerData::new(s.kafka_partition, Arc::clone(&metric_registry)),
-            );
-        }
-        let data = Arc::new(IngesterData::new(
-            object_store,
-            catalog,
-            sequencers,
-            exec,
-            BackoffConfig::default(),
-        ));
+        let data = Arc::new(
+            IngesterData::new(
+                object_store,
+                catalog,
+                shard_states.clone().into_iter().map(|(idx, s)| (s.id, idx)),
+                exec,
+                BackoffConfig::default(),
+                Arc::clone(&metric_registry),
+            )
+            .await
+            .context(IngesterInitSnafu)?,
+        );
 
         let ingester_data = Arc::clone(&data);
-        let kafka_topic_name = topic.name.clone();
+        let topic_name = topic.name.clone();
 
         // start the lifecycle manager
         let persister = Arc::clone(&data);
@@ -182,48 +175,48 @@ impl IngestHandlerImpl {
             lifecycle_config
         );
 
-        let mut join_handles = Vec::with_capacity(sequencer_states.len() + 1);
+        let mut join_handles = Vec::with_capacity(shard_states.len() + 1);
         join_handles.push(("lifecycle manager".to_owned(), shared_handle(handle)));
 
-        for (kafka_partition, sequencer) in sequencer_states {
+        for (shard_index, shard) in shard_states {
             let metric_registry = Arc::clone(&metric_registry);
 
             // Acquire a write buffer stream and seek it to the last
             // definitely-already-persisted op
             let mut op_stream = write_buffer
-                .stream_handler(kafka_partition.get() as u32)
+                .stream_handler(shard_index)
                 .await
                 .context(WriteBufferSnafu)?;
             info!(
-                kafka_partition = kafka_partition.get(),
-                min_unpersisted_sequence_number = sequencer.min_unpersisted_sequence_number.get(),
+                shard_index = shard_index.get(),
+                min_unpersisted_sequence_number = shard.min_unpersisted_sequence_number.get(),
                 "Seek stream",
             );
             op_stream
-                .seek(sequencer.min_unpersisted_sequence_number)
+                .seek(shard.min_unpersisted_sequence_number)
                 .await
                 .context(WriteBufferSnafu)?;
 
             // Initialise the DmlSink stack.
             let watermark_fetcher = PeriodicWatermarkFetcher::new(
                 Arc::clone(&write_buffer),
-                sequencer.kafka_partition,
+                shard.shard_index,
                 Duration::from_secs(10),
-                &*metric_registry,
+                &metric_registry,
             );
             // Wrap the IngesterData in a DmlSink adapter
             let sink = IngestSinkAdaptor::new(
                 Arc::clone(&ingester_data),
                 lifecycle_handle.clone(),
-                sequencer.id,
+                shard.id,
             );
             // Emit metrics when ops flow through the sink
             let sink = SinkInstrumentation::new(
                 sink,
                 watermark_fetcher,
-                kafka_topic_name.clone(),
-                sequencer.kafka_partition,
-                &*metric_registry,
+                topic_name.clone(),
+                shard.shard_index,
+                &metric_registry,
             );
 
             // Spawn a task to stream in ops from the op_stream and push them
@@ -231,16 +224,17 @@ impl IngestHandlerImpl {
             let handle = tokio::task::spawn({
                 let shutdown = shutdown.child_token();
                 let lifecycle_handle = lifecycle_handle.clone();
-                let kafka_topic_name = kafka_topic_name.clone();
+                let topic_name = topic_name.clone();
                 async move {
                     let handler = SequencedStreamHandler::new(
                         op_stream,
-                        sequencer.min_unpersisted_sequence_number,
+                        shard.min_unpersisted_sequence_number,
                         sink,
                         lifecycle_handle,
-                        kafka_topic_name,
-                        sequencer.kafka_partition,
-                        &*metric_registry,
+                        topic_name,
+                        shard.shard_index,
+                        shard.id,
+                        &metric_registry,
                         skip_to_oldest_available,
                     );
 
@@ -248,7 +242,7 @@ impl IngestHandlerImpl {
                 }
             });
 
-            let worker_name = format!("stream handler for partition {}", kafka_partition.get());
+            let worker_name = format!("stream handler for shard index {}", shard_index.get());
             join_handles.push((worker_name, shared_handle(handle)));
         }
 
@@ -271,7 +265,7 @@ impl IngestHandlerImpl {
 
         Ok(Self {
             data,
-            kafka_topic: topic,
+            topic,
             join_handles,
             shutdown,
             query_duration_success,
@@ -289,7 +283,10 @@ impl IngestHandler for IngestHandlerImpl {
     async fn query(
         &self,
         request: IngesterQueryRequest,
+        span: Option<Span>,
     ) -> Result<IngesterQueryResponse, crate::querier_handler::Error> {
+        let span_recorder = SpanRecorder::new(span);
+
         // TODO(4567): move this into a instrumented query delegate
 
         // Acquire and hold a permit for the duration of this request, or return
@@ -311,15 +308,22 @@ impl IngestHandler for IngestHandlerImpl {
         // TEMP(alamb): Log details about what was requested
         // temporarily so we can track down potentially "killer"
         // requests from the querier to ingester
-        info!(namespace=%request.namespace,
-              table=%request.table,
-              columns=?request.columns,
-              predicate=?request.predicate,
-              "Handling querier request");
+        info!(
+            namespace_id=%request.namespace_id,
+            table_id=%request.table_id,
+            columns=?request.columns,
+            predicate=?request.predicate,
+            "handling querier request"
+        );
 
         let t = self.time_provider.now();
         let request = Arc::new(request);
-        let res = prepare_data_to_querier(&self.data, &request).await;
+        let res = prepare_data_to_querier(
+            &self.data,
+            &request,
+            span_recorder.child_span("ingester prepare data to querier"),
+        )
+        .await;
 
         if let Some(delta) = self.time_provider.now().checked_duration_since(t) {
             match &res {
@@ -360,12 +364,12 @@ impl IngestHandler for IngestHandlerImpl {
         self.data.exec().shutdown();
     }
 
-    /// Return the ingestion progress from each sequencer
+    /// Return the ingestion progress from each shard
     async fn progresses(
         &self,
-        partitions: Vec<KafkaPartition>,
-    ) -> BTreeMap<KafkaPartition, SequencerProgress> {
-        self.data.progresses(partitions).await
+        shard_indexes: Vec<ShardIndex>,
+    ) -> BTreeMap<ShardIndex, ShardProgress> {
+        self.data.progresses(shard_indexes).await
     }
 }
 
@@ -392,185 +396,18 @@ impl<T> Drop for IngestHandlerImpl<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::SnapshotBatch;
-    use data_types::{Namespace, NamespaceSchema, QueryPool, Sequence, SequenceNumber};
-    use dml::{DmlMeta, DmlWrite};
-    use iox_catalog::{mem::MemCatalog, validate_or_insert_schema};
-    use iox_time::Time;
-    use metric::{Attributes, Metric, U64Counter, U64Gauge};
-    use mutable_batch_lp::lines_to_batches;
+    use crate::test_util::make_write_op;
+    use data_types::{Namespace, NamespaceId, PartitionKey, SequenceNumber, TableId};
+    use dml::DmlWrite;
+    use iox_catalog::mem::MemCatalog;
     use object_store::memory::InMemory;
-    use std::{num::NonZeroU32, ops::DerefMut};
+    use std::num::NonZeroU32;
+    use test_helpers::maybe_start_logging;
     use write_buffer::mock::{MockBufferForReading, MockBufferSharedState};
 
     #[tokio::test]
-    async fn read_from_write_buffer_write_to_mutable_buffer() {
-        let ingester = TestIngester::new().await;
-
-        let schema = NamespaceSchema::new(
-            ingester.namespace.id,
-            ingester.kafka_topic.id,
-            ingester.query_pool.id,
-        );
-        let mut txn = ingester.catalog.start_transaction().await.unwrap();
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let ingest_ts2 = Time::from_timestamp_millis(1337);
-        let w1 = DmlWrite::new(
-            "foo",
-            lines_to_batches("mem foo=1 10", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(0, SequenceNumber::new(0)),
-                ingest_ts1,
-                None,
-                50,
-            ),
-        );
-        let schema = validate_or_insert_schema(w1.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w1);
-        let w2 = DmlWrite::new(
-            "foo",
-            lines_to_batches("cpu bar=2 20\ncpu bar=3 30", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(0, SequenceNumber::new(7)),
-                ingest_ts2,
-                None,
-                150,
-            ),
-        );
-        let _schema = validate_or_insert_schema(w2.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w2);
-        let w3 = DmlWrite::new(
-            "foo",
-            lines_to_batches("a b=2 200", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(0, SequenceNumber::new(9)),
-                ingest_ts2,
-                None,
-                150,
-            ),
-        );
-        let _schema = validate_or_insert_schema(w3.tables(), &schema, txn.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-        ingester.write_buffer_state.push_write(w3);
-        txn.commit().await.unwrap();
-
-        // give the writes some time to go through the buffer. Exit once we've verified there's
-        // data in there from both writes.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let mut has_measurement = false;
-
-                if let Some(data) = ingester.ingester.data.sequencer(ingester.sequencer.id) {
-                    if let Some(data) = data.namespace(&ingester.namespace.name) {
-                        // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("a", &"1970-01-01".into()).await {
-                            if let Some(b) = b.first() {
-                                if b.data.num_rows() > 0 {
-                                    has_measurement = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // and ensure that the sequencer state was actually updated
-                let seq = ingester
-                    .catalog
-                    .repositories()
-                    .await
-                    .sequencers()
-                    .create_or_get(&ingester.kafka_topic, ingester.kafka_partition)
-                    .await
-                    .unwrap();
-
-                if has_measurement && seq.min_unpersisted_sequence_number == SequenceNumber::new(9)
-                {
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .expect("timeout");
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<DurationHistogram>>("ingester_op_apply_duration")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-                ("result", "success"),
-            ]))
-            .unwrap()
-            .fetch();
-        let hits = observation.buckets.iter().map(|b| b.count).sum::<u64>();
-        assert_eq!(hits, 3);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Counter>>("ingester_write_buffer_read_bytes")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 350);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_sequence_number")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 9);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_sequence_number_lag")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, 0);
-
-        let observation = ingester
-            .metrics
-            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_ingest_ts")
-            .unwrap()
-            .get_observer(&Attributes::from(&[
-                ("kafka_topic", "whatevs"),
-                ("kafka_partition", "0"),
-            ]))
-            .unwrap()
-            .fetch();
-        assert_eq!(observation, ingest_ts2.timestamp_nanos() as u64);
-    }
-
-    #[tokio::test]
     async fn test_shutdown() {
-        let ingester = TestIngester::new().await.ingester;
+        let (ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         // does not exit w/o shutdown
         tokio::select! {
@@ -588,7 +425,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "Background worker 'bad_task' exited early!")]
     async fn test_join_task_early_shutdown() {
-        let mut ingester = TestIngester::new().await.ingester;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         let shutdown_task = tokio::spawn(async {
             // It does nothing! and stops.
@@ -605,7 +442,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "JoinError::Panic")]
     async fn test_join_task_panic() {
-        let mut ingester = TestIngester::new().await.ingester;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
 
         let shutdown_task = tokio::spawn(async {
             panic!("bananas");
@@ -623,48 +460,42 @@ mod tests {
         write_operations: Vec<DmlWrite>,
         min_unpersisted_sequence_number: i64,
         skip_to_oldest_available: bool,
-    ) -> (IngestHandlerImpl, Sequencer, Namespace) {
+    ) -> (IngestHandlerImpl, Shard, Namespace) {
         let metrics: Arc<metric::Registry> = Default::default();
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
         let mut txn = catalog.start_transaction().await.unwrap();
-        let kafka_topic = txn.kafka_topics().create_or_get("whatevs").await.unwrap();
+        let topic = txn.topics().create_or_get("whatevs").await.unwrap();
         let query_pool = txn.query_pools().create_or_get("whatevs").await.unwrap();
-        let kafka_partition = KafkaPartition::new(0);
+        let shard_index = ShardIndex::new(0);
         let namespace = txn
             .namespaces()
-            .create("foo", "inf", kafka_topic.id, query_pool.id)
+            .create("foo", None, topic.id, query_pool.id)
             .await
             .unwrap();
-        let mut sequencer = txn
-            .sequencers()
-            .create_or_get(&kafka_topic, kafka_partition)
+        let mut shard = txn
+            .shards()
+            .create_or_get(&topic, shard_index)
             .await
             .unwrap();
         // update the min unpersisted
-        sequencer.min_unpersisted_sequence_number =
+        shard.min_unpersisted_sequence_number =
             SequenceNumber::new(min_unpersisted_sequence_number);
         // this probably isn't necessary, but just in case something changes later
-        txn.sequencers()
+        txn.shards()
             .update_min_unpersisted_sequence_number(
-                sequencer.id,
+                shard.id,
                 SequenceNumber::new(min_unpersisted_sequence_number),
             )
             .await
             .unwrap();
 
-        let mut sequencer_states = BTreeMap::new();
-        sequencer_states.insert(kafka_partition, sequencer);
+        let mut shard_states = BTreeMap::new();
+        shard_states.insert(shard_index, shard);
 
         let write_buffer_state =
-            MockBufferSharedState::empty_with_n_sequencers(NonZeroU32::try_from(1).unwrap());
-
-        let schema = NamespaceSchema::new(namespace.id, kafka_topic.id, query_pool.id);
+            MockBufferSharedState::empty_with_n_shards(NonZeroU32::try_from(1).unwrap());
         for write_operation in write_operations {
-            validate_or_insert_schema(write_operation.tables(), &schema, txn.deref_mut())
-                .await
-                .unwrap()
-                .unwrap();
             write_buffer_state.push_write(write_operation);
         }
         txn.commit().await.unwrap();
@@ -679,11 +510,12 @@ mod tests {
             1000,
             Duration::from_secs(10),
             Duration::from_secs(10),
+            100000000,
         );
         let ingester = IngestHandlerImpl::new(
             lifecycle_config,
-            kafka_topic.clone(),
-            sequencer_states,
+            topic.clone(),
+            shard_states,
             Arc::clone(&catalog),
             object_store,
             reading,
@@ -695,96 +527,40 @@ mod tests {
         .await
         .unwrap();
 
-        (ingester, sequencer, namespace)
+        (ingester, shard, namespace)
     }
 
-    async fn verify_ingester_buffer_has_data(
-        ingester: IngestHandlerImpl,
-        sequencer: Sequencer,
-        namespace: Namespace,
-        custom_batch_verification: impl Fn(&SnapshotBatch) + Send,
-    ) {
-        // give the writes some time to go through the buffer. Exit once we've verified there's
-        // data in there
-        tokio::time::timeout(Duration::from_secs(1), async move {
-            loop {
-                let mut has_measurement = false;
+    fn dml_write(table_name: &str, sequence_number: i64) -> DmlWrite {
+        let partition_key = PartitionKey::from("1970-01-01");
+        let shard_index = ShardIndex::new(0);
+        let namespace_id = NamespaceId::new(1);
+        let table_id = TableId::new(1);
+        let timestamp = 42;
 
-                if let Some(data) = ingester.data.sequencer(sequencer.id) {
-                    if let Some(data) = data.namespace(&namespace.name) {
-                        // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("cpu", &"1970-01-01".into()).await {
-                            if let Some(b) = b.first() {
-                                custom_batch_verification(b);
-
-                                if b.data.num_rows() == 1 {
-                                    has_measurement = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if has_measurement {
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .expect("timeout");
-    }
-
-    #[tokio::test]
-    async fn seeks_on_initialization() {
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let ingest_ts2 = Time::from_timestamp_millis(1337);
-        let write_operations = vec![
-            DmlWrite::new(
-                "foo",
-                lines_to_batches("cpu bar=2 20", 0).unwrap(),
-                Some("1970-01-01".into()),
-                DmlMeta::sequenced(
-                    Sequence::new(0, SequenceNumber::new(1)),
-                    ingest_ts1,
-                    None,
-                    150,
-                ),
+        make_write_op(
+            &partition_key,
+            shard_index,
+            namespace_id,
+            table_name,
+            table_id,
+            sequence_number,
+            &format!(
+                "{} foo=1 {}\n{} foo=2 {}",
+                table_name,
+                timestamp,
+                table_name,
+                timestamp + 10
             ),
-            DmlWrite::new(
-                "foo",
-                lines_to_batches("cpu bar=2 30", 0).unwrap(),
-                Some("1970-01-01".into()),
-                DmlMeta::sequenced(
-                    Sequence::new(0, SequenceNumber::new(2)),
-                    ingest_ts2,
-                    None,
-                    150,
-                ),
-            ),
-        ];
-
-        let (ingester, sequencer, namespace) =
-            ingester_test_setup(write_operations, 2, false).await;
-
-        verify_ingester_buffer_has_data(ingester, sequencer, namespace, |first_batch| {
-            if first_batch.min_sequencer_number == SequenceNumber::new(1) {
-                panic!(
-                    "initialization did a seek to the beginning rather than \
-                    the min_unpersisted"
-                );
-            }
-        })
-        .await;
+        )
     }
 
     #[tokio::test]
     #[should_panic(expected = "JoinError::Panic")]
-    async fn seeks_on_initialization_unknown_sequence_number() {
-        // No write operations means the stream will return unknown sequence number
-        // Ingester will panic because skip_to_oldest_available is false
-        let (ingester, _sequencer, _namespace) = ingester_test_setup(vec![], 2, false).await;
+    async fn sequence_number_no_longer_exists() {
+        maybe_start_logging();
+
+        let write_operations = vec![dml_write("cpu", 10)];
+        let (ingester, _shard, _namespace) = ingester_test_setup(write_operations, 2, false).await;
 
         tokio::time::timeout(Duration::from_millis(1000), ingester.join())
             .await
@@ -792,132 +568,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeks_on_initialization_unknown_sequence_number_skip_to_oldest_available() {
-        let ingest_ts1 = Time::from_timestamp_millis(42);
-        let write_operations = vec![DmlWrite::new(
-            "foo",
-            lines_to_batches("cpu bar=2 20", 0).unwrap(),
-            Some("1970-01-01".into()),
-            DmlMeta::sequenced(
-                Sequence::new(0, SequenceNumber::new(1)),
-                ingest_ts1,
-                None,
-                150,
-            ),
-        )];
+    #[should_panic(
+        expected = "attempted to seek to offset 10, but current high watermark for partition 0 is 2"
+    )]
+    async fn sequence_number_after_watermark() {
+        maybe_start_logging();
 
-        // Set the min unpersisted to something bigger than the write's sequence number to
-        // cause an UnknownSequenceNumber error. Skip to oldest available = true, so ingester
-        // should find data
-        let (ingester, sequencer, namespace) =
-            ingester_test_setup(write_operations, 10, true).await;
+        let write_operations = vec![dml_write("cpu", 2)];
 
-        verify_ingester_buffer_has_data(ingester, sequencer, namespace, |first_batch| {
-            assert_eq!(
-                first_batch.min_sequencer_number,
-                SequenceNumber::new(1),
-                "re-initialization didn't seek to the beginning",
-            );
-        })
-        .await;
+        let (ingester, _shard, _namespace) = ingester_test_setup(write_operations, 10, false).await;
+
+        tokio::time::timeout(Duration::from_millis(1100), ingester.join())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "attempted to seek to offset 10, but current high watermark for partition 0 is 2"
+    )]
+    async fn sequence_number_after_watermark_skip_to_oldest_available() {
+        maybe_start_logging();
+
+        let write_operations = vec![dml_write("cpu", 2)];
+
+        let (ingester, _shard, _namespace) = ingester_test_setup(write_operations, 10, true).await;
+
+        tokio::time::timeout(Duration::from_millis(1100), ingester.join())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn limits_concurrent_queries() {
-        let mut ingester = TestIngester::new().await;
+        let (mut ingester, _, _) = ingester_test_setup(vec![], 0, true).await;
         let request = IngesterQueryRequest {
-            namespace: "foo".to_string(),
-            table: "cpu".to_string(),
+            namespace_id: NamespaceId::new(42),
+            table_id: TableId::new(24),
             columns: vec!["asdf".to_string()],
             predicate: None,
         };
 
-        let res = ingester.ingester.query(request.clone()).await.unwrap_err();
+        let res = ingester.query(request.clone(), None).await.unwrap_err();
         assert!(matches!(
             res,
             crate::querier_handler::Error::NamespaceNotFound { .. }
         ));
 
-        ingester.ingester.request_sem = Semaphore::new(0);
-        let res = ingester.ingester.query(request).await.unwrap_err();
+        ingester.request_sem = Semaphore::new(0);
+        let res = ingester.query(request, None).await.unwrap_err();
         assert!(matches!(res, crate::querier_handler::Error::RequestLimit));
-    }
-
-    struct TestIngester {
-        catalog: Arc<dyn Catalog>,
-        sequencer: Sequencer,
-        namespace: Namespace,
-        kafka_topic: KafkaTopic,
-        kafka_partition: KafkaPartition,
-        query_pool: QueryPool,
-        metrics: Arc<metric::Registry>,
-        write_buffer_state: MockBufferSharedState,
-        ingester: IngestHandlerImpl,
-    }
-
-    impl TestIngester {
-        async fn new() -> Self {
-            let metrics: Arc<metric::Registry> = Default::default();
-            let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-
-            let mut txn = catalog.start_transaction().await.unwrap();
-            let kafka_topic = txn.kafka_topics().create_or_get("whatevs").await.unwrap();
-            let query_pool = txn.query_pools().create_or_get("whatevs").await.unwrap();
-            let kafka_partition = KafkaPartition::new(0);
-            let namespace = txn
-                .namespaces()
-                .create("foo", "inf", kafka_topic.id, query_pool.id)
-                .await
-                .unwrap();
-            let sequencer = txn
-                .sequencers()
-                .create_or_get(&kafka_topic, kafka_partition)
-                .await
-                .unwrap();
-            txn.commit().await.unwrap();
-
-            let mut sequencer_states = BTreeMap::new();
-            sequencer_states.insert(kafka_partition, sequencer);
-
-            let write_buffer_state =
-                MockBufferSharedState::empty_with_n_sequencers(NonZeroU32::try_from(1).unwrap());
-            let reading: Arc<dyn WriteBufferReading> =
-                Arc::new(MockBufferForReading::new(write_buffer_state.clone(), None).unwrap());
-            let object_store = Arc::new(InMemory::new());
-
-            let lifecycle_config = LifecycleConfig::new(
-                1000000,
-                1000,
-                1000,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-            );
-            let ingester = IngestHandlerImpl::new(
-                lifecycle_config,
-                kafka_topic.clone(),
-                sequencer_states,
-                Arc::clone(&catalog),
-                object_store,
-                reading,
-                Arc::new(Executor::new(1)),
-                Arc::clone(&metrics),
-                false,
-                1,
-            )
-            .await
-            .unwrap();
-
-            Self {
-                catalog,
-                sequencer,
-                namespace,
-                kafka_topic,
-                kafka_partition,
-                query_pool,
-                metrics,
-                write_buffer_state,
-                ingester,
-            }
-        }
     }
 }

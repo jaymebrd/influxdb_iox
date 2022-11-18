@@ -61,9 +61,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::{
+    common::DFSchemaRef,
     error::{DataFusionError, Result},
     execution::context::TaskContext,
-    logical_plan::{DFSchemaRef, Expr, LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
@@ -432,7 +433,7 @@ fn compute_batch(
             let indices = indices.as_any().downcast_ref::<BooleanArray>().unwrap();
 
             // include null for last batch
-            let batch = if last_batch && indices.null_count() > 0 {
+            if last_batch && indices.null_count() > 0 {
                 // since !Null --> Null, but we want all the
                 // remaining rows, that are not in true_indicies,
                 // transform any nulls into true for this one
@@ -441,8 +442,7 @@ fn compute_batch(
                 filter_record_batch(input_batch, &BooleanArray::from(mapped_indicies))
             } else {
                 filter_record_batch(input_batch, indices)
-            }?;
-            batch
+            }?
         }
         ColumnarValue::Scalar(ScalarValue::Boolean(val)) => {
             let empty_record_batch = RecordBatch::new_empty(input_batch.schema());
@@ -520,8 +520,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow_util::assert_batches_sorted_eq;
     use datafusion::{
-        logical_plan::{col, lit},
         physical_plan::memory::MemoryExec,
+        prelude::{col, lit},
     };
     use datafusion_util::test_collect_partition;
 

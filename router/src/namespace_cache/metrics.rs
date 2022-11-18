@@ -1,10 +1,12 @@
 //! Metric instrumentation for a [`NamespaceCache`] implementation.
 
-use super::NamespaceCache;
-use data_types::{DatabaseName, NamespaceSchema};
+use std::sync::Arc;
+
+use data_types::{NamespaceName, NamespaceSchema};
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{DurationHistogram, Metric, U64Gauge};
-use std::sync::Arc;
+
+use super::NamespaceCache;
 
 /// An [`InstrumentedCache`] decorates a [`NamespaceCache`] with cache read
 /// hit/miss and cache put insert/update metrics.
@@ -72,7 +74,7 @@ where
     T: NamespaceCache,
     P: TimeProvider,
 {
-    fn get_schema(&self, namespace: &DatabaseName<'_>) -> Option<Arc<NamespaceSchema>> {
+    fn get_schema(&self, namespace: &NamespaceName<'_>) -> Option<Arc<NamespaceSchema>> {
         let t = self.time_provider.now();
         let res = self.inner.get_schema(namespace);
 
@@ -90,11 +92,11 @@ where
 
     fn put_schema(
         &self,
-        namespace: DatabaseName<'static>,
+        namespace: NamespaceName<'static>,
         schema: impl Into<Arc<NamespaceSchema>>,
     ) -> Option<Arc<NamespaceSchema>> {
         let schema = schema.into();
-        let stats = NamespaceStats::new(&*schema);
+        let stats = NamespaceStats::new(&schema);
 
         let t = self.time_provider.now();
         let res = self.inner.put_schema(namespace, schema);
@@ -107,7 +109,7 @@ where
 
                 // Figure out the difference between the new namespace and the
                 // evicted old namespace
-                let old_stats = NamespaceStats::new(&*v);
+                let old_stats = NamespaceStats::new(&v);
                 let table_count_diff = stats.table_count as i64 - old_stats.table_count as i64;
                 let column_count_diff = stats.column_count as i64 - old_stats.column_count as i64;
 
@@ -151,14 +153,15 @@ impl NamespaceStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::namespace_cache::MemoryNamespaceCache;
+    use std::collections::BTreeMap;
+
     use data_types::{
-        ColumnId, ColumnSchema, ColumnType, KafkaTopicId, NamespaceId, QueryPoolId, TableId,
-        TableSchema,
+        ColumnId, ColumnSchema, ColumnType, NamespaceId, QueryPoolId, TableId, TableSchema, TopicId,
     };
     use metric::{Attributes, MetricObserver, Observation};
-    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::namespace_cache::MemoryNamespaceCache;
 
     /// Deterministically generate a schema containing tables with the specified
     /// column cardinality.
@@ -192,9 +195,11 @@ mod tests {
 
         NamespaceSchema {
             id: NamespaceId::new(42),
-            kafka_topic_id: KafkaTopicId::new(24),
+            topic_id: TopicId::new(24),
             query_pool_id: QueryPoolId::new(1234),
             tables,
+            max_columns_per_table: 100,
+            retention_period_ns: None,
         }
     }
 
@@ -220,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_put() {
-        let ns = DatabaseName::new("test").expect("database name is valid");
+        let ns = NamespaceName::new("test").expect("namespace name is valid");
         let registry = metric::Registry::default();
         let cache = Arc::new(MemoryNamespaceCache::default());
         let cache = Arc::new(InstrumentedCache::new(cache, &registry));
@@ -352,7 +357,7 @@ mod tests {
         assert_eq!(cache.column_count.observe(), Observation::U64Gauge(11));
 
         // Add a new namespace
-        let ns = DatabaseName::new("another").expect("database name is valid");
+        let ns = NamespaceName::new("another").expect("namespace name is valid");
         let schema = new_schema(&[10, 12, 9]);
         assert!(cache.put_schema(ns.clone(), schema).is_none());
         assert_histogram_hit(

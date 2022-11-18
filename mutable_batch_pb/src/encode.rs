@@ -12,24 +12,20 @@ use mutable_batch::MutableBatch;
 use schema::InfluxColumnType;
 
 /// Convert a [`DmlWrite`] to a [`DatabaseBatch`]
-pub fn encode_write(db_name: &str, write: &DmlWrite) -> DatabaseBatch {
+pub fn encode_write(database_id: i64, write: &DmlWrite) -> DatabaseBatch {
     DatabaseBatch {
-        database_name: db_name.to_string(),
         table_batches: write
             .tables()
-            .map(|(table_name, batch)| encode_batch(table_name, batch))
+            .map(|(table_id, batch)| encode_batch(table_id.get(), batch))
             .collect(),
-        partition_key: write
-            .partition_key()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
+        partition_key: write.partition_key().to_string(),
+        database_id,
     }
 }
 
 /// Convert a [`MutableBatch`] to [`TableBatch`]
-pub fn encode_batch(table_name: &str, batch: &MutableBatch) -> TableBatch {
+pub fn encode_batch(table_id: i64, batch: &MutableBatch) -> TableBatch {
     TableBatch {
-        table_name: table_name.to_string(),
         columns: batch
             .columns()
             .filter_map(|(column_name, column)| {
@@ -48,6 +44,7 @@ pub fn encode_batch(table_name: &str, batch: &MutableBatch) -> TableBatch {
             })
             .collect(),
         row_count: batch.rows() as u32,
+        table_id,
     }
 }
 

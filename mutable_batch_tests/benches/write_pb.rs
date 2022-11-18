@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use data_types::{NamespaceId, TableId};
 use dml::DmlWrite;
 use generated_types::influxdata::pbdata::v1::DatabaseBatch;
 use mutable_batch::MutableBatch;
@@ -12,13 +13,19 @@ fn generate_pbdata_bytes() -> Vec<(String, (usize, Bytes))> {
         .into_iter()
         .map(|(bench, lp)| {
             let batches = lines_to_batches(&lp, 0).unwrap();
+            let data = batches
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (_table_name, batch))| (TableId::new(idx as _), batch))
+                .collect();
+
             let write = DmlWrite::new(
-                "test_db",
-                batches,
-                Some("bananas".into()),
+                NamespaceId::new(42),
+                data,
+                "bananas".into(),
                 Default::default(),
             );
-            let database_batch = mutable_batch_pb::encode::encode_write("db", &write);
+            let database_batch = mutable_batch_pb::encode::encode_write(42, &write);
 
             let mut bytes = BytesMut::new();
             database_batch.encode(&mut bytes).unwrap();

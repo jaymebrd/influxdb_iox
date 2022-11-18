@@ -1,11 +1,13 @@
 [package]
 name = "mutable_batch_lp"
-version = "0.1.0"
-edition = "2021"
 description = "Conversion logic for line protocol -> MutableBatch"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 influxdb_line_protocol = { path = "../influxdb_line_protocol" }
 mutable_batch = { path = "../mutable_batch" }
 schema = { path = "../schema" }
@@ -15,11 +17,14 @@ workspace-hack = { path = "../workspace-hack"}
 [dev-dependencies]
 arrow_util = { path = "../arrow_util" }
 assert_matches = "1.5.0"
-criterion = "0.3"
+criterion = { version = "0.4", default-features = false, features = ["rayon"]}
 
 [[bench]]
 name = "parse_lp"
 harness = false
 
+
 [lib]
+# Allow --save-baseline to work
+# https://github.com/bheisler/criterion.rs/issues/275
 bench = false

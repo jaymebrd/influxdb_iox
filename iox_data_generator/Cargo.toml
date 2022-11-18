@@ -1,34 +1,46 @@
 [package]
 name = "iox_data_generator"
-version = "0.1.0"
-authors = ["Paul Dix <paul@pauldix.net>"]
-edition = "2021"
 default-run = "iox_data_generator"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+bytes = "1.2"
 chrono = { version = "0.4", default-features = false }
 chrono-english = "0.1.4"
-clap = { version = "3", features = ["derive", "env", "cargo"] }
+clap = { version = "4", features = ["derive", "env", "cargo"] }
+datafusion_util = { path = "../datafusion_util" }
 futures = "0.3"
-handlebars = "4.3.2"
+handlebars = "4.3.5"
 humantime = "2.1.0"
 influxdb2_client = { path = "../influxdb2_client" }
-itertools = "0.10.0"
+itertools = "0.10.5"
+mutable_batch_lp = { path = "../mutable_batch_lp" }
+mutable_batch = { path = "../mutable_batch" }
+parquet_file = { path = "../parquet_file" }
 rand = { version = "0.8.3", features = ["small_rng"] }
-regex = "1.6"
+regex = "1.7"
+schema = { path = "../schema" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.82"
+serde_json = "1.0.87"
 snafu = "0.7"
-tokio = { version = "1.20", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.21", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 toml = "0.5.9"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", default_features = false }
 
 [dev-dependencies]
-criterion = "0.3.6"
+criterion = { version = "0.4", default-features = false, features = ["rayon"]}
 test_helpers = { path = "../test_helpers" }
 
 [[bench]]
 name = "point_generation"
 harness = false
+
+[lib]
+# Allow --save-baseline to work
+# https://github.com/bheisler/criterion.rs/issues/275
+bench = false

@@ -1,15 +1,16 @@
 [package]
 name = "schema"
-version = "0.1.0"
-authors = ["Andrew Lamb <andrew@nerdnetworks.org>"]
-edition = "2021"
 description = "IOx Schema definition"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-arrow = { version = "17.0.0", features = ["prettyprint"] }
-hashbrown = "0.12"
+arrow = { workspace = true, features = ["prettyprint"] }
+hashbrown = { workspace = true }
 indexmap = { version = "1.9", features = ["std"] }
-itertools = "0.10.1"
+itertools = "0.10.5"
 observability_deps = { path = "../observability_deps" }
 snafu = "0.7"
 workspace-hack = { path = "../workspace-hack"}

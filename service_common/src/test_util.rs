@@ -8,7 +8,7 @@ use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
 };
 
-use crate::QueryDatabaseProvider;
+use crate::QueryNamespaceProvider;
 
 #[derive(Debug)]
 pub struct TestDatabaseStore {
@@ -57,11 +57,11 @@ impl Default for TestDatabaseStore {
 }
 
 #[async_trait]
-impl QueryDatabaseProvider for TestDatabaseStore {
+impl QueryNamespaceProvider for TestDatabaseStore {
     type Db = TestDatabase;
 
     /// Retrieve the database specified name
-    async fn db(&self, name: &str) -> Option<Arc<Self::Db>> {
+    async fn db(&self, name: &str, _span: Option<Span>) -> Option<Arc<Self::Db>> {
         let databases = self.databases.lock();
 
         databases.get(name).cloned()

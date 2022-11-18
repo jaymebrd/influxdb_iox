@@ -104,23 +104,24 @@ impl TraceHeaderParser {
     /// * <https://www.jaegertracing.io/docs/1.21/client-libraries/#propagation-format>
     pub fn parse(
         &self,
-        collector: &Arc<dyn TraceCollector>,
+        collector: Option<&Arc<dyn TraceCollector>>,
         headers: &HeaderMap,
     ) -> Result<Option<SpanContext>, ContextError> {
         if let Some(trace_header) = self.jaeger_trace_context_header_name.as_ref() {
             if headers.contains_key(trace_header.as_ref()) {
-                return decode_jaeger(collector, headers, trace_header.as_ref());
+                return decode_jaeger(collector, headers, trace_header.as_ref()).map(Some);
             }
         }
 
         if headers.contains_key(B3_TRACE_ID_HEADER) {
-            return decode_b3(collector, headers);
+            return decode_b3(collector, headers).map(Some);
         }
 
         if let Some(debug_header_name) = self.jaeger_debug_name.as_ref() {
             if let Some(debug_header_value) = headers.get(debug_header_name.as_ref()) {
                 // create a new trace / span
-                let new_trace_context = SpanContext::new(Arc::clone(collector));
+                let new_trace_context =
+                    SpanContext::new_with_optional_collector(collector.cloned());
                 // It would be nice to record the debug-name in the span somehow for easy finding in Jaeger
                 // for now, also log it.
                 let trace_id = format!("{:x}", new_trace_context.trace_id.get());
@@ -135,9 +136,9 @@ impl TraceHeaderParser {
 
 /// Decodes headers in the B3 format
 fn decode_b3(
-    collector: &Arc<dyn TraceCollector>,
+    collector: Option<&Arc<dyn TraceCollector>>,
     headers: &HeaderMap,
-) -> Result<Option<SpanContext>, ContextError> {
+) -> Result<SpanContext, ContextError> {
     let debug = decoded_header(headers, B3_FLAGS)?
         .map(|header| header == "1")
         .unwrap_or(false);
@@ -150,20 +151,17 @@ fn decode_b3(
             .unwrap_or(false),
     };
 
-    if !sampled {
-        return Ok(None);
-    }
-
     // Links cannot be specified via the HTTP header
     let links = vec![];
 
-    Ok(Some(SpanContext {
+    Ok(SpanContext {
         trace_id: required_header(headers, B3_TRACE_ID_HEADER, parse_trace)?,
         parent_span_id: parsed_header(headers, B3_PARENT_SPAN_ID_HEADER, parse_span)?,
         span_id: required_header(headers, B3_SPAN_ID_HEADER, parse_span)?,
         links,
-        collector: Some(Arc::clone(collector)),
-    }))
+        collector: collector.cloned(),
+        sampled,
+    })
 }
 
 struct JaegerCtx {
@@ -204,25 +202,24 @@ impl FromStr for JaegerCtx {
 
 /// Decodes headers in the Jaeger format
 fn decode_jaeger(
-    collector: &Arc<dyn TraceCollector>,
+    collector: Option<&Arc<dyn TraceCollector>>,
     headers: &HeaderMap,
     jaeger_header: &str,
-) -> Result<Option<SpanContext>, ContextError> {
+) -> Result<SpanContext, ContextError> {
     let decoded: JaegerCtx = required_header(headers, jaeger_header, FromStr::from_str)?;
-    if decoded.flags & 0x01 == 0 {
-        return Ok(None);
-    }
+    let sampled = decoded.flags & 0x01 == 1;
 
     // Links cannot be specified via the HTTP header
     let links = vec![];
 
-    Ok(Some(SpanContext {
+    Ok(SpanContext {
         trace_id: decoded.trace_id,
         parent_span_id: decoded.parent_span_id,
         span_id: decoded.span_id,
         links,
-        collector: Some(Arc::clone(collector)),
-    }))
+        collector: collector.cloned(),
+        sampled,
+    })
 }
 
 /// Decodes a given header from the provided HeaderMap to a string
@@ -278,23 +275,55 @@ fn required_header<T, F: FnOnce(&str) -> Result<T, DecodeError>>(
     })
 }
 
+/// Span context from external source together with some flags.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext(SpanContext);
+
+impl RequestLogContext {
+    pub(crate) fn new(ctx: SpanContext) -> Self {
+        Self(ctx)
+    }
+
+    pub fn ctx(&self) -> &SpanContext {
+        &self.0
+    }
+}
+
 /// Format span context as Jaeger trace context.
 ///
 /// This only emits the value-part required for tracer. You must still add the header name to the framework / output
 /// stream you're using.
 ///
 /// You may use [`TraceHeaderParser`] to parse the resulting value.
+#[allow(clippy::bool_to_int_with_if)] // if sampled 1 else 0 is clearer than i32::from(sampled) imo
 pub fn format_jaeger_trace_context(span_context: &SpanContext) -> String {
+    let flags = if span_context.sampled { 1 } else { 0 };
+
     format!(
-        "{:x}:{:x}:{:x}:1",
+        "{:x}:{:x}:{:x}:{}",
         span_context.trace_id.get(),
         span_context.span_id.get(),
         span_context
             .parent_span_id
             .as_ref()
             .map(|span_id| span_id.get())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        flags,
     )
+}
+
+/// A simple way to format an external span context in a jaeger-like fashion, e.g. for logging.
+pub trait RequestLogContextExt {
+    /// Format context.
+    fn format_jaeger(&self) -> String;
+}
+
+impl RequestLogContextExt for Option<RequestLogContext> {
+    fn format_jaeger(&self) -> String {
+        self.as_ref()
+            .map(|ctx| format_jaeger_trace_context(&ctx.0))
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -311,45 +340,55 @@ mod tests {
         let mut headers = HeaderMap::new();
 
         // No headers should be None
-        assert!(parser.parse(&collector, &headers).unwrap().is_none());
+        assert!(parser.parse(Some(&collector), &headers).unwrap().is_none());
 
         headers.insert(B3_TRACE_ID_HEADER, HeaderValue::from_static("ee25f"));
         headers.insert(B3_SAMPLED_HEADER, HeaderValue::from_static("0"));
 
-        // Not sampled
-        assert!(parser.parse(&collector, &headers).unwrap().is_none());
-
-        headers.insert(B3_SAMPLED_HEADER, HeaderValue::from_static("1"));
-
         // Missing required headers
         assert_eq!(
-            parser.parse(&collector, &headers).unwrap_err().to_string(),
+            parser
+                .parse(Some(&collector), &headers)
+                .unwrap_err()
+                .to_string(),
             "header 'X-B3-SpanId' not found"
         );
 
         headers.insert(B3_SPAN_ID_HEADER, HeaderValue::from_static("34e"));
 
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        // Not sampled
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
+        assert_eq!(span.span_id.0.get(), 0x34e);
+        assert_eq!(span.trace_id.0.get(), 0xee25f);
+        assert!(span.parent_span_id.is_none());
+        assert!(!span.sampled);
+
+        // sample
+        headers.insert(B3_SAMPLED_HEADER, HeaderValue::from_static("1"));
+
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.span_id.0.get(), 0x34e);
         assert_eq!(span.trace_id.0.get(), 0xee25f);
         assert!(span.parent_span_id.is_none());
+        assert!(span.sampled);
 
         headers.insert(
             B3_PARENT_SPAN_ID_HEADER,
             HeaderValue::from_static("4595945"),
         );
 
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.span_id.0.get(), 0x34e);
         assert_eq!(span.trace_id.0.get(), 0xee25f);
         assert_eq!(span.parent_span_id.unwrap().0.get(), 0x4595945);
+        assert!(span.sampled);
 
         headers.insert(B3_SPAN_ID_HEADER, HeaderValue::from_static("not a number"));
 
         assert_eq!(
-            parser.parse(&collector, &headers)
+            parser.parse(Some(&collector), &headers)
                 .unwrap_err()
                 .to_string(),
             "error decoding header 'X-B3-SpanId': value decode error: invalid digit found in string"
@@ -358,7 +397,10 @@ mod tests {
         headers.insert(B3_SPAN_ID_HEADER, HeaderValue::from_static("0"));
 
         assert_eq!(
-            parser.parse(&collector, &headers).unwrap_err().to_string(),
+            parser
+                .parse(Some(&collector), &headers)
+                .unwrap_err()
+                .to_string(),
             "error decoding header 'X-B3-SpanId': value cannot be 0"
         );
     }
@@ -375,7 +417,7 @@ mod tests {
         // Invalid format
         headers.insert(TRACE_HEADER, HeaderValue::from_static("invalid"));
         assert_eq!(
-            parser.parse(&collector, &headers)
+            parser.parse(Some(&collector), &headers)
                 .unwrap_err()
                 .to_string(),
             "error decoding header 'uber-trace-id': Expected \"trace-id:span-id:parent-span-id:flags\""
@@ -383,28 +425,38 @@ mod tests {
 
         // Not sampled
         headers.insert(TRACE_HEADER, HeaderValue::from_static("343:4325345:0:0"));
-        assert!(parser.parse(&collector, &headers).unwrap().is_none());
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
+
+        assert_eq!(span.trace_id.0.get(), 0x343);
+        assert_eq!(span.span_id.0.get(), 0x4325345);
+        assert!(span.parent_span_id.is_none());
+        assert!(!span.sampled);
 
         // Sampled
         headers.insert(TRACE_HEADER, HeaderValue::from_static("3a43:432e345:0:1"));
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.trace_id.0.get(), 0x3a43);
         assert_eq!(span.span_id.0.get(), 0x432e345);
         assert!(span.parent_span_id.is_none());
+        assert!(span.sampled);
 
         // Parent span
         headers.insert(TRACE_HEADER, HeaderValue::from_static("343:4325345:3434:F"));
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.trace_id.0.get(), 0x343);
         assert_eq!(span.span_id.0.get(), 0x4325345);
         assert_eq!(span.parent_span_id.unwrap().0.get(), 0x3434);
+        assert!(span.sampled);
 
         // Invalid trace id
         headers.insert(TRACE_HEADER, HeaderValue::from_static("0:4325345:3434:1"));
         assert_eq!(
-            parser.parse(&collector, &headers).unwrap_err().to_string(),
+            parser
+                .parse(Some(&collector), &headers)
+                .unwrap_err()
+                .to_string(),
             "error decoding header 'uber-trace-id': value cannot be 0"
         );
 
@@ -413,11 +465,12 @@ mod tests {
             HeaderValue::from_static("008e813572f53b3a:008e813572f53b3a:0000000000000000:1"),
         );
 
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.trace_id.0.get(), 0x008e813572f53b3a);
         assert_eq!(span.span_id.0.get(), 0x008e813572f53b3a);
         assert!(span.parent_span_id.is_none());
+        assert!(span.sampled);
     }
 
     #[test]
@@ -433,16 +486,17 @@ mod tests {
 
         // Default header is ignored
         headers.insert(DEFAULT_JAEGER_TRACE_HEADER, value.clone());
-        assert!(parser.parse(&collector, &headers).unwrap().is_none());
+        assert!(parser.parse(Some(&collector), &headers).unwrap().is_none());
 
         // custom header is parsed
         let mut headers = HeaderMap::new();
         headers.insert("my-awesome-header", value);
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert_eq!(span.trace_id.0.get(), 1);
         assert_eq!(span.span_id.0.get(), 2);
         assert_eq!(span.parent_span_id.unwrap().get(), 3);
+        assert!(span.sampled);
     }
 
     #[test]
@@ -453,11 +507,11 @@ mod tests {
 
         let mut headers = HeaderMap::new();
 
-        assert!(parser.parse(&collector, &headers).unwrap().is_none());
+        assert!(parser.parse(Some(&collector), &headers).unwrap().is_none());
         headers.insert("force-a-trace", HeaderValue::from_static("please do"));
 
         // should have created an entirely new span
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
         assert!(span.parent_span_id.is_none());
     }
@@ -475,10 +529,11 @@ mod tests {
         headers.insert("uber-trace-id", HeaderValue::from_static("1:2:3:1"));
         headers.insert("force-a-trace", HeaderValue::from_static("please do"));
 
-        let span = parser.parse(&collector, &headers).unwrap().unwrap();
+        let span = parser.parse(Some(&collector), &headers).unwrap().unwrap();
         assert_eq!(span.trace_id.0.get(), 1);
         assert_eq!(span.span_id.0.get(), 2);
         assert_eq!(span.parent_span_id.unwrap().get(), 3);
+        assert!(span.sampled);
     }
 
     #[test]
@@ -493,11 +548,9 @@ mod tests {
 
             let mut headers = HeaderMap::new();
             headers.insert(TRACE_HEADER, HeaderValue::from_str(&formatted).unwrap());
-            let parsed = parser.parse(&collector, &headers).unwrap().unwrap();
+            let parsed = parser.parse(Some(&collector), &headers).unwrap().unwrap();
 
-            assert_eq!(parsed.trace_id, orig.trace_id);
-            assert_eq!(parsed.span_id, orig.span_id);
-            assert_eq!(parsed.parent_span_id, orig.parent_span_id);
+            assert_eq!(parsed, orig);
         };
 
         // w/o parent span ID
@@ -506,7 +559,8 @@ mod tests {
             span_id: SpanId::new(5678).unwrap(),
             parent_span_id: None,
             links: vec![],
-            collector: None,
+            collector: Some(Arc::clone(&collector)),
+            sampled: true,
         });
 
         // w/ parent span ID
@@ -515,7 +569,18 @@ mod tests {
             span_id: SpanId::new(5678).unwrap(),
             parent_span_id: Some(SpanId::new(1357).unwrap()),
             links: vec![],
-            collector: None,
+            collector: Some(Arc::clone(&collector)),
+            sampled: true,
+        });
+
+        // not sampled
+        assert_roundtrip(SpanContext {
+            trace_id: TraceId::new(1234).unwrap(),
+            span_id: SpanId::new(5678).unwrap(),
+            parent_span_id: None,
+            links: vec![],
+            collector: Some(Arc::clone(&collector)),
+            sampled: false,
         });
     }
 }

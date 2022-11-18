@@ -8,7 +8,7 @@ use futures::{
 };
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
-use std::{collections::HashMap, hash::Hash, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::{
     sync::oneshot::{error::RecvError, Sender},
     task::JoinHandle,
@@ -18,27 +18,22 @@ use super::{Cache, CacheGetStatus, CachePeekStatus};
 
 /// Combine a [`CacheBackend`] and a [`Loader`] into a single [`Cache`]
 #[derive(Debug)]
-pub struct CacheDriver<K, V, Extra>
+pub struct CacheDriver<B, L>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
-    Extra: std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
+    L: Loader<K = B::K, V = B::V>,
 {
-    state: Arc<Mutex<CacheState<K, V>>>,
-    loader: Arc<dyn Loader<K = K, V = V, Extra = Extra>>,
+    state: Arc<Mutex<CacheState<B>>>,
+    loader: Arc<L>,
 }
 
-impl<K, V, Extra> CacheDriver<K, V, Extra>
+impl<B, L> CacheDriver<B, L>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
-    Extra: std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
+    L: Loader<K = B::K, V = B::V>,
 {
     /// Create new, empty cache with given loader function.
-    pub fn new(
-        loader: Arc<dyn Loader<K = K, V = V, Extra = Extra>>,
-        backend: Box<dyn CacheBackend<K = K, V = V>>,
-    ) -> Self {
+    pub fn new(loader: Arc<L>, backend: B) -> Self {
         Self {
             state: Arc::new(Mutex::new(CacheState {
                 cached_entries: backend,
@@ -51,17 +46,21 @@ where
 }
 
 #[async_trait]
-impl<K, V, Extra> Cache for CacheDriver<K, V, Extra>
+impl<B, L> Cache for CacheDriver<B, L>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
-    Extra: std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
+    L: Loader<K = B::K, V = B::V>,
 {
-    type K = K;
-    type V = V;
-    type Extra = Extra;
+    type K = B::K;
+    type V = B::V;
+    type GetExtra = L::Extra;
+    type PeekExtra = ();
 
-    async fn get_with_status(&self, k: Self::K, extra: Self::Extra) -> (Self::V, CacheGetStatus) {
+    async fn get_with_status(
+        &self,
+        k: Self::K,
+        extra: Self::GetExtra,
+    ) -> (Self::V, CacheGetStatus) {
         // place state locking into its own scope so it doesn't leak into the generator (async
         // function)
         let (receiver, status) = {
@@ -167,7 +166,11 @@ where
         (v, status)
     }
 
-    async fn peek_with_status(&self, k: Self::K) -> Option<(Self::V, CachePeekStatus)> {
+    async fn peek_with_status(
+        &self,
+        k: Self::K,
+        _extra: Self::PeekExtra,
+    ) -> Option<(Self::V, CachePeekStatus)> {
         // place state locking into its own scope so it doesn't leak into the generator (async
         // function)
         let (receiver, status) = {
@@ -224,11 +227,10 @@ where
     }
 }
 
-impl<K, V, Extra> Drop for CacheDriver<K, V, Extra>
+impl<B, L> Drop for CacheDriver<B, L>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
-    Extra: std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
+    L: Loader<K = B::K, V = B::V>,
 {
     fn drop(&mut self) {
         for (_k, running_query) in self.state.lock().running_queries.drain() {
@@ -244,23 +246,21 @@ where
 /// Helper to submit results of running queries.
 ///
 /// Ensures that running query is removed when dropped (e.g. during panic).
-struct ResultSubmitter<K, V>
+struct ResultSubmitter<B>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
 {
-    state: Arc<Mutex<CacheState<K, V>>>,
+    state: Arc<Mutex<CacheState<B>>>,
     tag: u64,
-    k: Option<K>,
-    v: Option<V>,
+    k: Option<B::K>,
+    v: Option<B::V>,
 }
 
-impl<K, V> ResultSubmitter<K, V>
+impl<B> ResultSubmitter<B>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
 {
-    fn new(state: Arc<Mutex<CacheState<K, V>>>, k: K, tag: u64) -> Self {
+    fn new(state: Arc<Mutex<CacheState<B>>>, k: B::K, tag: u64) -> Self {
         Self {
             state,
             tag,
@@ -272,7 +272,7 @@ where
     /// Submit value.
     ///
     /// Returns `true` if this very query was running.
-    fn submit(mut self, v: V) -> bool {
+    fn submit(mut self, v: B::V) -> bool {
         assert!(self.v.is_none());
         self.v = Some(v);
         self.finalize()
@@ -308,10 +308,9 @@ where
     }
 }
 
-impl<K, V> Drop for ResultSubmitter<K, V>
+impl<B> Drop for ResultSubmitter<B>
 where
-    K: Clone + Eq + Hash + std::fmt::Debug + Ord + Send + 'static,
-    V: Clone + std::fmt::Debug + Send + 'static,
+    B: CacheBackend,
 {
     fn drop(&mut self) {
         if self.k.is_some() {
@@ -369,12 +368,15 @@ struct RunningQuery<V> {
 ///
 /// The state parts must be updated in a consistent manner, i.e. while using the same lock guard.
 #[derive(Debug)]
-struct CacheState<K, V> {
+struct CacheState<B>
+where
+    B: CacheBackend,
+{
     /// Cached entires (i.e. queries completed).
-    cached_entries: Box<dyn CacheBackend<K = K, V = V>>,
+    cached_entries: B,
 
     /// Currently running queries indexed by cache key.
-    running_queries: HashMap<K, RunningQuery<V>>,
+    running_queries: HashMap<B::K, RunningQuery<B::V>>,
 
     /// Tag counter for running queries.
     tag_counter: u64,
@@ -384,21 +386,30 @@ struct CacheState<K, V> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::cache::test_util::TestLoader;
+    use crate::cache::test_util::{run_test_generic, TestAdapter, TestLoader};
 
     use super::*;
 
     #[tokio::test]
     async fn test_generic() {
-        use crate::cache::test_util::test_generic;
-
-        test_generic(setup).await;
+        run_test_generic(MyTestAdapter).await;
     }
 
-    fn setup(loader: Arc<TestLoader>) -> Arc<CacheDriver<u8, String, bool>> {
-        Arc::new(CacheDriver::new(
-            Arc::clone(&loader) as _,
-            Box::new(HashMap::new()),
-        ))
+    struct MyTestAdapter;
+
+    impl TestAdapter for MyTestAdapter {
+        type GetExtra = bool;
+        type PeekExtra = ();
+        type Cache = CacheDriver<HashMap<u8, String>, TestLoader>;
+
+        fn construct(&self, loader: Arc<TestLoader>) -> Arc<Self::Cache> {
+            Arc::new(CacheDriver::new(Arc::clone(&loader) as _, HashMap::new()))
+        }
+
+        fn get_extra(&self, inner: bool) -> Self::GetExtra {
+            inner
+        }
+
+        fn peek_extra(&self) -> Self::PeekExtra {}
     }
 }

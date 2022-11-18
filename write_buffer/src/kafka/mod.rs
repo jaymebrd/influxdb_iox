@@ -1,6 +1,7 @@
 use self::{
-    aggregator::DmlAggregator,
     config::{ClientConfig, ConsumerConfig, ProducerConfig, TopicCreationConfig},
+    instrumentation::KafkaProducerMetrics,
+    record_aggregator::RecordAggregator,
 };
 use crate::{
     codec::IoxHeaders,
@@ -11,9 +12,12 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use data_types::{Sequence, SequenceNumber};
+use data_types::{Sequence, SequenceNumber, ShardIndex};
 use dml::{DmlMeta, DmlOperation};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{
+    stream::{self, BoxStream},
+    StreamExt, TryStreamExt,
+};
 use iox_time::{Time, TimeProvider};
 use observability_deps::tracing::warn;
 use parking_lot::Mutex;
@@ -21,7 +25,7 @@ use rskafka::{
     client::{
         consumer::{StartOffset, StreamConsumerBuilder},
         error::{Error as RSKafkaError, ProtocolError},
-        partition::{OffsetAt, PartitionClient},
+        partition::{Compression, OffsetAt, PartitionClient, UnknownTopicHandling},
         producer::{BatchProducer, BatchProducerBuilder},
         ClientBuilder,
     },
@@ -29,6 +33,7 @@ use rskafka::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -36,8 +41,9 @@ use std::{
 };
 use trace::TraceCollector;
 
-mod aggregator;
 mod config;
+mod instrumentation;
+mod record_aggregator;
 
 /// Maximum number of jobs buffered and decoded concurrently.
 const CONCURRENT_DECODE_JOBS: usize = 10;
@@ -46,23 +52,27 @@ type Result<T, E = WriteBufferError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct RSKafkaProducer {
-    producers: BTreeMap<u32, BatchProducer<DmlAggregator>>,
+    producers: BTreeMap<ShardIndex, BatchProducer<RecordAggregator>>,
 }
 
 impl RSKafkaProducer {
-    pub async fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new<'a>(
         conn: String,
-        database_name: String,
-        connection_config: &BTreeMap<String, String>,
-        creation_config: Option<&WriteBufferCreationConfig>,
+        topic_name: String,
+        connection_config: &'a BTreeMap<String, String>,
         time_provider: Arc<dyn TimeProvider>,
-        trace_collector: Option<Arc<dyn TraceCollector>>,
+        creation_config: Option<&'a WriteBufferCreationConfig>,
+        partitions: Option<Range<i32>>,
+        _trace_collector: Option<Arc<dyn TraceCollector>>,
+        metric_registry: &'a metric::Registry,
     ) -> Result<Self> {
         let partition_clients = setup_topic(
             conn,
-            database_name.clone(),
+            topic_name.clone(),
             connection_config,
             creation_config,
+            partitions,
         )
         .await?;
 
@@ -70,20 +80,28 @@ impl RSKafkaProducer {
 
         let producers = partition_clients
             .into_iter()
-            .map(|(sequencer_id, partition_client)| {
-                let mut producer_builder = BatchProducerBuilder::new(Arc::new(partition_client));
+            .map(|(shard_index, partition_client)| {
+                // Instrument this kafka partition client.
+                let partition_client = KafkaProducerMetrics::new(
+                    Box::new(partition_client),
+                    topic_name.clone(),
+                    shard_index,
+                    metric_registry,
+                );
+
+                let mut producer_builder =
+                    BatchProducerBuilder::new_with_client(Arc::new(partition_client))
+                        .with_compression(Compression::Zstd);
                 if let Some(linger) = producer_config.linger {
                     producer_builder = producer_builder.with_linger(linger);
                 }
-                let producer = producer_builder.build(DmlAggregator::new(
-                    trace_collector.clone(),
-                    database_name.clone(),
+                let producer = producer_builder.build(RecordAggregator::new(
+                    shard_index,
                     producer_config.max_batch_size,
-                    sequencer_id,
                     Arc::clone(&time_provider),
                 ));
 
-                (sequencer_id, producer)
+                (shard_index, producer)
             })
             .collect();
 
@@ -93,20 +111,20 @@ impl RSKafkaProducer {
 
 #[async_trait]
 impl WriteBufferWriting for RSKafkaProducer {
-    fn sequencer_ids(&self) -> BTreeSet<u32> {
+    fn shard_indexes(&self) -> BTreeSet<ShardIndex> {
         self.producers.keys().copied().collect()
     }
 
     async fn store_operation(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         operation: DmlOperation,
     ) -> Result<DmlMeta, WriteBufferError> {
         let producer = self
             .producers
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown partition: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
 
         Ok(producer.produce(operation).await?)
@@ -131,7 +149,7 @@ pub struct RSKafkaStreamHandler {
     terminated: Arc<AtomicBool>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
     consumer_config: ConsumerConfig,
-    sequencer_id: u32,
+    shard_index: ShardIndex,
 }
 
 /// Launch a tokio task that attempts to decode a DmlOperation from a
@@ -143,7 +161,7 @@ pub struct RSKafkaStreamHandler {
 /// there was an error reading the record in the first place.
 async fn try_decode(
     record: Result<RecordAndOffset, WriteBufferError>,
-    sequencer_id: u32,
+    shard_index: ShardIndex,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 ) -> (Option<i64>, Result<DmlOperation, WriteBufferError>) {
     let offset = match &record {
@@ -160,14 +178,11 @@ async fn try_decode(
         let headers = IoxHeaders::from_headers(record.record.headers, trace_collector.as_ref())?;
 
         let sequence = Sequence {
-            sequencer_id,
+            shard_index,
             sequence_number: SequenceNumber::new(record.offset),
         };
 
-        let timestamp_nanos = i64::try_from(record.record.timestamp.unix_timestamp_nanos())
-            .map_err(WriteBufferError::invalid_data)?;
-
-        let timestamp = Time::from_timestamp_nanos(timestamp_nanos);
+        let timestamp = Time::from_date_time(record.record.timestamp);
 
         let value = record
             .record
@@ -224,9 +239,10 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
         }
         let stream = stream_builder.build();
 
-        let sequencer_id = self.sequencer_id;
+        let shard_index = self.shard_index;
 
-        // Use buffered streams to pipeline the reading of a message from kafka from with its decoding.
+        // Use buffered streams to pipeline the reading of a message from kafka from with its
+        // decoding.
         //
         // ┌─────┬──────┬──────┬─────┬──────┬──────┬─────┬──────┬──────┐
         // │ Read│ Read │ Read │ Read│ Read │ Read │ Read│ Read │ Read │
@@ -255,9 +271,13 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
                 Err(e) => {
                     terminated.store(true, Ordering::SeqCst);
                     let kind = match e {
-                        RSKafkaError::ServerError(ProtocolError::OffsetOutOfRange, _) => {
-                            WriteBufferErrorKind::UnknownSequenceNumber
-                        }
+                        RSKafkaError::ServerError {
+                            protocol_error: ProtocolError::OffsetOutOfRange,
+                            // NOTE: the high watermark included in this
+                            // response is always -1 when reading before/after
+                            // valid offsets.
+                            ..
+                        } => WriteBufferErrorKind::SequenceNumberNoLongerExists,
                         _ => WriteBufferErrorKind::Unknown,
                     };
                     return Err(WriteBufferError::new(kind, e));
@@ -272,7 +292,7 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
             .map(move |record| {
                 // appease borrow checker
                 let trace_collector = trace_collector.clone();
-                try_decode(record, sequencer_id, trace_collector)
+                try_decode(record, shard_index, trace_collector)
             })
             // the decode jobs in parallel
             // (`buffered` does NOT reorder, so the API user still gets an ordered stream)
@@ -298,6 +318,15 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
 
     async fn seek(&mut self, sequence_number: SequenceNumber) -> Result<(), WriteBufferError> {
         let offset = sequence_number.get();
+        let current = self.partition_client.get_offset(OffsetAt::Latest).await?;
+        if offset > current {
+            return Err(WriteBufferError::sequence_number_after_watermark(format!(
+                "attempted to seek to offset {offset}, but current high \
+                watermark for partition {p} is {current}",
+                p = self.shard_index
+            )));
+        }
+
         *self.next_offset.lock() = Some(offset);
         self.terminated.store(false, Ordering::SeqCst);
         Ok(())
@@ -311,7 +340,7 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
 
 #[derive(Debug)]
 pub struct RSKafkaConsumer {
-    partition_clients: BTreeMap<u32, Arc<PartitionClient>>,
+    partition_clients: BTreeMap<ShardIndex, Arc<PartitionClient>>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
     consumer_config: ConsumerConfig,
 }
@@ -319,16 +348,18 @@ pub struct RSKafkaConsumer {
 impl RSKafkaConsumer {
     pub async fn new(
         conn: String,
-        database_name: String,
+        topic_name: String,
         connection_config: &BTreeMap<String, String>,
         creation_config: Option<&WriteBufferCreationConfig>,
+        partitions: Option<Range<i32>>,
         trace_collector: Option<Arc<dyn TraceCollector>>,
     ) -> Result<Self> {
         let partition_clients = setup_topic(
             conn,
-            database_name.clone(),
+            topic_name.clone(),
             connection_config,
             creation_config,
+            partitions,
         )
         .await?;
 
@@ -347,19 +378,19 @@ impl RSKafkaConsumer {
 
 #[async_trait]
 impl WriteBufferReading for RSKafkaConsumer {
-    fn sequencer_ids(&self) -> BTreeSet<u32> {
+    fn shard_indexes(&self) -> BTreeSet<ShardIndex> {
         self.partition_clients.keys().copied().collect()
     }
 
     async fn stream_handler(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
     ) -> Result<Box<dyn WriteBufferStreamHandler>, WriteBufferError> {
         let partition_client = self
             .partition_clients
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown partition: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
 
         Ok(Box::new(RSKafkaStreamHandler {
@@ -368,19 +399,19 @@ impl WriteBufferReading for RSKafkaConsumer {
             terminated: Arc::new(AtomicBool::new(false)),
             trace_collector: self.trace_collector.clone(),
             consumer_config: self.consumer_config.clone(),
-            sequencer_id,
+            shard_index,
         }))
     }
 
     async fn fetch_high_watermark(
         &self,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
     ) -> Result<SequenceNumber, WriteBufferError> {
         let partition_client = self
             .partition_clients
-            .get(&sequencer_id)
+            .get(&shard_index)
             .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown partition: {}", sequencer_id).into()
+                format!("Unknown shard index: {}", shard_index).into()
             })?;
 
         let watermark = partition_client.get_offset(OffsetAt::Latest).await?;
@@ -394,12 +425,17 @@ impl WriteBufferReading for RSKafkaConsumer {
 
 async fn setup_topic(
     conn: String,
-    database_name: String,
+    topic_name: String,
     connection_config: &BTreeMap<String, String>,
     creation_config: Option<&WriteBufferCreationConfig>,
-) -> Result<BTreeMap<u32, PartitionClient>> {
+    partitions: Option<Range<i32>>,
+) -> Result<BTreeMap<ShardIndex, PartitionClient>> {
     let client_config = ClientConfig::try_from(connection_config)?;
-    let mut client_builder = ClientBuilder::new(vec![conn]);
+    let mut client_builder =
+        ClientBuilder::new(conn.split(',').map(|s| s.trim().to_owned()).collect());
+    if let Some(client_id) = client_config.client_id {
+        client_builder = client_builder.client_id(client_id);
+    }
     if let Some(max_message_size) = client_config.max_message_size {
         client_builder = client_builder.max_message_size(max_message_size);
     }
@@ -412,14 +448,43 @@ async fn setup_topic(
     loop {
         // check if topic already exists
         let topics = client.list_topics().await?;
-        if let Some(topic) = topics.into_iter().find(|t| t.name == database_name) {
-            let mut partition_clients = BTreeMap::new();
-            for partition in topic.partitions {
-                let c = client.partition_client(&database_name, partition)?;
-                let partition = u32::try_from(partition).map_err(WriteBufferError::invalid_data)?;
-                partition_clients.insert(partition, c);
+        if let Some(topic) = topics.into_iter().find(|t| t.name == topic_name) {
+            // Instantiate 10 partition clients concurrently until all are ready
+            // speed up server init.
+            let client_ref = &client;
+            let clients = stream::iter(
+                topic
+                    .partitions
+                    .into_iter()
+                    .filter(|p| {
+                        partitions
+                            .as_ref()
+                            .map(|want| want.contains(p))
+                            .unwrap_or(true)
+                    })
+                    .map(|p| {
+                        let topic_name = topic_name.clone();
+                        async move {
+                            let shard_index = ShardIndex::new(p);
+                            let c = client_ref
+                                .partition_client(&topic_name, p, UnknownTopicHandling::Error)
+                                .await?;
+                            Result::<_, WriteBufferError>::Ok((shard_index, c))
+                        }
+                    }),
+            )
+            .buffer_unordered(10)
+            .try_collect::<BTreeMap<_, _>>()
+            .await?;
+
+            if let Some(p) = partitions {
+                assert_eq!(
+                    p.len(),
+                    clients.len(),
+                    "requested partition clients not initialised"
+                );
             }
-            return Ok(partition_clients);
+            return Ok(clients);
         }
 
         // create topic
@@ -428,7 +493,7 @@ async fn setup_topic(
 
             match controller_client
                 .create_topic(
-                    &database_name,
+                    &topic_name,
                     topic_creation_config.num_partitions,
                     topic_creation_config.replication_factor,
                     topic_creation_config.timeout_ms,
@@ -437,7 +502,10 @@ async fn setup_topic(
             {
                 Ok(_) => {}
                 // race condition between check and creation action, that's OK
-                Err(RSKafkaError::ServerError(ProtocolError::TopicAlreadyExists, _)) => {}
+                Err(RSKafkaError::ServerError {
+                    protocol_error: ProtocolError::TopicAlreadyExists,
+                    ..
+                }) => {}
                 Err(e) => {
                     return Err(e.into());
                 }
@@ -455,14 +523,15 @@ mod tests {
     use super::*;
     use crate::{
         core::test_utils::{
-            assert_span_context_eq_or_linked, perform_generic_tests, random_topic_name,
-            set_pop_first, TestAdapter, TestContext,
+            assert_span_context_eq_or_linked, lp_to_batches, perform_generic_tests,
+            random_topic_name, set_pop_first, TestAdapter, TestContext,
         },
         maybe_skip_kafka_integration,
     };
-    use data_types::{DeletePredicate, PartitionKey, TimestampRange};
+    use data_types::{DeletePredicate, NamespaceId, PartitionKey, TimestampRange};
     use dml::{test_util::assert_write_op_eq, DmlDelete, DmlWrite};
     use futures::{stream::FuturesUnordered, TryStreamExt};
+    use iox_time::TimeProvider;
     use rskafka::{client::partition::Compression, record::Record};
     use std::num::NonZeroU32;
     use test_helpers::assert_contains;
@@ -484,33 +553,40 @@ mod tests {
 
         async fn new_context_with_time(
             &self,
-            n_sequencers: NonZeroU32,
+            n_shards: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
         ) -> Self::Context {
             RSKafkaTestContext {
                 conn: self.conn.clone(),
-                database_name: random_topic_name(),
-                n_sequencers,
+                topic_name: random_topic_name(),
+                n_shards,
                 time_provider,
                 trace_collector: Arc::new(RingBufferTraceCollector::new(100)),
+                metrics: metric::Registry::default(),
             }
         }
     }
 
     struct RSKafkaTestContext {
         conn: String,
-        database_name: String,
-        n_sequencers: NonZeroU32,
+        topic_name: String,
+        n_shards: NonZeroU32,
         time_provider: Arc<dyn TimeProvider>,
         trace_collector: Arc<RingBufferTraceCollector>,
+        metrics: metric::Registry,
     }
 
     impl RSKafkaTestContext {
         fn creation_config(&self, value: bool) -> Option<WriteBufferCreationConfig> {
             value.then(|| WriteBufferCreationConfig {
-                n_sequencers: self.n_sequencers,
+                n_shards: self.n_shards,
                 ..Default::default()
             })
+        }
+
+        #[allow(dead_code)]
+        fn metrics(&self) -> &metric::Registry {
+            &self.metrics
         }
     }
 
@@ -523,11 +599,13 @@ mod tests {
         async fn writing(&self, creation_config: bool) -> Result<Self::Writing, WriteBufferError> {
             RSKafkaProducer::new(
                 self.conn.clone(),
-                self.database_name.clone(),
+                self.topic_name.clone(),
                 &BTreeMap::default(),
-                self.creation_config(creation_config).as_ref(),
                 Arc::clone(&self.time_provider),
+                self.creation_config(creation_config).as_ref(),
+                None,
                 Some(self.trace_collector() as Arc<_>),
+                &self.metrics,
             )
             .await
         }
@@ -535,9 +613,10 @@ mod tests {
         async fn reading(&self, creation_config: bool) -> Result<Self::Reading, WriteBufferError> {
             RSKafkaConsumer::new(
                 self.conn.clone(),
-                self.database_name.clone(),
+                self.topic_name.clone(),
                 &BTreeMap::default(),
                 self.creation_config(creation_config).as_ref(),
+                None,
                 Some(self.trace_collector() as Arc<_>),
             )
             .await
@@ -559,7 +638,7 @@ mod tests {
     async fn test_setup_topic_race() {
         let conn = maybe_skip_kafka_integration!();
         let topic_name = random_topic_name();
-        let n_partitions = NonZeroU32::new(2).unwrap();
+        let n_shards = NonZeroU32::new(2).unwrap();
 
         let mut jobs: FuturesUnordered<_> = (0..10)
             .map(|_| {
@@ -572,9 +651,10 @@ mod tests {
                         topic_name,
                         &BTreeMap::default(),
                         Some(&WriteBufferCreationConfig {
-                            n_sequencers: n_partitions,
+                            n_shards,
                             ..Default::default()
                         }),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -594,36 +674,40 @@ mod tests {
         let producer = ctx.writing(true).await.unwrap();
 
         // write broken message followed by a real one
-        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
+        let shard_index = set_pop_first(&mut producer.shard_indexes()).unwrap();
         ClientBuilder::new(vec![conn])
             .build()
             .await
             .unwrap()
-            .partition_client(ctx.database_name.clone(), sequencer_id as i32)
+            .partition_client(
+                ctx.topic_name.clone(),
+                shard_index.get(),
+                UnknownTopicHandling::Retry,
+            )
+            .await
             .unwrap()
             .produce(
                 vec![Record {
                     key: None,
                     value: None,
                     headers: Default::default(),
-                    timestamp: rskafka::time::OffsetDateTime::now_utc(),
+                    timestamp: rskafka::chrono::Utc::now(),
                 }],
-                Compression::NoCompression,
+                Compression::Zstd,
             )
             .await
             .unwrap();
         let w = crate::core::test_utils::write(
-            "namespace",
             &producer,
             "table foo=1 1",
-            sequencer_id,
+            shard_index,
             "bananas".into(),
             None,
         )
         .await;
 
         let consumer = ctx.reading(true).await.unwrap();
-        let mut handler = consumer.stream_handler(sequencer_id).await.unwrap();
+        let mut handler = consumer.stream_handler(shard_index).await.unwrap();
 
         // read broken message from stream
         let mut stream = handler.stream().await;
@@ -646,84 +730,69 @@ mod tests {
 
         let producer = ctx.writing(true).await.unwrap();
 
-        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
+        let shard_index = set_pop_first(&mut producer.shard_indexes()).unwrap();
 
         let (w1_1, w1_2, w2_1, d1_1, d1_2, w1_3, w1_4, w2_2) = tokio::join!(
             // ns1: batch 1
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
             // ns2: batch 1, part A
-            write("ns2", &producer, &trace_collector, sequencer_id, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
             // ns1: batch 2
-            delete("ns1", &producer, &trace_collector, sequencer_id),
+            delete(&producer, &trace_collector, shard_index),
             // ns1: batch 3
-            delete("ns1", &producer, &trace_collector, sequencer_id),
+            delete(&producer, &trace_collector, shard_index),
             // ns1: batch 4
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
             // ns2: batch 1, part B
-            write("ns2", &producer, &trace_collector, sequencer_id, "bananas"),
+            write(&producer, &trace_collector, shard_index, "bananas"),
         );
 
-        // ensure that write operations were fused
-        assert_eq!(w1_1.sequence().unwrap(), w1_2.sequence().unwrap());
+        // ensure that write operations were NOT fused
+        assert_ne!(w1_1.sequence().unwrap(), w1_2.sequence().unwrap());
         assert_ne!(w1_2.sequence().unwrap(), d1_1.sequence().unwrap());
         assert_ne!(d1_1.sequence().unwrap(), d1_2.sequence().unwrap());
         assert_ne!(d1_2.sequence().unwrap(), w1_3.sequence().unwrap());
-        assert_eq!(w1_3.sequence().unwrap(), w1_4.sequence().unwrap());
+        assert_ne!(w1_3.sequence().unwrap(), w1_4.sequence().unwrap());
         assert_ne!(w1_4.sequence().unwrap(), w1_1.sequence().unwrap());
 
         assert_ne!(w2_1.sequence().unwrap(), w1_1.sequence().unwrap());
-        assert_eq!(w2_1.sequence().unwrap(), w2_2.sequence().unwrap());
+        assert_ne!(w2_1.sequence().unwrap(), w2_2.sequence().unwrap());
 
         let consumer = ctx.reading(true).await.unwrap();
-        let mut handler = consumer.stream_handler(sequencer_id).await.unwrap();
+        let mut handler = consumer.stream_handler(shard_index).await.unwrap();
         let mut stream = handler.stream().await;
 
-        // get output, note that the write operations were fused
-        let op_w1_12 = stream.next().await.unwrap().unwrap();
+        // get output, note that the write operations were NOT fused
+        let op_w1_1 = stream.next().await.unwrap().unwrap();
+        let op_w1_2 = stream.next().await.unwrap().unwrap();
+        let op_w2_1 = stream.next().await.unwrap().unwrap();
         let op_d1_1 = stream.next().await.unwrap().unwrap();
         let op_d1_2 = stream.next().await.unwrap().unwrap();
-        let op_w1_34 = stream.next().await.unwrap().unwrap();
-        let op_w2_12 = stream.next().await.unwrap().unwrap();
+        let op_w1_3 = stream.next().await.unwrap().unwrap();
+        let op_w1_4 = stream.next().await.unwrap().unwrap();
+        let op_w2_2 = stream.next().await.unwrap().unwrap();
 
         // ensure that sequence numbers map as expected
-        assert_eq!(
-            op_w1_12.meta().sequence().unwrap(),
-            w1_1.sequence().unwrap(),
-        );
-        assert_eq!(
-            op_w1_12.meta().sequence().unwrap(),
-            w1_2.sequence().unwrap(),
-        );
+        assert_eq!(op_w1_1.meta().sequence().unwrap(), w1_1.sequence().unwrap(),);
+        assert_eq!(op_w1_2.meta().sequence().unwrap(), w1_2.sequence().unwrap(),);
         assert_eq!(op_d1_1.meta().sequence().unwrap(), d1_1.sequence().unwrap(),);
         assert_eq!(op_d1_2.meta().sequence().unwrap(), d1_2.sequence().unwrap(),);
-        assert_eq!(
-            op_w1_34.meta().sequence().unwrap(),
-            w1_3.sequence().unwrap(),
-        );
-        assert_eq!(
-            op_w1_34.meta().sequence().unwrap(),
-            w1_4.sequence().unwrap(),
-        );
-        assert_eq!(
-            op_w2_12.meta().sequence().unwrap(),
-            w2_1.sequence().unwrap(),
-        );
-        assert_eq!(
-            op_w2_12.meta().sequence().unwrap(),
-            w2_2.sequence().unwrap(),
-        );
+        assert_eq!(op_w1_3.meta().sequence().unwrap(), w1_3.sequence().unwrap(),);
+        assert_eq!(op_w1_4.meta().sequence().unwrap(), w1_4.sequence().unwrap(),);
+        assert_eq!(op_w2_1.meta().sequence().unwrap(), w2_1.sequence().unwrap(),);
+        assert_eq!(op_w2_2.meta().sequence().unwrap(), w2_2.sequence().unwrap(),);
 
         // check tracing span links
         assert_span_context_eq_or_linked(
             w1_1.span_context().unwrap(),
-            op_w1_12.meta().span_context().unwrap(),
+            op_w1_1.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
         assert_span_context_eq_or_linked(
             w1_2.span_context().unwrap(),
-            op_w1_12.meta().span_context().unwrap(),
+            op_w1_2.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
         assert_span_context_eq_or_linked(
@@ -738,107 +807,52 @@ mod tests {
         );
         assert_span_context_eq_or_linked(
             w1_3.span_context().unwrap(),
-            op_w1_34.meta().span_context().unwrap(),
+            op_w1_3.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
         assert_span_context_eq_or_linked(
             w1_4.span_context().unwrap(),
-            op_w1_34.meta().span_context().unwrap(),
+            op_w1_4.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
         assert_span_context_eq_or_linked(
             w2_1.span_context().unwrap(),
-            op_w2_12.meta().span_context().unwrap(),
+            op_w2_1.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
         assert_span_context_eq_or_linked(
             w2_2.span_context().unwrap(),
-            op_w2_12.meta().span_context().unwrap(),
+            op_w2_2.meta().span_context().unwrap(),
             trace_collector.spans(),
         );
     }
 
-    // Coverage of https://github.com/influxdata/influxdb_iox/issues/4787
-    #[tokio::test]
-    async fn test_batching_respects_partitioning() {
-        let conn = maybe_skip_kafka_integration!();
-        let adapter = RSKafkaTestAdapter::new(conn);
-        let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
-        let trace_collector = ctx.trace_collector();
-
-        let producer = ctx.writing(true).await.unwrap();
-
-        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
-
-        let (w1, w2, w3, w4) = tokio::join!(
-            // These two ops have the same partition key, and therefore can be
-            // merged together.
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
-            // However this op has a different partition_key and cannot be
-            // merged with the others.
-            write("ns1", &producer, &trace_collector, sequencer_id, "platanos"),
-            // this operation can still go into the first write, no need to start yet another one
-            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
-        );
-
-        // Assert ops 1+2+4 were merged, by asserting they have the same
-        // sequence number.
-        assert_eq!(w1.sequence().unwrap(), w2.sequence().unwrap());
-        assert_eq!(w1.sequence().unwrap(), w4.sequence().unwrap());
-
-        // And assert the third op was not merged because of the differing
-        // partition key.
-        assert_ne!(w1.sequence().unwrap(), w3.sequence().unwrap());
-    }
-
-    #[tokio::test]
-    #[should_panic = "enqueuing unpartitioned write into kafka"]
-    async fn test_enqueue_no_partition_key() {
-        let conn = maybe_skip_kafka_integration!("enqueuing unpartitioned write into kafka");
-        let adapter = RSKafkaTestAdapter::new(conn);
-        let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
-
-        let producer = ctx.writing(true).await.unwrap();
-
-        let tables = mutable_batch_lp::lines_to_batches("table foo=1", 0).unwrap();
-        let write = DmlWrite::new("bananas", tables, None, DmlMeta::unsequenced(None));
-
-        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
-        producer
-            .store_operation(sequencer_id, DmlOperation::Write(write))
-            .await
-            .unwrap();
-    }
-
     async fn write(
-        namespace: &str,
         producer: &RSKafkaProducer,
         trace_collector: &Arc<RingBufferTraceCollector>,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
         partition_key: impl Into<PartitionKey> + Send,
     ) -> DmlMeta {
         let span_ctx = SpanContext::new(Arc::clone(trace_collector) as Arc<_>);
-        let tables = mutable_batch_lp::lines_to_batches("table foo=1", 0).unwrap();
+        let tables = lp_to_batches("table foo=1");
         let write = DmlWrite::new(
-            namespace,
+            NamespaceId::new(42),
             tables,
-            Some(partition_key.into()),
+            partition_key.into(),
             DmlMeta::unsequenced(Some(span_ctx)),
         );
         let op = DmlOperation::Write(write);
-        producer.store_operation(sequencer_id, op).await.unwrap()
+        producer.store_operation(shard_index, op).await.unwrap()
     }
 
     async fn delete(
-        namespace: &str,
         producer: &RSKafkaProducer,
         trace_collector: &Arc<RingBufferTraceCollector>,
-        sequencer_id: u32,
+        shard_index: ShardIndex,
     ) -> DmlMeta {
         let span_ctx = SpanContext::new(Arc::clone(trace_collector) as Arc<_>);
         let op = DmlOperation::Delete(DmlDelete::new(
-            namespace,
+            NamespaceId::new(42),
             DeletePredicate {
                 range: TimestampRange::new(0, 1),
                 exprs: vec![],
@@ -846,6 +860,6 @@ mod tests {
             None,
             DmlMeta::unsequenced(Some(span_ctx)),
         ));
-        producer.store_operation(sequencer_id, op).await.unwrap()
+        producer.store_operation(shard_index, op).await.unwrap()
     }
 }

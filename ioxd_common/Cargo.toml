@@ -1,7 +1,9 @@
 [package]
 name = "ioxd_common"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 # Optional feature 'pprof' enables http://localhost:8080/debug/pprof/profile support support
 
@@ -9,18 +11,15 @@ edition = "2021"
 # Workspace dependencies, in alphabetical order
 clap_blocks = { path = "../clap_blocks" }
 data_types = { path = "../data_types" }
-dml = { path = "../dml" }
 generated_types = { path = "../generated_types" }
-heappy = { git = "https://github.com/mkmik/heappy", rev = "5d47dff152b8430e1dc1aea5a54c91c0c3099219", features = ["enable_heap_profiler", "jemalloc_shim", "measure_free"], optional = true }
+heappy = { git = "https://github.com/mkmik/heappy", rev = "b98e7f7dc080d5d7972a134de0e01e999e68e350", features = ["enable_heap_profiler", "jemalloc_shim", "measure_free"], optional = true }
 metric = { path = "../metric" }
 metric_exporters = { path = "../metric_exporters" }
-mutable_batch_lp = { path = "../mutable_batch_lp" }
 observability_deps = { path = "../observability_deps" }
 # NOTE: we may not notice that we need the "backtrace-rs" feature if we also build with the heappy feature, which depends on backtrace-rs.
 # (honestly I thought that cargo dependencies were isolated on a per crate basis so I'm a bit surprised that pprof accidentally builds
 # successfully just because another crate happens to depend on backtrace-rs)
-pprof = { version = "0.9", default-features = false, features = ["flamegraph", "prost-codec", "backtrace-rs"], optional = true }
-predicate = { path = "../predicate" }
+pprof = { version = "0.11", default-features = false, features = ["flamegraph", "prost-codec"], optional = true }
 service_grpc_testing = { path = "../service_grpc_testing" }
 trace = { path = "../trace" }
 trace_exporters = { path = "../trace_exporters" }
@@ -28,27 +27,27 @@ trace_http = { path = "../trace_http" }
 
 # Crates.io dependencies, in alphabetical order
 async-trait = "0.1"
-bytes = "1.0"
-clap = { version = "3", features = ["derive", "env"] }
+bytes = "1.2"
+clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false }
 flate2 = "1.0"
 futures = "0.3"
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 http = "0.2.8"
 hyper = "0.14"
 log = "0.4"
 parking_lot = "0.12"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.82"
+serde_json = "1.0.87"
 serde_urlencoded = "0.7.0"
 snafu = "0.7"
-tokio = { version = "1.20", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.21", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-util = { version = "0.7.3" }
-tonic = "0.7"
-tonic-health = "0.6.0"
-tonic-reflection = "0.4.0"
+tokio-util = { version = "0.7.4" }
+tonic = "0.8"
+tonic-health = "0.7.1"
+tonic-reflection = "0.5.0"
 tower = "0.4"
 tower-http = { version = "0.3", features = ["catch-panic"] }
 workspace-hack = { path = "../workspace-hack"}

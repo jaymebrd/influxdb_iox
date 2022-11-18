@@ -17,24 +17,23 @@ ARG CARGO_INCREMENTAL=yes
 ARG PROFILE=release
 ARG FEATURES=aws,gcp,azure,jemalloc_replacing_malloc
 ARG PACKAGE=influxdb_iox
-ARG ROARING_ARCH="haswell"
 ARG RUSTFLAGS=""
 ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     PROFILE=$PROFILE \
     FEATURES=$FEATURES \
     PACKAGE=$PACKAGE \
-    ROARING_ARCH=$ROARING_ARCH \
     RUSTFLAGS=$RUSTFLAGS
 
 RUN \
+  --mount=type=cache,id=influxdb_iox_rustup,sharing=locked,target=/usr/local/rustup \
   --mount=type=cache,id=influxdb_iox_registry,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,id=influxdb_iox_git,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,id=influxdb_iox_target,sharing=locked,target=/influxdb_iox/target \
-    du -cshx /usr/local/cargo/registry /usr/local/cargo/git /influxdb_iox/target && \
+    du -cshx /usr/local/rustup /usr/local/cargo/registry /usr/local/cargo/git /influxdb_iox/target && \
     cargo build --target-dir /influxdb_iox/target --package="$PACKAGE" --profile="$PROFILE" --no-default-features --features="$FEATURES" && \
     objcopy --compress-debug-sections "target/$PROFILE/$PACKAGE" && \
     cp "/influxdb_iox/target/$PROFILE/$PACKAGE" /root/$PACKAGE && \
-    du -cshx /usr/local/cargo/registry /usr/local/cargo/git /influxdb_iox/target
+    du -cshx /usr/local/rustup /usr/local/cargo/registry /usr/local/cargo/git /influxdb_iox/target
 
 
 
@@ -58,10 +57,9 @@ ENV PACKAGE=$PACKAGE
 COPY --from=build "/root/$PACKAGE" "/usr/bin/$PACKAGE"
 COPY docker/entrypoint.sh /usr/bin/entrypoint.sh
 
-ENV INFLUXDB_IOX_SERVER_MODE=database
 
 EXPOSE 8080 8082
 
 ENTRYPOINT ["/usr/bin/entrypoint.sh"]
 
-CMD ["run", "$INFLUXDB_IOX_SERVER_MODE"]
+CMD ["run"]
